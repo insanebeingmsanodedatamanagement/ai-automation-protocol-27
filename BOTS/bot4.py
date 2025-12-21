@@ -31,8 +31,11 @@ from googleapiclient.http import MediaIoBaseUpload
 # ==========================================
 # ⚡ CONFIGURATION
 # ==========================================
-BOT_TOKEN = "8444279967:AAHRBgfyUByl5RZnx2kyAXk3WwoYsRJQWRw"
-MONGO_URI = "mongodb+srv://MSANODE:99insanebeing45@msanodedata.qax08fp.mongodb.net/?appName=MSANODEDATA"
+BOT_TOKEN = os.getenv("BOT_4_TOKEN") 
+MONGO_URI = os.getenv("MONGO_URI") # This one is shared by everyone
+
+if not BOT_TOKEN:
+    print("❌ Bot 4 Error: BOT_4_TOKEN not found in Render Environment!")
 OWNER_ID = 6988593629 
 PARENT_FOLDER_ID = '1J0iGLcwjTTdQRQJ--A9s8D26a3-gN7IB'
 CREDENTIALS_FILE = 'credentials.json'
@@ -545,4 +548,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
+
         print("◈ MSANODE Shutdown.")
