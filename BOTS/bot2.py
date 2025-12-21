@@ -21,9 +21,14 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, Teleg
 # ⚡ CONFIGURATION
 # ==========================================
 # ⚠️ REPLACE WITH YOUR REAL KEYS
-MANAGER_BOT_TOKEN = "8566961549:AAFOJMBRlcNQY6bJCgGx94sElug5o6cr3MU" 
-MAIN_BOT_TOKEN = "8274830204:AAGJdF_Tu09EE0-rjoNYyM6lUfYwyS3E0g8"
-MONGO_URI = "mongodb+srv://MSANODE:99insanebeing45@msanodedata.qax08fp.mongodb.net/?appName=MSANODEDATA"
+# Securely fetch from Render Environment
+MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN")
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+
+# Safety Check: If Render isn't set up right, the bot will tell you why
+if not all([MANAGER_BOT_TOKEN, MAIN_BOT_TOKEN, MONGO_URI]):
+    print("❌ ERROR: One or more environment variables are missing in Render!")
 OWNER_ID = 6988593629 
 
 # Timezone for Reports
@@ -690,4 +695,5 @@ async def main():
     await dp.start_polling(manager_bot)
 
 if __name__ == "__main__":
+
     asyncio.run(main())
