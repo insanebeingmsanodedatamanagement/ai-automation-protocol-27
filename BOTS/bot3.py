@@ -16,9 +16,12 @@ from telebot.storage import StateMemoryStorage
 from datetime import datetime
 
 # ================= CONFIGURATION =================
-# ⚠️ YOUR KEYS ARE PRESERVED
-BOT_TOKEN = "7169534008:AAEKENwNrOujKhD05fLQQJoYBaHeNW7LeOg"
-MONGO_URI = "mongodb+srv://MSANODE:99insanebeing45@msanodedata.qax08fp.mongodb.net/?appName=MSANODEDATA" 
+# These pull from the Render Environment Variables we will set next
+BOT_TOKEN = os.getenv("BOT_3_TOKEN") 
+MONGO_URI = os.getenv("MONGO_URI")
+
+if not BOT_TOKEN or not MONGO_URI:
+    print("❌ SECURITY ALERT: Bot 3 keys missing from Environment!")
 
 MAIN_BOT_USERNAME = "@msanodedatamanagerbot" 
 MASTER_ADMIN_ID = 6988593629 
@@ -352,4 +355,5 @@ if __name__ == "__main__":
             bot.polling(none_stop=True, skip_pending=True, timeout=20)
         except Exception as e:
             print(f"⚠️ Conflict/Error: {e}. Reconnecting in 5s...")
+
             time.sleep(5)
