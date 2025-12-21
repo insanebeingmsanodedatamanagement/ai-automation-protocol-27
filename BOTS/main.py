@@ -3,47 +3,59 @@ import os
 import sys
 import asyncio
 import shutil
+import base64
 from aiohttp import web
 
 # ==========================================
-# 🔧 PICKLE RECONSTRUCTION FOR RENDER
+# 🔧 ENVIRONMENT PREPARATION (PATH FIX)
 # ==========================================
-def rebuild_pickle():
-    """Reconstruct token.pickle from base64 for Google API authentication"""
-    # Change these two lines to look one level up (../)
-    source = os.path.join("..", "token.pickle.base64")
-    target = "token.pickle" # Keep this here so the bot can see it locally
+def prepare_environment():
+    """Ensure all secrets are moved to the BOTS directory where bots can see them"""
+    # Get absolute path of this script (main.py)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    # Root is one level up on Render
+    root_dir = os.path.dirname(current_dir)
 
-    if os.path.exists(source) and not os.path.exists(target):
+    print(f"📂 Current Dir: {current_dir}")
+    print(f"📂 Looking for secrets in: {root_dir}")
+
+    # 1. Rebuild token.pickle from Base64
+    source_pickle = os.path.join(root_dir, "token.pickle.base64")
+    target_pickle = os.path.join(current_dir, "token.pickle")
+
+    if os.path.exists(source_pickle):
         try:
-            import base64
-            with open(source, "r") as f:
-                base64_data = f.read().strip()  # Remove any whitespace
+            with open(source_pickle, "r") as f:
+                base64_data = f.read().strip()
                 binary_data = base64.b64decode(base64_data)
-
-            with open(target, "wb") as f:
+            with open(target_pickle, "wb") as f:
                 f.write(binary_data)
-            print("✅ token.pickle successfully reconstructed from Base64")
+            print("✅ token.pickle successfully reconstructed")
         except Exception as e:
-            print(f"❌ Failed to reconstruct token.pickle: {e}")
-    elif os.path.exists(target):
-        print("✅ token.pickle already exists")
+            print(f"❌ Failed to reconstruct pickle: {e}")
     else:
-        print("⚠️  token.pickle.base64 not found - Google API may not work")
+        print(f"⚠️ token.pickle.base64 not found at {source_pickle}")
 
-# Reconstruct pickle before starting anything
-rebuild_pickle()
-for secret in ["credentials.json", "service_account.json", "vault_final.json"]:
-    root_path = os.path.join("..", secret)
-    if os.path.exists(root_path):
-        shutil.copy(root_path, secret) # Copy from Root to BOTS folder
-        print(f"✅ Injected {secret} into BOTS environment")
+    # 2. Inject JSON secrets
+    secrets = ["credentials.json", "service_account.json", "vault_final.json"]
+    for secret in secrets:
+        source_json = os.path.join(root_dir, secret)
+        target_json = os.path.join(current_dir, secret)
+        
+        if os.path.exists(source_json):
+            shutil.copy(source_json, target_json)
+            print(f"✅ Injected {secret} into BOTS environment")
+        else:
+            print(f"⚠️ Secret missing: {secret} (Looked in {root_dir})")
+
+# Run preparation before starting the server
+prepare_environment()
+
 # --- 1. RENDER HEALTH CHECK ---
 async def handle(request):
     return web.Response(text="MSANODE SINGULARITY: ALL CORES ACTIVE")
 
 async def start_server():
-    # Dynamically find the port for Render
     port = int(os.environ.get("PORT", 10000))
     app = web.Application()
     app.router.add_get('/', handle)
@@ -56,22 +68,29 @@ async def start_server():
 # --- 2. THE MULTI-BOT ENGINE ---
 async def run_bots():
     bot_files = ["bot1.py", "bot2.py", "bot3.py", "bot4.py", "bot5.py"]
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
     print("🚀 MSANODE: Launching all 5 Cores...")
 
     for file in bot_files:
-        if os.path.exists(file):
-            # This starts each bot in its own background process
-            # 'cwd' ensures the bot runs inside its own folder
-            subprocess.Popen([sys.executable, file], cwd=os.path.dirname(os.path.abspath(__file__)))
-            print(f"✅ Started: {file}")
-            await asyncio.sleep(1) # Small delay to prevent CPU overload
+        file_path = os.path.join(current_dir, file)
+        if os.path.exists(file_path):
+            # stdout/stderr redirection is the ONLY way to see bot errors in Render logs
+            subprocess.Popen(
+                [sys.executable, file],
+                cwd=current_dir,
+                stdout=sys.stdout,
+                stderr=sys.stderr
+            )
+            print(f"✅ Executing: {file}")
+            await asyncio.sleep(2) # Increased delay to prevent CPU spikes
         else:
-            print(f"❌ File Missing: {file}")
+            print(f"❌ File Missing: {file_path}")
 
 async def main():
     await start_server()
     await run_bots()
-    # Keeps the script alive forever
+    # Continuous keep-alive loop
     while True:
         await asyncio.sleep(3600)
 
@@ -80,5 +99,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Singularity Offline.")
-
-
