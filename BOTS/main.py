@@ -11,47 +11,51 @@ def log(message):
     print(message, flush=True)
 
 # ==========================================
-# 🔧 ENVIRONMENT PREPARATION
+# 🔧 HARDENED ENVIRONMENT PREPARATION
 # ==========================================
 def prepare_environment():
+    """Locate secrets in Render root and move them into the BOTS execution folder"""
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    # If Root Directory is 'BOTS', then secrets are in '..'
-    # If Root Directory is blank, secrets are also in '..' relative to this file
-    root_dir = os.path.dirname(current_dir)
+    # Render's secret files are usually in the parent of the BOTS folder
+    parent_dir = os.path.dirname(current_dir)
 
-    log(f"--- 🛠️  STARTING PREPARATION ---")
+    log(f"--- 🛠️ STARTING HARDENED PREPARATION ---")
     log(f"Current Path: {current_dir}")
-    log(f"Root Path: {root_dir}")
+    log(f"Searching for secrets in: {parent_dir}")
 
-    # 1. Rebuild token.pickle
-    source_pickle = os.path.join(root_dir, "token.pickle.base64")
-    target_pickle = os.path.join(current_dir, "token.pickle")
+    # 1. Handle token.pickle.base64
+    pickle_source = os.path.join(parent_dir, "token.pickle.base64")
+    pickle_target = os.path.join(current_dir, "token.pickle")
 
-    if os.path.exists(source_pickle):
+    if os.path.exists(pickle_source):
         try:
-            with open(source_pickle, "r") as f:
+            with open(pickle_source, "r") as f:
                 base64_data = f.read().strip()
                 binary_data = base64.b64decode(base64_data)
-            with open(target_pickle, "wb") as f:
+            with open(pickle_target, "wb") as f:
                 f.write(binary_data)
             log("✅ SUCCESS: token.pickle reconstructed")
         except Exception as e:
             log(f"❌ ERROR: Pickle reconstruction failed: {e}")
     else:
-        log(f"⚠️  CRITICAL: token.pickle.base64 NOT FOUND at {source_pickle}")
+        log(f"⚠️ CRITICAL: token.pickle.base64 NOT FOUND at {pickle_source}")
 
-    # 2. Inject JSON secrets
+    # 2. Handle JSON Secrets
     secrets = ["credentials.json", "service_account.json", "vault_final.json"]
     for secret in secrets:
-        source_json = os.path.join(root_dir, secret)
+        source_json = os.path.join(parent_dir, secret)
         target_json = os.path.join(current_dir, secret)
         
         if os.path.exists(source_json):
-            shutil.copy(source_json, target_json)
-            log(f"✅ SUCCESS: Injected {secret}")
+            try:
+                shutil.copy(source_json, target_json)
+                log(f"✅ SUCCESS: Injected {secret}")
+            except Exception as e:
+                log(f"❌ ERROR: Failed to copy {secret}: {e}")
         else:
-            log(f"⚠️  MISSING: {secret} not found in root")
+            log(f"⚠️ MISSING: {secret} not found in parent directory")
 
+# Run preparation before starting anything
 prepare_environment()
 
 # --- 1. RENDER HEALTH CHECK ---
@@ -79,15 +83,15 @@ async def run_bots():
         file_path = os.path.join(current_dir, file)
         if os.path.exists(file_path):
             log(f"🔄 Attempting to start {file}...")
-            # We use 'bufsize=0' and connect pipes to see bot logs in real-time
+            # Use -u for unbuffered logs and pass current stdout/stderr to Render
             subprocess.Popen(
-                [sys.executable, "-u", file], # -u forces unbuffered output in the bot itself
+                [sys.executable, "-u", file],
                 cwd=current_dir,
                 stdout=sys.stdout,
                 stderr=sys.stderr
             )
             log(f"✅ Process started for {file}")
-            await asyncio.sleep(5) # Give it 5 seconds to show any initial errors
+            await asyncio.sleep(5)
         else:
             log(f"❌ CRITICAL: {file} not found at {file_path}")
 
