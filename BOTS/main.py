@@ -2,6 +2,7 @@ import subprocess
 import os
 import sys
 import asyncio
+import shutil
 from aiohttp import web
 
 # ==========================================
@@ -9,8 +10,9 @@ from aiohttp import web
 # ==========================================
 def rebuild_pickle():
     """Reconstruct token.pickle from base64 for Google API authentication"""
-    source = "token.pickle.base64"
-    target = "token.pickle"
+    # Change these two lines to look one level up (../)
+    source = os.path.join("..", "token.pickle.base64")
+    target = "token.pickle" # Keep this here so the bot can see it locally
 
     if os.path.exists(source) and not os.path.exists(target):
         try:
@@ -31,7 +33,11 @@ def rebuild_pickle():
 
 # Reconstruct pickle before starting anything
 rebuild_pickle()
-
+for secret in ["credentials.json", "service_account.json", "vault_final.json"]:
+    root_path = os.path.join("..", secret)
+    if os.path.exists(root_path):
+        shutil.copy(root_path, secret) # Copy from Root to BOTS folder
+        print(f"✅ Injected {secret} into BOTS environment")
 # --- 1. RENDER HEALTH CHECK ---
 async def handle(request):
     return web.Response(text="MSANODE SINGULARITY: ALL CORES ACTIVE")
@@ -55,7 +61,8 @@ async def run_bots():
     for file in bot_files:
         if os.path.exists(file):
             # This starts each bot in its own background process
-            subprocess.Popen([sys.executable, file])
+            # 'cwd' ensures the bot runs inside its own folder
+            subprocess.Popen([sys.executable, file], cwd=os.path.dirname(os.path.abspath(__file__)))
             print(f"✅ Started: {file}")
             await asyncio.sleep(1) # Small delay to prevent CPU overload
         else:
@@ -73,4 +80,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Singularity Offline.")
+
 
