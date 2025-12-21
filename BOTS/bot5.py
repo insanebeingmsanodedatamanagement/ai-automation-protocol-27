@@ -37,12 +37,16 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 # ==========================================
 # ⚡ CONFIGURATION
 # ==========================================
-BOT_TOKEN = "8095359380:AAHeYeeB92ZRR4-TT9KO30dFBUDT2klNBVY"
-GEMINI_KEY = "AIzaSyBf_CzwRbPjyTaiEiAnQTIuZ29EXu9ldQk"
+BOT_TOKEN = os.getenv("BOT_5_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_KEY")
+MONGO_URI = os.getenv("MONGO_URI")
+
+if not all([BOT_TOKEN, GEMINI_KEY, MONGO_URI]):
+    print("❌ Bot 5 Error: Missing AI or Bot credentials in Render Environment!")
 CHANNEL_ID = -1003480585973 
 LOG_CHANNEL_ID = -1003689609198 
 OWNER_ID = 6988593629 
-MONGO_URI = "mongodb+srv://MSANODE:99insanebeing45@msanodedata.qax08fp.mongodb.net/?appName=MSANODEDATA"
+
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -1797,4 +1801,5 @@ async def main():
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
+
     asyncio.run(main())
