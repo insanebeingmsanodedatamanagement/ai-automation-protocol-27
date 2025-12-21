@@ -55,7 +55,7 @@ async def run_bots():
     for file in bot_files:
         if os.path.exists(file):
             # This starts each bot in its own background process
-            subprocess.Popen([sys.executable, file], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            subprocess.Popen([sys.executable, file])
             print(f"✅ Started: {file}")
             await asyncio.sleep(1) # Small delay to prevent CPU overload
         else:
@@ -73,3 +73,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Singularity Offline.")
+
