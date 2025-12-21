@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import pymongo
+import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject, ChatMemberUpdatedFilter, LEAVE_TRANSITION, JOIN_TRANSITION
@@ -13,8 +14,11 @@ from aiogram.exceptions import TelegramBadRequest
 # ⚡ CONFIGURATION
 # ==========================================
 # ⚠️ REPLACE THESE WITH YOUR REAL KEYS
-BOT_TOKEN = "8274830204:AAGJdF_Tu09EE0-rjoNYyM6lUfYwyS3E0g8" 
-MONGO_URI = "mongodb+srv://MSANODE:99insanebeing45@msanodedata.qax08fp.mongodb.net/?appName=MSANODEDATA" 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+
+if not BOT_TOKEN or not MONGO_URI:
+    print("❌ ERROR: Environment Variables not found! Check Render settings.")
 
 CHANNEL_ID = -1003480585973 
 CHANNEL_LINK = "https://t.me/msanode" 
@@ -413,4 +417,5 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+
     asyncio.run(main())
