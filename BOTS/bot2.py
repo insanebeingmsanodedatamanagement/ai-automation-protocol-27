@@ -718,3 +718,21 @@ def run_health_server():
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"📡 Health Server Note: {e}")
+# ================= THE SUPREME RESTART (FIXED) =================
+if __name__ == "__main__":
+    print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 2 (MANAGER)")
+    
+    # 1. Start the Health Server for Render (Fixes "No open ports")
+    # This must run so Render marks the bot as "Live"
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # 2. Start the Manager Core
+    try:
+        # Give the health server a moment to bind to port 10000
+        time.sleep(2)
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("🛑 Manager Bot Stopped Safely")
+    except Exception as e:
+        print(f"💥 CRITICAL ERROR: {e}")
+        traceback.print_exc()
