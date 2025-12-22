@@ -66,9 +66,10 @@ async def start_server():
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
+    # Bind to 0.0.0.0 so Render can see it
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    log(f"📡 Master Port {port} Online")
+    log(f"📡 Render Port {port} LOCKED & ACTIVE")
 
 # --- 2. THE MULTI-BOT ENGINE ---
 async def run_bots():
@@ -97,3 +98,4 @@ async def main():
 if __name__ == "__main__":
     try: asyncio.run(main())
     except Exception as e: log(f"💥 CRASH: {e}")
+
