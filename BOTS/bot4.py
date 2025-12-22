@@ -5,6 +5,10 @@ import io
 import pickle
 import pymongo
 import re
+import threading
+from aiohttp import web
+import shutil
+import base64
 import sys
 import socket
 import time
@@ -51,7 +55,37 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 col_pdfs = None
 db_client = None
+# --- RENDER SECRET INJECTION ---
+def prepare_secrets():
+    """Moves Google secrets from Render /etc/secrets to local folder."""
+    targets = {"token.pickle.base64": "token.pickle", "credentials.json": "credentials.json"}
+    search_paths = ["/etc/secrets", "..", "."]
+    
+    for src, target in targets.items():
+        for path in search_paths:
+            full_src = os.path.join(path, src)
+            if os.path.exists(full_src):
+                if ".base64" in src:
+                    with open(full_src, "r") as f:
+                        binary = base64.b64decode(f.read().strip())
+                    with open(target, "wb") as f: f.write(binary)
+                else:
+                    shutil.copy(full_src, target)
+                print(f"✅ Secret Injected: {target}")
+                break
 
+# --- RENDER PORT BINDER ---
+async def handle_health(request):
+    return web.Response(text="CORE 4 (PDF INFRASTRUCTURE) IS ACTIVE")
+
+def run_health_server():
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health)
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Note: {e}")
 def connect_db():
     global col_pdfs, db_client
     try:
@@ -545,8 +579,17 @@ async def main():
         await bot.session.close()
 
 if __name__ == "__main__":
+    print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 4")
+    
+    # 1. Prepare Google Drive Secrets first
+    prepare_secrets()
+    
+    # 2. Start Health Server in background
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # 3. Launch Bot 4
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
+        print("◈ Bot 4 Shutdown.")
 
-        print("◈ MSANODE Shutdown.")
