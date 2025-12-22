@@ -24,8 +24,8 @@ if not BOT_TOKEN or not MONGO_URI:
 
 CHANNEL_ID = -1003480585973 
 CHANNEL_LINK = "https://t.me/msanode" 
-YOUTUBE_LINK = "http://www.youtube.com/@msanode" 
-INSTAGRAM_LINK = "https://www.instagram.com/msanode" 
+YOUTUBE_LINK = "https://youtube.com/@msanodeofficial?si=Se3-GQpOoMt0Ur_3" 
+INSTAGRAM_LINK = "https://www.instagram.com/msanodeofficial?igsh=MXZjb2VjY2Z6MzR1Nw==" 
 
 # 🧠 PSYCHOLOGY: Titles for YouTube Videos (Fallback)
 CLICKBAIT_TITLES = [
@@ -440,4 +440,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("🛑 Bot 1 Stopped")
+
 
