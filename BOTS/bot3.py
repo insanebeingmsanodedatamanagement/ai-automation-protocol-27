@@ -14,6 +14,7 @@ from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.storage import StateMemoryStorage
 from datetime import datetime
+from aiohttp import web
 
 # ================= CONFIGURATION =================
 # These pull from the Render Environment Variables we will set next
@@ -337,17 +338,35 @@ def step_remove_code(message):
 
 def step_yt_link(m): bot.register_next_step_handler(bot.reply_to(m, "Title:"), lambda msg: (col_viral.insert_one({"link": m.text, "desc": msg.text}), bot.reply_to(msg, "✅ Saved.")))
 def step_insta_link(m): bot.register_next_step_handler(bot.reply_to(m, "Desc:"), lambda msg: (col_reels.insert_one({"link": m.text, "desc": msg.text}), bot.reply_to(msg, "✅ Saved.")))
+# --- RENDER PORT BINDER ---
+async def handle_health(request):
+    return web.Response(text="BOT 3 IS ONLINE")
 
+def run_health_server():
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health)
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Note: {e}")
+# ================= THE SUPREME RESTART =================
 if __name__ == "__main__":
     print("💎 MSANODE DATA CORE: ACTIVATING GOD MODE...")
+    
+    # 1. Start the Health Server for Render (Stops the "No open ports" error)
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # 2. Kill Ghost Sessions
     bot.remove_webhook()
     time.sleep(2)
     
+    # 3. High-Stability Polling Loop
     while True:
         try:
-            print("📡 Bot 3: Starting Long Polling...")
-            # 'none_stop=True' is critical for Render stability
-            bot.polling(none_stop=True, interval=2, timeout=60)
+            print("📡 Connection established. Monitoring Buttons...")
+            bot.polling(none_stop=True, skip_pending=True, timeout=60, long_polling_timeout=60)
         except Exception as e:
-            print(f"⚠️ Bot 3 Restarting due to: {e}")
+            print(f"⚠️ Conflict/Error: {e}. Reconnecting in 10s...")
             time.sleep(10)
+
