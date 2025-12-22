@@ -2,7 +2,8 @@ import asyncio
 import logging
 import random
 import html
-
+import threading
+from aiohttp import web
 import uuid
 import re
 import os
@@ -61,7 +62,10 @@ col_api_ledger = None
 col_vault = None
 col_schedules = None
 col_settings = None
-
+MODEL_POOL = ["gemini-2.5-flash", "gemini-2.5-pro","gemini-2.5-flash-preview-09-2025","gemini-2.5-flash-lite","gemini-2.5-flash-lite-preview-09-2025"]
+API_USAGE_COUNT = 0
+CONSOLE_LOGS = [] # Required for your terminal_viewer
+PENDING_APPROVALS = {} # Required for your scheduling logic
 # ==========================================
 # 🛠 SETUP
 # ==========================================
@@ -359,7 +363,18 @@ async def alchemy_transform(raw_text):
         resp = await model.generate_content_async(prompt)
         return re.sub(r"^(Here is|Sure).*?\n", "", resp.text, flags=re.IGNORECASE).strip()
     except: return "⚠️ Alchemy Failed."
+# --- RENDER PORT BINDER (SHIELD) ---
+async def handle_health(request):
+    return web.Response(text="CORE 5 (AI SINGULARITY) IS ACTIVE")
 
+def run_health_server():
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health)
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Note: {e}")
 # ==========================================
 # 📡 UTILITY LOGIC
 # ==========================================
@@ -1799,7 +1814,15 @@ async def main():
         except Exception as e:
             print(f"Polling error: {e}")
             await asyncio.sleep(5)
+# --- RENDER PORT BINDER (SHIELD) ---
+async def handle_health(request):
+    return web.Response(text="CORE 5 (AI SINGULARITY) IS ACTIVE")
 
-if __name__ == "__main__":
-
-    asyncio.run(main())
+def run_health_server():
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health)
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Note: {e}")
