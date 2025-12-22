@@ -338,24 +338,16 @@ def step_remove_code(message):
 def step_yt_link(m): bot.register_next_step_handler(bot.reply_to(m, "Title:"), lambda msg: (col_viral.insert_one({"link": m.text, "desc": msg.text}), bot.reply_to(msg, "✅ Saved.")))
 def step_insta_link(m): bot.register_next_step_handler(bot.reply_to(m, "Desc:"), lambda msg: (col_reels.insert_one({"link": m.text, "desc": msg.text}), bot.reply_to(msg, "✅ Saved.")))
 
-# ================= THE SUPREME RESTART (RENDER OPTIMIZED) =================
 if __name__ == "__main__":
     print("💎 MSANODE DATA CORE: ACTIVATING GOD MODE...")
-    
-    # 1. Kill Ghost Sessions & Clear Webhooks
     bot.remove_webhook()
+    time.sleep(2)
     
-    # 2. Connection Cooling (Crucial for Render Startup)
-    print("⏳ Cooling connection for stability...")
-    time.sleep(5)
-    
-    # 3. High-Stability Polling Loop with Long Timeouts
     while True:
         try:
-            print("📡 Connection established. Monitoring Buttons...")
-            # Increased timeout and long_polling_timeout for Render's network
-            bot.polling(none_stop=True, skip_pending=True, timeout=60, long_polling_timeout=60)
+            print("📡 Bot 3: Starting Long Polling...")
+            # 'none_stop=True' is critical for Render stability
+            bot.polling(none_stop=True, interval=2, timeout=60)
         except Exception as e:
-            print(f"⚠️ Conflict/Error: {e}. Reconnecting in 10s...")
-            # Increased sleep to let Render CPU cool down
+            print(f"⚠️ Bot 3 Restarting due to: {e}")
             time.sleep(10)
