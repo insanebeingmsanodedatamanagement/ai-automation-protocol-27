@@ -66,6 +66,7 @@ MODEL_POOL = ["gemini-2.5-flash", "gemini-2.5-pro","gemini-2.5-flash-preview-09-
 API_USAGE_COUNT = 0
 CONSOLE_LOGS = [] # Required for your terminal_viewer
 PENDING_APPROVALS = {} # Required for your scheduling logic
+model = None
 # ==========================================
 # 🛠 SETUP
 # ==========================================
@@ -1826,3 +1827,25 @@ def run_health_server():
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"📡 Health Server Note: {e}")
+# ==========================================
+# 🚀 THE SUPREME STARTUP (THE FIX)
+# ==========================================
+if __name__ == "__main__":
+    print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 5 (AI SINGULARITY)")
+    
+    # 1. Start the Health Server in a background thread
+    # This stops the "No open ports detected" error immediately
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # 2. Launch the AI Singularity main loop
+    try:
+        # Buffer to allow port binding to stabilize
+        time.sleep(2) 
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("◈ Bot 5 Shutdown.")
+    except Exception as e:
+        # This will show us EXACTLY why the bot crashed in Render logs
+        print(f"💥 CRITICAL STARTUP ERROR: {e}")
+        import traceback
+        traceback.print_exc()
