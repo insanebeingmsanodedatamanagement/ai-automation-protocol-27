@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import random
+import threading
+from aiohttp import web
 import pymongo
 import os
 from datetime import datetime
@@ -81,7 +83,18 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+# --- RENDER PORT BINDER ---
+async def handle_health(request):
+    return web.Response(text="BOT 1 (HUMAN EDITION) IS ACTIVE")
 
+def run_health_server():
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health)
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Note: {e}")
 # --- MONGODB CONNECTION ---
 print("🔄 Connecting to Database...")
 try:
@@ -417,5 +430,14 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 1")
+    
+    # 1. Start Health Server in background thread (Fixes Render Port error)
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # 2. Run the Bot
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("🛑 Bot 1 Stopped")
 
-    asyncio.run(main())
