@@ -17,14 +17,14 @@ from datetime import datetime
 from aiohttp import web
 
 # ================= CONFIGURATION =================
-# These pull from the Render Environment Variables we will set next
 BOT_TOKEN = os.getenv("BOT_3_TOKEN") 
 MONGO_URI = os.getenv("MONGO_URI")
 
 if not BOT_TOKEN or not MONGO_URI:
     print("❌ SECURITY ALERT: Bot 3 keys missing from Environment!")
 
-MAIN_BOT_USERNAME = "@msanodedatamanagerbot" 
+# Hardcoded for the new empire identity
+MAIN_BOT_USERNAME = "@msanodebot" 
 MASTER_ADMIN_ID = 6988593629 
 
 # Timezone
@@ -35,7 +35,7 @@ print("🔄 Initializing Empire Data Manager (God Mode)...")
 # ================= DATABASE CONNECTION =================
 try:
     client = pymongo.MongoClient(MONGO_URI)
-    db = client["MSANNodeDB"]
+    db = client["MSANodeDB"]
     
     # Collections
     col_active = db["active_content"]
@@ -68,7 +68,6 @@ def safe_execute(func):
         except Exception as e:
             print(f"⚠️ Error in {func.__name__}: {e}")
             try:
-                # Optimized error reporting
                 chat_id = None
                 if len(args) > 0:
                     if hasattr(args[0], 'chat'): chat_id = args[0].chat.id
@@ -99,8 +98,8 @@ def log_audit(action, user, details, code="N/A"):
     except: pass
 
 def get_next_code_suggestion():
-    try: return f"VIDEO{col_active.count_documents({}) + 1}"
-    except: return "VIDEO1"
+    try: return f"M{col_active.count_documents({}) + 101}"
+    except: return "M101"
 
 def get_storage_usage():
     try:
@@ -113,19 +112,12 @@ def get_storage_usage():
 def get_main_menu():
     markup = InlineKeyboardMarkup()
     markup.row_width = 2
-    # Content
     markup.add(InlineKeyboardButton("➕ Add Content", callback_data="btn_add"), InlineKeyboardButton("🔗 Get Smart Links", callback_data="btn_link"))
-    # Reports
     markup.add(InlineKeyboardButton("📦 Full Inventory", callback_data="btn_full_list"), InlineKeyboardButton("💾 Check Storage", callback_data="btn_storage"))
-    # Media
     markup.add(InlineKeyboardButton("🎬 Add YT Video", callback_data="btn_yt"), InlineKeyboardButton("📸 Add IG Reel", callback_data="btn_insta"))
-    # Edit/Search
     markup.add(InlineKeyboardButton("🔍 Search", callback_data="btn_search"), InlineKeyboardButton("✏️ Edit", callback_data="btn_edit"))
-    # Maintenance
     markup.add(InlineKeyboardButton("🗑️ Remove", callback_data="btn_remove"), InlineKeyboardButton("🧹 Deep Clean", callback_data="btn_clean"))
-    # Stats
     markup.add(InlineKeyboardButton("🏥 Health Check", callback_data="btn_health"), InlineKeyboardButton("📈 Traffic Stats", callback_data="btn_traffic"))
-    # Admin
     markup.add(InlineKeyboardButton("📊 DB Counts", callback_data="btn_stats"), InlineKeyboardButton("📂 Export CSV", callback_data="btn_export"))
     markup.add(InlineKeyboardButton("🔄 Refresh Admins", callback_data="btn_refresh"))
     return markup
@@ -154,7 +146,7 @@ def handle_docs(message):
     
     if len(df.columns) < 3: os.remove(save_path); return bot.reply_to(message, "❌ Columns must be: Code, PDF, Affiliate")
     
-    data_list = [{"code": str(row[0]), "pdf_link": str(row[1]), "aff_link": str(row[2])} for index, row in df.iterrows()]
+    data_list = [{"code": str(row[0]).upper(), "pdf_link": str(row[1]), "aff_link": str(row[2])} for index, row in df.iterrows()]
     if data_list: col_active.insert_many(data_list)
     
     log_audit("BULK_IMPORT", message.from_user.first_name, f"Imported {len(data_list)}")
@@ -164,10 +156,7 @@ def handle_docs(message):
 @bot.callback_query_handler(func=lambda call: True)
 @safe_execute
 def handle_query(call):
-    # --- CRITICAL FIX: STOP LOADING SPINNER IMMEDIATELY ---
     bot.answer_callback_query(call.id)
-    print(f"💎 BUTTON ACTION: {call.data}")
-
     if not is_admin(call.from_user.id): return bot.send_message(call.message.chat.id, "⛔ Access Denied")
     data = call.data
 
@@ -177,9 +166,8 @@ def handle_query(call):
         bot.register_next_step_handler(msg, step_process_edit, field, code)
         return
 
-    # Routing
     if data == "btn_add":
-        msg = bot.send_message(call.message.chat.id, f"Enter Code:\n💡 Sug: `{get_next_code_suggestion()}`", parse_mode="Markdown")
+        msg = bot.send_message(call.message.chat.id, f"📥 **Step 1:** Enter the **M-Code**:\n💡 Suggested: `{get_next_code_suggestion()}`", parse_mode="Markdown")
         bot.register_next_step_handler(msg, step_add_code)
     
     elif data == "btn_link": 
@@ -215,17 +203,13 @@ def handle_query(call):
         msg = bot.send_message(call.message.chat.id, "📸 Enter Reel Link:")
         bot.register_next_step_handler(msg, step_insta_link)
 
-    elif data == "btn_traffic":
-        run_traffic_analysis(call.message)
-    elif data == "btn_clean":
-        run_deep_clean(call.message)
+    elif data == "btn_traffic": run_traffic_analysis(call.message)
+    elif data == "btn_clean": run_deep_clean(call.message)
     elif data == "btn_health":
         bot.send_message(call.message.chat.id, "🏥 Scanning...")
         run_health_check(call.message)
-    elif data == "btn_export":
-        run_export(call.message)
-    elif data == "btn_stats":
-        run_stats(call.message)
+    elif data == "btn_export": run_export(call.message)
+    elif data == "btn_stats": run_stats(call.message)
     elif data == "btn_refresh":
         global last_cache_time; last_cache_time = 0; get_authorized_users()
         bot.send_message(call.message.chat.id, "🔐 Admins Refreshed.", reply_markup=get_main_menu())
@@ -283,15 +267,15 @@ def run_export(message):
 # ================= STEPS =================
 @safe_execute
 def step_add_code(message):
-    code = message.text.strip()
+    code = message.text.upper().strip()
     if col_active.find_one({"code": code}): return bot.reply_to(message, "⚠️ Exists.", reply_markup=get_main_menu())
-    msg = bot.reply_to(message, f"Code: `{code}`\nSend PDF Link:", parse_mode="Markdown")
+    msg = bot.reply_to(message, f"Code Locked: `{code}`\n────────────────────\n🔗 **Step 2:** Send the **PDF Link**:", parse_mode="Markdown")
     bot.register_next_step_handler(msg, step_add_pdf, code)
 
 @safe_execute
 def step_add_pdf(message, code):
     pdf = message.text.strip()
-    msg = bot.reply_to(message, "Send Aff Link:")
+    msg = bot.reply_to(message, f"PDF Link Received.\n────────────────────\n💸 **Step 3:** Send the **Affiliate Link**:")
     bot.register_next_step_handler(msg, step_add_aff, code, pdf)
 
 @safe_execute
@@ -299,23 +283,23 @@ def step_add_aff(message, code, pdf):
     aff = message.text.strip()
     col_active.insert_one({"code": code, "pdf_link": pdf, "aff_link": aff})
     log_audit("ADDED", message.from_user.username or message.from_user.id, code)
-    bot.reply_to(message, "✅ Added.", reply_markup=get_main_menu())
+    bot.reply_to(message, f"✅ **SUCCESS**\n\nCode `{code}` is now stored in the Vault.", reply_markup=get_main_menu())
 
 @safe_execute
 def step_get_link(message):
-    code = message.text.strip()
-    base = MAIN_BOT_USERNAME.replace('@', '')
-    bot.reply_to(message, f"🔗 **Links for {code}**\n\n🔴 `https://t.me/{base}?start=yt_{code}`\n📸 `https://t.me/{base}?start=ig_{code}`", parse_mode="Markdown", reply_markup=get_main_menu())
+    code = message.text.upper().strip()
+    clean_username = MAIN_BOT_USERNAME.replace('@', '')
+    bot.reply_to(message, f"🔗 **Smart Links for {code}**\n\n🔴 **YouTube:**\n`https://t.me/{clean_username}?start=yt_{code}`\n\n📸 **Instagram:**\n`https://t.me/{clean_username}?start=ig_{code}`", parse_mode="Markdown", reply_markup=get_main_menu())
 
 @safe_execute
 def step_search_code(message):
-    res = col_active.find_one({"code": message.text.strip()})
+    res = col_active.find_one({"code": message.text.upper().strip()})
     if not res: return bot.reply_to(message, "❌ Not Found.", reply_markup=get_main_menu())
     bot.reply_to(message, f"🔍 **{res['code']}**\n📄 {res['pdf_link']}\n💰 {res['aff_link']}", reply_markup=get_main_menu())
 
 @safe_execute
 def step_edit_start(message):
-    code = message.text.strip()
+    code = message.text.upper().strip()
     if not col_active.find_one({"code": code}): return bot.reply_to(message, "❌ Not Found.")
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("Edit PDF", callback_data=f"edit:pdf_link:{code}"), InlineKeyboardButton("Edit Aff", callback_data=f"edit:aff_link:{code}"))
@@ -328,7 +312,7 @@ def step_process_edit(message, field, code):
 
 @safe_execute
 def step_remove_code(message):
-    code = message.text.strip()
+    code = message.text.upper().strip()
     res = col_active.find_one_and_delete({"code": code})
     if res:
         del res["_id"]; res["deleted_at"] = get_current_time()
@@ -338,6 +322,7 @@ def step_remove_code(message):
 
 def step_yt_link(m): bot.register_next_step_handler(bot.reply_to(m, "Title:"), lambda msg: (col_viral.insert_one({"link": m.text, "desc": msg.text}), bot.reply_to(msg, "✅ Saved.")))
 def step_insta_link(m): bot.register_next_step_handler(bot.reply_to(m, "Desc:"), lambda msg: (col_reels.insert_one({"link": m.text, "desc": msg.text}), bot.reply_to(msg, "✅ Saved.")))
+
 # --- RENDER PORT BINDER ---
 async def handle_health(request):
     return web.Response(text="BOT 3 IS ONLINE")
@@ -350,18 +335,14 @@ def run_health_server():
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"📡 Health Server Note: {e}")
+
 # ================= THE SUPREME RESTART =================
 if __name__ == "__main__":
     print("💎 MSANODE DATA CORE: ACTIVATING GOD MODE...")
-    
-    # 1. Start the Health Server for Render (Stops the "No open ports" error)
     threading.Thread(target=run_health_server, daemon=True).start()
-    
-    # 2. Kill Ghost Sessions
     bot.remove_webhook()
     time.sleep(2)
     
-    # 3. High-Stability Polling Loop
     while True:
         try:
             print("📡 Connection established. Monitoring Buttons...")
@@ -369,4 +350,3 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"⚠️ Conflict/Error: {e}. Reconnecting in 10s...")
             time.sleep(10)
-
