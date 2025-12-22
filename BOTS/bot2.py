@@ -3,6 +3,8 @@ import logging
 import os
 import csv
 import time
+import threading
+from aiohttp import web
 import functools
 import traceback
 from datetime import datetime, timedelta
@@ -88,7 +90,18 @@ try:
 except Exception as e:
     print(f"❌ CRITICAL DB ERROR: {e}")
     exit()
+# --- RENDER PORT BINDER (SHIELD) ---
+async def handle_health(request):
+    return web.Response(text="CORE 2 (MANAGER BOT) IS ACTIVE")
 
+def run_health_server():
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health)
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Note: {e}")
 # ==========================================
 # 🛡️ IRON DOME & HELPERS
 # ==========================================
@@ -693,7 +706,15 @@ async def main():
     asyncio.create_task(scheduled_health_check())
     asyncio.create_task(scheduled_pruning_cleanup()) 
     await dp.start_polling(manager_bot)
+# --- RENDER PORT BINDER (SHIELD) ---
+async def handle_health(request):
+    return web.Response(text="CORE 2 (MANAGER BOT) IS ACTIVE")
 
-if __name__ == "__main__":
-
-    asyncio.run(main())
+def run_health_server():
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health)
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Note: {e}")
