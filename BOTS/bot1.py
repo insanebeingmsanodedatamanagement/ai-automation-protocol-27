@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_LOG_CHANNEL = os.getenv("ADMIN_LOG_CHANNEL")
 
-# Pull IDs as Integers safely
+# Pull IDs as Integers safely from Environment
 try:
     OWNER_ID = int(os.getenv("OWNER_ID", 0))
     CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
@@ -35,14 +35,14 @@ except (TypeError, ValueError):
     OWNER_ID = 0
     CHANNEL_ID = 0
 
-# Links & Branding
+# Links & Branding from Environment
 CHANNEL_LINK = os.getenv("CHANNEL_LINK") 
 BOT_USERNAME = os.getenv("BOT_USERNAME")
 YOUTUBE_LINK = os.getenv("YOUTUBE_LINK") 
 INSTAGRAM_LINK = os.getenv("INSTAGRAM_LINK") 
 
 if not BOT_TOKEN or not MONGO_URI or not OWNER_ID:
-    print("❌ CRITICAL ERROR: Mandatory Environment Variables (BOT_TOKEN, MONGO_URI, OWNER_ID) missing!")
+    print("❌ CRITICAL ERROR: Mandatory Environment Variables missing! Check Render settings.")
     sys.exit(1)
 
 # 🧠 PSYCHOLOGY: MSANODE Alpha Titles
@@ -101,9 +101,6 @@ class VaultState(StatesGroup):
     waiting_pdf = State()
     waiting_aff_link = State()
     waiting_aff_text = State()
-
-class BroadcastState(StatesGroup):
-    waiting_msg = State()
 
 # ==========================================
 # 🛠 SYSTEM SETUP
@@ -178,21 +175,19 @@ async def log_user(user: types.User, source: str):
     user_id = str(user.id)
     username = f"@{user.username}" if user.username else "None"
     
-    entry = {
-        "first_name": user.first_name,
-        "username": username,
-        "user_id": user_id,
-        "last_active": now_str,
-        "status": "Active"
-    }
-
     try:
         existing = col_users.find_one({"user_id": user_id})
         if not existing:
-            entry["joined_date"] = now_str
-            entry["interaction_count"] = 1
-            entry["source"] = source
-            col_users.insert_one(entry)
+            col_users.insert_one({
+                "first_name": user.first_name,
+                "username": username,
+                "user_id": user_id,
+                "last_active": now_str,
+                "joined_date": now_str,
+                "interaction_count": 1,
+                "source": source,
+                "status": "Active"
+            })
             await send_admin_report(f"👤 **NEW RECRUIT**\n**Name:** {user.first_name}\n**User:** {username}\n**ID:** `{user_id}`\n**Source:** {source}\n**Time:** {now_str}")
         else:
             update_fields = {"last_active": now_str, "status": "Active"}
@@ -213,35 +208,6 @@ async def get_content(code: str):
             return {"main_link": doc.get("pdf_link"), "aff_link": doc.get("aff_link"), "aff_text": aff_text}
     except: return None
     return None
-
-# ==========================================
-# 📢 ADMIN: BROADCAST SYSTEM
-# ==========================================
-
-@dp.message(Command("broadcast"))
-async def start_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID: return
-    await message.answer("📣 **MSANODE BROADCAST SYSTEM**\n\nSend the message (Text/Photo/Video) you want to blast to all users in the database:")
-    await state.set_state(BroadcastState.waiting_msg)
-
-@dp.message(BroadcastState.waiting_msg)
-async def perform_broadcast(message: types.Message, state: FSMContext):
-    users = list(col_users.find({}, {"user_id": 1}))
-    count, blocked = 0, 0
-    await message.answer(f"🚀 **Targeting {len(users)} users... Stand by.**")
-    
-    for u in users:
-        try:
-            await bot.copy_message(chat_id=u['user_id'], from_chat_id=message.chat.id, message_id=message.message_id)
-            count += 1
-            await asyncio.sleep(0.05) 
-        except (TelegramForbiddenError, TelegramBadRequest):
-            blocked += 1
-            col_users.update_one({"user_id": u['user_id']}, {"$set": {"status": "BLOCKED"}})
-            
-    await message.answer(f"✅ **Mission Complete**\n────────────────────\n📦 **Delivered:** {count}\n🚫 **Blocked/Dead:** {blocked}")
-    await send_admin_report(f"📢 **BROADCAST SENT**\n**Total Target:** {len(users)}\n**Success:** {count}\n**Failure:** {blocked}")
-    await state.clear()
 
 # ==========================================
 # 🔑 ADMIN: VAULT MANAGEMENT (ADD)
@@ -322,7 +288,7 @@ async def on_user_join(event: ChatMemberUpdated):
 async def cmd_start(message: types.Message, command: CommandObject):
     if await is_banned(message.from_user.id): return
     if await check_maintenance():
-        await message.answer("🚧 **UPGRADING MSANODE...** Give us 5 minutes.")
+        await message.answer("🚧 **UPGRADING MSANODE...**We will be back soon. Check Back After Some Time")
         return 
 
     raw_arg = command.args
@@ -372,7 +338,7 @@ async def check_join(callback: types.CallbackQuery):
     try:
         user_status = await bot.get_chat_member(CHANNEL_ID, callback.from_user.id)
         if user_status.status in ['left', 'kicked', 'restricted']:
-            await callback.answer("❌ You haven't joined the MSANODE channel yet!", show_alert=True)
+            await callback.answer("❌ You haven't joined the MSANODE channel yet! ", show_alert=True)
             return
         
         try: await callback.message.delete()
@@ -413,13 +379,13 @@ async def deliver_content(message: types.Message, payload: str, source: str):
         video = list(col_viral.aggregate(pipeline))
         if video:
             kb_cross = InlineKeyboardBuilder().button(text="▶️ WATCH FULL STRATEGY", url=video[0]['link'])
-            await message.answer(f"🔥 **Deep Dive Needed?**\n\nI just dropped a breakdown on YouTube:\n{video[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
+            await message.answer(f"🔥 **Deep Dive Needed?**\n\nI just dropped a breakdown on YouTube: Check Out Now . DONT MISS !!!!\n{video[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
     else: 
         pipeline = [{"$sample": {"size": 1}}]
         reel = list(col_reels.aggregate(pipeline))
         if reel:
-            kb_cross = InlineKeyboardBuilder().button(text="📸 WATCH QUICK HACK", url=reel[0]['link'])
-            await message.answer(f"⚡ **Need it in 60s?**\n\nCheck the fast version on Instagram:\n{reel[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
+            kb_cross = InlineKeyboardBuilder().button(text="📸 WATCH MORE NEW ", url=reel[0]['link'])
+            await message.answer(f"⚡ **Need it in 60s?**\n\nCheck the more  version on Instagram: Check Out Now . DONT MISS !!!\n{reel[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
 
 # ==========================================
 # 🚀 THE SUPREME RESTART
