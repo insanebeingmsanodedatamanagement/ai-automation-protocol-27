@@ -279,8 +279,8 @@ async def on_user_leave(event: ChatMemberUpdated):
     user = event.new_chat_member.user
     await send_admin_report(f"📉 **OPERATIVE DISCONNECTED**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
     try:
-        await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou just disconnected from the MSANODE Alpha Vault. Most people quit right before the breakthrough. Don't be 'most people'. Access is now LOCKED.", 
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-establish Connection", url=CHANNEL_LINK)]]))
+        await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou just disconnected from the MSANODE Vault. Most people quit right before the breakthrough. Don't be 'most people'. Access is now LOCKED.", 
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-establish MEMBERSHIP", url=CHANNEL_LINK)]]))
     except: pass
 
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
@@ -288,7 +288,7 @@ async def on_user_join(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
     await send_admin_report(f"📈 **OPERATIVE RE-SYNCED**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
-    try: await bot.send_message(user.id, f"🤝 **Clearance Restored, {user.first_name}.**\n\nYour commitment to the grind is noted. The MSANode Vault is open.")
+    try: await bot.send_message(user.id, f"🤝 **Clearance Restored, WELCOME BACK TO FAMILY {user.first_name}.**\n\nYour commitment to the grind is noted. The MSANode Vault is is now Exclusively open.")
     except: pass
 
 # ==========================================
@@ -328,16 +328,16 @@ async def cmd_start(message: types.Message, command: CommandObject):
         kb.row(InlineKeyboardButton(text="✅ I HAVE JOINED ALL", callback_data=f"check_{raw_arg or 'none'}"))
         
         await message.answer(
-            f"**Identity Rejected, {message.from_user.first_name}.** ✋\n\nThe MSANode Data Core is reserved for active members of the family. To unlock my private blueprints, you must re-establish your connection on all platforms.",
+            f"**Identity Rejected, {message.from_user.first_name}.** ✋\n\nThe MSANode Data Core is reserved only for active members of the family. To unlock my private blueprints, you must re-establish your MEMBERSHIPS on all platforms.",
             reply_markup=kb.as_markup()
         )
         return
 
     # --- 3. PERSONAL BRANDED WELCOME ---
     if user_status == "NEW":
-        await message.answer(f"**Connection Established, Recruit {message.from_user.first_name}!** 👋\n\nWelcome to the MSANODE Alpha Hub. You have successfully bypassed the initial filters. Ready for execution?")
+        await message.answer(f"**Connection Established, Recruit {message.from_user.first_name}!** 👋\n\nWelcome to the MSANODE VAULT. You have successfully bypassed the initial filters. {message.from_user.first_name} You Are Part Of MSANODE Family Now. Ready for execution?")
     else:
-        await message.answer(f"**Identity Verified, Operative {message.from_user.first_name}.** ✅\n\nWelcome back to the MSANODE Core. Re-syncing your requested data now...")
+        await message.answer(f"**Identity Verified, Operative {message.from_user.first_name}.** ✅\n\nWelcome back to the MSANODE VAULT. Re-syncing your requested data now...")
 
     if not payload:
         kb = InlineKeyboardBuilder()
@@ -374,7 +374,7 @@ async def deliver_content(message: types.Message, payload: str, source: str):
     name = message.chat.first_name if message.chat.first_name else "Operative"
     
     if not data: 
-        await message.answer(f"❌ **Error:** Code `{payload}` not found in the MSANODE Data Core.")
+        await message.answer(f"❌ **Error:** Code `{payload}` not found in the MSANODE VAULT.")
         return
     
     # 1. THE PDF DELIVERY
@@ -424,26 +424,34 @@ async def deliver_content(message: types.Message, payload: str, source: str):
         await message.answer(msg, reply_markup=kb_yt.as_markup())
 
 # ==========================================
-# 🚀 THE SUPREME GHOST-PROOF RESTART
+# 🚀 MSANODE NUCLEAR GHOST-KILLER RESTART
 # ==========================================
 
 async def main():
-    # Force delete webhook and drop all pending updates to clear the conflict
-    await bot.delete_webhook(drop_pending_updates=True)
-    print(f"✅ MSANODE Ghost Shield Active. Starting polling...")
+    # 1. Force Telegram to close all other connections
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("🛠 Purging old sessions... MSANode Shield Active.")
+        await asyncio.sleep(2) # Breath time for the server
+    except Exception as e:
+        print(f"⚠️ Webhook Purge Note: {e}")
+
+    # 2. Start Polling with skip_updates
+    print(f"✅ MSANODE HUB ONLINE. Monitoring for Ghost Instances...")
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
-    # Start the Health Server for Render/UptimeRobot
+    # Start the Health Server (Essential for Render & UptimeRobot)
     threading.Thread(target=run_health_server, daemon=True).start()
     
     while True:
         try:
             asyncio.run(main())
         except TelegramConflictError:
-            # If a ghost is detected, we wait 10 seconds for it to die
-            print("⚠️ CONFLICT DETECTED: Another instance is running. Waiting 10s to kill the ghost...")
-            time.sleep(10)
+            # THIS IS THE KEY: If we see conflict, we wait long enough to kill the ghost
+            print("💀 GHOST DETECTED! Conflict Error 409.")
+            print("☢️ Nuclear Option: Waiting 20 seconds to force-kill the competing instance...")
+            time.sleep(20) # Long sleep forces the other bot to time out
         except Exception as e:
-            print(f"⚠️ System Error: {e}")
+            print(f"⚠️ System Alert: {e}")
             time.sleep(15)
