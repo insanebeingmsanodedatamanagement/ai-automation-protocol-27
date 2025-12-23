@@ -9,6 +9,7 @@ from aiohttp import web
 import pymongo
 import os
 import io
+import pytz
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject, ChatMemberUpdatedFilter, LEAVE_TRANSITION, JOIN_TRANSITION, Command, StateFilter
@@ -21,13 +22,12 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramConflictError, TelegramForbiddenError
 
 # ==========================================
-# ⚡ MSANODE CONFIGURATION (ENVIRONMENT ONLY)
+# ⚡ CONFIGURATION (GHOST PROTOCOL)
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_LOG_CHANNEL = os.getenv("ADMIN_LOG_CHANNEL")
 
-# Pull IDs safely
 try:
     OWNER_ID = int(os.getenv("OWNER_ID", 0))
     CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
@@ -41,68 +41,24 @@ YOUTUBE_LINK = os.getenv("YOUTUBE_LINK")
 INSTAGRAM_LINK = os.getenv("INSTAGRAM_LINK") 
 
 if not BOT_TOKEN or not MONGO_URI or not OWNER_ID:
-    print("❌ CRITICAL ERROR: Mandatory Environment Variables missing! Check Render settings.")
+    print("❌ CRITICAL ERROR: Mandatory Environment Variables missing!")
     sys.exit(1)
 
-# 🧠 PSYCHOLOGY: MSANODE Alpha Titles
-CLICKBAIT_TITLES = [
-    "🔥 **This Strategy is Breaking the Internet**",
-    "🚀 **How to 10x Your Results Overnight**",
-    "💰 **Watch This Before It Gets Deleted**",
-    "🧠 **The 1% Are Hiding This From You**",
-    "🤫 **The Secret Loophole Nobody Talks About**",
-    "⚠️ **URGENT: This Changes Everything**",
-    "💀 **Why Most People Fail (Don't Be Them)**",
-    "💎 **Found: The 'Cheat Code' for Success**",
-    "🤯 **I Can't Believe This Actually Works**",
-    "📉 **Is This The End of Traditional Methods?**",
-    "🔓 **Unlocking The Forbidden Strategy**",
-    "⚡ **From 0 to 100: The Fast Track**",
-    "🕵️ **Leaked: What The Pros Are Using**",
-    "🔮 **Predicting The Next Big Trend**",
-    "💸 **Passive Income: The Real Truth**",
-    "🛠️ **The Tool That Replaces Hard Work**",
-    "🚫 **Don't Ignore This Warning**",
-    "👑 **Become The Authority In Your Niche**",
-    "🌪️ **This Will Disrupt The Entire Industry**",
-    "🎯 **The Exact Blueprint I Used**"
-]
+# Timezone Synchronization
+IST = pytz.timezone('Asia/Kolkata')
 
-# 🧠 PSYCHOLOGY: MSANODE Affiliate Triggers
+# 🧠 PSYCHOLOGY: Affiliate Triggers (Fallback)
 AFFILIATE_TRIGGERS = [
     "🤖 **NEW AI ALERT:** This tool is going viral right now.",
     "⚠️ **URGENT:** 90% of people are missing this opportunity.",
     "🎁 **SURPRISE BONUS:** We unlocked a secret tool for you.",
     "🔥 **HIGH DEMAND:** Automate the hard work. Try it free.",
     "⚡ **SPEED RUN:** Want results faster? Use this.",
-    "💎 **HIDDEN GEM:** Top creators use this quietly.",
-    "🚀 **BOOST:** Give yourself an unfair advantage.",
-    "🤫 **CONFIDENTIAL:** I shouldn't be sharing this.",
-    "⏳ **LIMITED TIME:** This offer might expire soon.",
-    "💡 **SMART MOVE:** Work smarter, not harder.",
-    "🔑 **ACCESS GRANTED:** Your private invite is here.",
-    "📈 **GROWTH HACK:** The shortcut you've been looking for.",
-    "🏆 **WINNER'S CIRCLE:** Join the elite users.",
-    "🛑 **STOP WAITING:** Start seeing results today.",
-    "👀 **SNEAK PEEK:** See what the hype is about.",
-    "🧪 **PROVEN:** Tested and verified results.",
-    "🌪️ **GAME CHANGER:** This disrupts everything.",
-    "🛡️ **SECURE:** The safe way to scale up.",
-    "🎯 **PRECISE:** Hit your goals with AI precision.",
-    "💰 **PROFITABLE:** The ROI on this is insane."
+    "📈 **GROWTH HACK:** The shortcut you've been looking for."
 ]
 
 # ==========================================
-# 📝 FSM STATES (ADMIN FLOWS)
-# ==========================================
-class VaultState(StatesGroup):
-    waiting_code = State()
-    waiting_pdf = State()
-    waiting_aff_link = State()
-    waiting_aff_text = State()
-
-# ==========================================
-# 🛠 SYSTEM SETUP
+# 🛠 SYSTEM SETUP (IRON DOME)
 # ==========================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -111,9 +67,9 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# --- RENDER PORT BINDER ---
+# --- RENDER PORT BINDER (HEALTH SHIELD) ---
 async def handle_health(request):
-    return web.Response(text="MSANODE SUPREME COMMANDER IS ACTIVE")
+    return web.Response(text="MSANODE GATEWAY IS ONLINE")
 
 def run_health_server():
     try:
@@ -125,7 +81,7 @@ def run_health_server():
         print(f"📡 Health Server Note: {e}")
 
 # --- MONGODB CONNECTION ---
-print("🔄 Connecting to MSANODE Database...")
+print("🔄 Connecting Gateway to MSANode Database...")
 try:
     client = pymongo.MongoClient(MONGO_URI)
     db = client["MSANodeDB"]
@@ -135,15 +91,17 @@ try:
     col_reels = db["viral_reels"]
     col_settings = db["settings"] 
     col_banned = db["banned_users"] 
-    print(f"✅ SUCCESSFULLY CONNECTED TO MSANODE MONGODB")
+    print(f"✅ GATEWAY DATA CORE: CONNECTED")
 except Exception as e:
-    print(f"❌ CRITICAL CONNECTION ERROR: {e}")
+    print(f"❌ DATABASE OFFLINE: {e}")
     sys.exit(1)
 
-# --- HELPERS ---
+# ==========================================
+# 🛡️ GATEWAY INTELLIGENCE HELPERS
+# ==========================================
 
 async def send_admin_report(text: str):
-    """Sends real-time dossier logs to the private MSANODE Admin Channel."""
+    """Sends one-time detailed dossier to the private MSANode Admin channel."""
     if ADMIN_LOG_CHANNEL:
         try:
             await bot.send_message(
@@ -152,36 +110,30 @@ async def send_admin_report(text: str):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            print(f"⚠️ Admin Report Failed: {e}")
+            print(f"⚠️ Intel Report Failed: {e}")
 
 async def check_maintenance():
     try:
         setting = col_settings.find_one({"setting": "maintenance"})
-        if setting and setting.get("value") == True:
-            return True
-    except: pass
-    return False
+        return setting and setting.get("value") == True
+    except: return False
 
 async def is_banned(user_id):
     try:
-        user = col_banned.find_one({"user_id": str(user_id)})
-        return user is not None
+        return col_banned.find_one({"user_id": str(user_id)}) is not None
     except: return False
 
 async def is_member(user_id):
-    """Strictly checks if user is still inside the Telegram channel."""
+    """Strictly verifies if user is inside the MSANode Telegram."""
     try:
-        user_status = await bot.get_chat_member(CHANNEL_ID, user_id)
-        if user_status.status in ['member', 'administrator', 'creator']:
-            return True
-    except:
-        return False
-    return False
+        status = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return status.status in ['member', 'administrator', 'creator']
+    except: return False
 
 async def log_user(user: types.User, source: str):
-    """Handles User Identity and Silent Status Updates with precise formatting."""
-    # FORMAT: dd-mm-yyyy hh:mm AM/PM (e.g. 23-12-2025 04:08 PM)
-    now_str = datetime.now().strftime("%d-%m-%Y %I:%M %p")
+    """Handles Identity Management and Silent Updates."""
+    # Master Sadiq Format: DD-MM-YYYY 11:00 PM
+    now_str = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
     user_id = str(user.id)
     username = f"@{user.username}" if user.username else "None"
     
@@ -194,18 +146,18 @@ async def log_user(user: types.User, source: str):
                 "user_id": user_id,
                 "last_active": now_str,
                 "joined_date": now_str,
-                "interaction_count": 1,
                 "source": source,
                 "status": "Active",
-                "has_reported": False # Flag for one-time dossier
+                "has_reported": False # Dossier flag
             })
             return "NEW"
         else:
             # Silent Database Update for Returning Operatives
             update_fields = {"last_active": now_str, "status": "Active"}
-            if existing.get("source") in ["Unknown", None, "Direct"]:
+            # Upgrade source if it was Unknown but now is YT/IG
+            if existing.get("source") == "Unknown" and source != "Unknown":
                 update_fields["source"] = source
-            col_users.update_one({"user_id": user_id}, {"$set": update_fields, "$inc": {"interaction_count": 1}})
+            col_users.update_one({"user_id": user_id}, {"$set": update_fields})
             return "RETURNING"
     except Exception as e: 
         print(f"❌ LOG ERROR: {e}")
@@ -215,73 +167,23 @@ async def get_content(code: str):
     try:
         doc = col_active.find_one({"code": code.upper()})
         if doc:
-            aff_text = doc.get("aff_text")
-            if not aff_text or len(aff_text) < 5:
-                aff_text = random.choice(AFFILIATE_TRIGGERS)
+            aff_text = doc.get("aff_text") or random.choice(AFFILIATE_TRIGGERS)
             return {"main_link": doc.get("pdf_link"), "aff_link": doc.get("aff_link"), "aff_text": aff_text}
     except: return None
     return None
 
 # ==========================================
-# 🔑 ADMIN: VAULT MANAGEMENT (ADD)
-# ==========================================
-
-@dp.message(Command("add"), StateFilter("*"))
-async def add_start(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID: return
-    await state.clear()
-    await message.answer("🛠 **MSANODE VAULT ADD PROTOCOL**\n────────────────────\n📥 **Step 1:** Enter the **M-Code** (e.g. M101):")
-    await state.set_state(VaultState.waiting_code)
-
-@dp.message(VaultState.waiting_code)
-async def process_code(message: types.Message, state: FSMContext):
-    code = message.text.upper().strip()
-    await state.update_data(code=code)
-    await message.answer(f"✅ Code `{code}` Locked.\n────────────────────\n🔗 **Step 2:** Paste the **PDF Link**:")
-    await state.set_state(VaultState.waiting_pdf)
-
-@dp.message(VaultState.waiting_pdf)
-async def process_pdf(message: types.Message, state: FSMContext):
-    await state.update_data(pdf_link=message.text.strip())
-    await message.answer("💸 **Step 3:** Paste the **Affiliate Link** (or type 'none'):")
-    await state.set_state(VaultState.waiting_aff_link)
-
-@dp.message(VaultState.waiting_aff_link)
-async def process_aff(message: types.Message, state: FSMContext):
-    await state.update_data(aff_link=message.text.strip())
-    await message.answer("📝 **Step 4:** Enter the **Affiliate CTA Text** (Psychology trigger):")
-    await state.set_state(VaultState.waiting_aff_text)
-
-@dp.message(VaultState.waiting_aff_text)
-async def process_finish(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    aff_link = data['aff_link'] if data['aff_link'].lower() != 'none' else ""
-    
-    col_active.update_one(
-        {"code": data['code']},
-        {"$set": {
-            "pdf_link": data['pdf_link'],
-            "aff_link": aff_link,
-            "aff_text": message.text.strip(),
-            "created_at": datetime.now()
-        }}, upsert=True
-    )
-    await message.answer(f"🚀 **MSANODE VAULT UPDATED**\nCode `{data['code']}` is now LIVE and active.")
-    await state.clear()
-
-# ==========================================
-# 🚨 WATCHDOG: MSANODE RETENTION SHIELD
+# 🚨 RETENTION WATCHDOG
 # ==========================================
 
 @dp.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
 async def on_user_leave(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
-    # Silent Database status update
-    col_users.update_one({"user_id": str(user.id)}, {"$set": {"status": "Disconnected"}})
+    col_users.update_one({"user_id": str(user.id)}, {"$set": {"status": "LEFT"}})
     try:
-        await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou just disconnected from the MSANODE Vault. Most people quit right before the breakthrough. Don't be 'most people'. Access is now LOCKED.", 
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-establish MEMBERSHIP", url=CHANNEL_LINK)]]))
+        await bot.send_message(user.id, f"⚠️ **Connection Broken, {user.first_name}...**\n\nYou left the MSANode Core. Access is now locked. Re-join to continue.", 
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-Join MSANode", url=CHANNEL_LINK)]]))
     except: pass
 
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
@@ -289,61 +191,53 @@ async def on_user_join(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
     col_users.update_one({"user_id": str(user.id)}, {"$set": {"status": "Active"}})
-    try: await bot.send_message(user.id, f"🤝 **Clearance Restored, WELCOME BACK TO FAMILY {user.first_name}.**\n\nYour commitment to the grind is noted. The MSANode Vault is now Exclusively open.")
+    try: await bot.send_message(user.id, f"🤝 **Clearance Restored, {user.first_name}.**")
     except: pass
 
 # ==========================================
-# 🤖 BOT LOGIC: THE MSANODE HUB
+# 🤖 BOT LOGIC: THE MSANODE GATEWAY
 # ==========================================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
     if await is_banned(message.from_user.id): return
     if await check_maintenance():
-        await message.answer("🚧 **UPGRADING MSANODE CORE...** We will be back soon. Check back after some time.")
+        await message.answer("🚧 **UPGRADING CORE...** We will be back soon.")
         return 
 
     raw_arg = command.args
-    source = "Direct" 
-    payload = None
-
+    source = "Unknown"; payload = None
     if raw_arg:
         if raw_arg.startswith("ig_"): source = "Instagram"; payload = raw_arg.replace("ig_", "")
         elif raw_arg.startswith("yt_"): source = "YouTube"; payload = raw_arg.replace("yt_", "")
         else: payload = raw_arg
     
-    # --- 1. IDENTITY ENGINE ---
     user_status = await log_user(message.from_user, source)
 
-    # --- 2. THE GATEKEEPER (STRICT MEMBERSHIP CHECK) ---
+    # STRICT MEMBERSHIP CHECK
     if not await is_member(message.from_user.id):
         kb = InlineKeyboardBuilder()
-        if source == "Instagram":
-            kb.row(InlineKeyboardButton(text="🔴 Subscribe on YouTube", url=YOUTUBE_LINK))
-            kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
-        else:
-            kb.row(InlineKeyboardButton(text="📸 Follow on Instagram", url=INSTAGRAM_LINK))
-            kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
-            
+        if source == "YouTube": kb.row(InlineKeyboardButton(text="📸 Follow on Instagram", url=INSTAGRAM_LINK))
+        else: kb.row(InlineKeyboardButton(text="🔴 Subscribe on YouTube", url=YOUTUBE_LINK))
+        kb.row(InlineKeyboardButton(text="🚀 Join MSANode Telegram", url=CHANNEL_LINK))
         kb.row(InlineKeyboardButton(text="✅ I HAVE JOINED ALL", callback_data=f"check_{raw_arg or 'none'}"))
         
         await message.answer(
-            f"**Identity Rejected, {message.from_user.first_name}.** ✋\n\nThe MSANode Data Core is reserved only for active members of the family. To unlock my private blueprints, you must re-establish your MEMBERSHIPS on all platforms.",
+            f"**Identity Verification Required, {message.from_user.first_name}.** ✋\n\nThe MSANode Data Core is reserved for active members. Synchronize below to unlock clearance:",
             reply_markup=kb.as_markup()
         )
         return
 
-    # --- 3. PERSONAL BRANDED WELCOME ---
+    # BRANDED PSYCHOLOGICAL WELCOME
     if user_status == "NEW":
-        await message.answer(f"**Connection Established, Recruit {message.from_user.first_name}!** 👋\n\nWelcome to the MSANODE VAULT. You have successfully bypassed the initial filters. {message.from_user.first_name} You Are Part Of MSANODE Family Now. Ready for execution?")
+        await message.answer(f"**Welcome Recruit, {message.from_user.first_name}.** 👋\n\nConnection established with MSANODE. You are successfully part of the family. Ready for execution?")
     else:
-        await message.answer(f"**Identity Verified, Operative {message.from_user.first_name}.** ✅\n\nWelcome back to the MSANODE VAULT. Re-syncing your requested data now...")
+        await message.answer(f"**Clearance Verified, Operative {message.from_user.first_name}.** ✅\n\nWelcome back to the MSANODE Core. Re-syncing requested data...")
 
     if not payload:
         kb = InlineKeyboardBuilder()
         kb.row(InlineKeyboardButton(text="🔴 YouTube Channel", url=YOUTUBE_LINK), InlineKeyboardButton(text="📸 Instagram Page", url=INSTAGRAM_LINK))
-        await asyncio.sleep(1.0)
-        await message.answer(f"**HELLO! MSANODE AGENT ONLINE.**\n\nTo unlock a specific blueprint, use the Pinned Comment **LINK** from my latest videos.", reply_markup=kb.as_markup())
+        await message.answer(f"**HELLO! MSANODE AGENT ONLINE.**\n\nTo unlock a blueprint, use the link from the pinned comments of my latest content.", reply_markup=kb.as_markup())
         return
 
     await deliver_content(message, payload, source)
@@ -351,14 +245,12 @@ async def cmd_start(message: types.Message, command: CommandObject):
 @dp.callback_query(F.data.startswith("check_"))
 async def check_join(callback: types.CallbackQuery):
     raw_arg = callback.data.split("_", 1)[1]
-    
     if not await is_member(callback.from_user.id):
-        await callback.answer("❌ PROTOCOL FAILED: Join the channel first!", show_alert=True)
+        await callback.answer("❌ Error: Membership not detected in MSANode Vault.", show_alert=True)
         return
-        
+
     try: await callback.message.delete()
     except: pass
-    
     await callback.message.answer(f"**Clearance Granted, {callback.from_user.first_name}.** ✅")
     
     if raw_arg != "none":
@@ -366,26 +258,30 @@ async def check_join(callback: types.CallbackQuery):
         payload = raw_arg.replace("ig_", "").replace("yt_", "")
         await deliver_content(callback.message, payload, source)
     else:
-        await callback.message.answer("✅ **Access Restored.** Welcome back to MSANODE.")
+        await callback.message.answer("✅ **Access Restored.** Welcome back.")
 
 async def deliver_content(message: types.Message, payload: str, source: str):
     data = await get_content(payload)
     user_id = str(message.chat.id)
-    name = message.chat.first_name if message.chat.first_name else "Operative"
+    name = message.chat.first_name or "Operative"
     username = f"@{message.chat.username}" if message.chat.username else "None"
     
     if not data: 
-        await message.answer(f"❌ **Error:** Code `{payload}` not found in the MSANODE VAULT.")
+        await message.answer(f"❌ **Data Error:** Code `{payload}` is invalid or expired.")
         return
     
-    # --- INTELLIGENCE REPORTING (ONE TIME DOSSIER ONLY) ---
+    # 1. 📂 THE DELIVERY
+    await message.answer(f"**Transmission Successful.** 🔓\n\nYour requested MSANode Blueprint is ready:\n{data['main_link']}")
+
+    # --- ONE-TIME ADMIN INTELLIGENCE DOSSIER ---
+    # Trigger: If user exists in DB but hasn't been reported to the admin channel yet
     user_doc = col_users.find_one({"user_id": user_id})
     if user_doc and not user_doc.get("has_reported", False):
-        report_time = datetime.now().strftime("%d-%m-%Y %I:%M %p")
+        report_time = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
         dossier = (
             f"👤 **NEW RECRUIT CAPTURED**\n"
             f"**Name:** {name}\n"
-            f"**Username:** {username}\n"
+            f"**User:** {username}\n"
             f"**ID:** `{user_id}`\n"
             f"**Source:** {source}\n"
             f"**M-Code Used:** `{payload}`\n"
@@ -396,75 +292,58 @@ async def deliver_content(message: types.Message, payload: str, source: str):
         await send_admin_report(dossier)
         col_users.update_one({"user_id": user_id}, {"$set": {"has_reported": True}})
 
-    # 1. THE PDF DELIVERY
-    await message.answer(f"**Transmission Successful, {name}.** 🔓\n\nHere is your requested MSANODE blueprint:\n{data['main_link']}")
-
-    # 2. THE PSYCHOLOGICAL AFFILIATE (DELAYED)
+    # 2. 💸 THE PSYCHOLOGICAL AFFILIATE (DELAYED)
     if data['aff_link'] and len(data['aff_link']) > 5:
         await asyncio.sleep(1.5)
         kb_aff = InlineKeyboardBuilder().button(text="🚀 UNLOCK THE ENGINE", url=data['aff_link'])
         await message.answer(f"🤫 **Wait, one more tool for the army...**\n\n{data['aff_text']}", reply_markup=kb_aff.as_markup())
 
-    # 3. THE CROSS-PLATFORM PSYCHOLOGY (INTELLIGENT SYNC)
+    # 3. 🔄 THE CROSS-SYNC (INTELLIGENT GROWTH)
     await asyncio.sleep(1.5)
-    
     if source == "YouTube":
-        # FROM YT -> PUSH IG + REMIND YT
-        pipeline = [{"$sample": {"size": 1}}]
-        reel = list(col_reels.aggregate(pipeline))
-        msg = f"⚡ **Maximize Your Edge, {name}.**\n\nYou've seen the deep dive, but I drop daily automation hacks on my Instagram stories. Join the elite there for real-time updates. Check Out Now. DONT MISS !!!!"
-        kb_ig = InlineKeyboardBuilder()
-        if reel:
-            msg += f"\n\n🔥 **Trending Now on Instagram:**\n{reel[0].get('desc', 'New Hack Active')}"
-            kb_ig.row(InlineKeyboardButton(text="📸 WATCH DAILY ALPHA", url=reel[0]['link']))
-        else:
-            kb_ig.row(InlineKeyboardButton(text="📸 FOLLOW INSTAGRAM", url=INSTAGRAM_LINK))
-        kb_ig.row(InlineKeyboardButton(text="▶️ STAY TUNED ON YOUTUBE", url=YOUTUBE_LINK))
-        await message.answer(msg, reply_markup=kb_ig.as_markup())
-        
-    else: 
-        # FROM IG -> PUSH YT + REMIND IG
-        pipeline = [{"$sample": {"size": 1}}]
-        video = list(col_viral.aggregate(pipeline))
-        msg = f"🔥 **Go Beyond the Surface, {name}.**\n\nInstagram is for speed, but YouTube is for the real money. I just dropped a breakdown on YouTube that you can't afford to miss. Check Out Now. DONT MISS !!!!"
-        kb_yt = InlineKeyboardBuilder()
-        if video:
-            msg += f"\n\n▶️ **New Deep Dive on YouTube:**\n{video[0].get('desc', 'Elite Strategy Revealed')}"
-            kb_yt.row(InlineKeyboardButton(text="▶️ WATCH FULL STRATEGY", url=video[0]['link']))
-        else:
-            kb_yt.row(InlineKeyboardButton(text="▶️ SUBSCRIBE YOUTUBE", url=YOUTUBE_LINK))
-        kb_yt.row(InlineKeyboardButton(text="📸 STAY TUNED ON INSTA", url=INSTAGRAM_LINK))
-        await message.answer(msg, reply_markup=kb_yt.as_markup())
+        # Coming from YouTube? Suggest mobile/short-form alpha on IG
+        reel = list(col_reels.aggregate([{"$sample": {"size": 1}}]))
+        kb_sync = InlineKeyboardBuilder()
+        msg = f"⚡ **Maximize Your Edge, {name}.**\n\nYou've seen the deep dive, but I drop daily automation hacks on Instagram. Check this out:"
+        if reel: kb_sync.row(InlineKeyboardButton(text="📸 WATCH DAILY ALPHA", url=reel[0]['link']))
+        else: kb_sync.row(InlineKeyboardButton(text="📸 FOLLOW INSTAGRAM", url=INSTAGRAM_LINK))
+        kb_sync.row(InlineKeyboardButton(text="▶️ STAY TUNED ON YOUTUBE", url=YOUTUBE_LINK))
+        await message.answer(msg, reply_markup=kb_sync.as_markup())
+    else:
+        # Coming from Instagram? Suggest deep strategy on YouTube
+        video = list(col_viral.aggregate([{"$sample": {"size": 1}}]))
+        kb_sync = InlineKeyboardBuilder()
+        msg = f"🔥 **Go Beyond the Surface, {name}.**\n\nInstagram is for speed, but YouTube is for the real money. I just dropped a deep strategy breakdown:"
+        if video: kb_sync.row(InlineKeyboardButton(text="▶️ WATCH FULL STRATEGY", url=video[0]['link']))
+        else: kb_sync.row(InlineKeyboardButton(text="▶️ SUBSCRIBE YOUTUBE", url=YOUTUBE_LINK))
+        kb_sync.row(InlineKeyboardButton(text="📸 STAY TUNED ON INSTA", url=INSTAGRAM_LINK))
+        await message.answer(msg, reply_markup=kb_sync.as_markup())
 
 # ==========================================
 # 🚀 MSANODE NUCLEAR GHOST-KILLER RESTART
 # ==========================================
 
 async def main():
-    # 1. Force Telegram to close all other connections
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        print("🛠 Purging old sessions... MSANode Shield Active.")
+        print("🛠 Purging sessions... MSANode Gateway Shield Active.")
         await asyncio.sleep(2)
     except Exception as e:
         print(f"⚠️ Webhook Purge Note: {e}")
-
-    # 2. Start Polling with skip_updates
-    print(f"✅ MSANODE HUB ONLINE. Monitoring for Ghost Instances...")
+    print(f"✅ MSANODE GATEWAY HUB ONLINE. Monitoring for Ghost Instances...")
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
-    # Start the Health Server (Essential for Render & UptimeRobot)
+    # Start the Health Server (Essential for Render Uptime)
     threading.Thread(target=run_health_server, daemon=True).start()
     
     while True:
         try:
             asyncio.run(main())
         except TelegramConflictError:
-            # NUCLEAR OPTION: Wait 20 seconds to kill any competing instances
-            print("💀 GHOST DETECTED! Conflict Error 409.")
-            print("☢️ Nuclear Option: Waiting 20 seconds to force-kill the competing instance...")
-            time.sleep(20) 
+            # NUCLEAR OPTION: If conflict error 409, wait 20s to kill the competing bot
+            print("💀 GHOST DETECTED! Waiting 20 seconds to force-kill the competing instance...")
+            time.sleep(20)
         except Exception as e:
             print(f"⚠️ System Error: {e}")
             time.sleep(15)
