@@ -22,20 +22,25 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest, TelegramConflictError
 
 # ==========================================
-# ⚡ CONFIGURATION (GHOST PROTOCOL)
+# ⚡ CONFIGURATION (GHOST PROTOCOL ACTIVATED)
 # ==========================================
-# Securely fetch from Render Environment
+# Securely fetch all keys from Render Environment
 MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN")
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 
-# Safety Check: If Render isn't set up right, the bot will tell you why
-if not all([MANAGER_BOT_TOKEN, MAIN_BOT_TOKEN, MONGO_URI]):
-    print("❌ ERROR: One or more environment variables are missing in Render!")
+# SECURE OWNER ID FETCH (Hidden from Source)
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", 0))
+except (TypeError, ValueError):
+    OWNER_ID = 0
 
-OWNER_ID = 6988593629 
+# Validation: Kill execution if critical variables are missing
+if not all([MANAGER_BOT_TOKEN, MAIN_BOT_TOKEN, MONGO_URI, OWNER_ID]):
+    print("❌ CRITICAL ERROR: Mandatory Environment Variables missing!")
+    print("Ensure MANAGER_BOT_TOKEN, MAIN_BOT_TOKEN, MONGO_URI, and OWNER_ID are set in Render.")
 
-# Timezone for Reports
+# Timezone for MSANode Intelligence Reports
 IST = pytz.timezone('Asia/Kolkata')
 
 # ==========================================
@@ -817,3 +822,4 @@ if __name__ == "__main__":
             print(f"💥 CRITICAL ERROR: {e}")
             traceback.print_exc()
             time.sleep(15)
+
