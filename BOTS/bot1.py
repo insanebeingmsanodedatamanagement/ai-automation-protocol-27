@@ -343,7 +343,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
         kb = InlineKeyboardBuilder()
         kb.row(InlineKeyboardButton(text="🔴 YouTube Channel", url=YOUTUBE_LINK), InlineKeyboardButton(text="📸 Instagram Page", url=INSTAGRAM_LINK))
         await asyncio.sleep(1.0)
-        await message.answer(f"**MSANODE HUB ONLINE.**\n\nTo unlock a specific blueprint, use the M-Code from my latest video.", reply_markup=kb.as_markup())
+        await message.answer(f"**HELLO! MSANODE AGENT ONLINE.**\n\nTo unlock a specific blueprint, use the Pinned Comment **LINK** from my latest videos.", reply_markup=kb.as_markup())
         return
 
     await deliver_content(message, payload, source)
@@ -367,7 +367,7 @@ async def check_join(callback: types.CallbackQuery):
         payload = raw_arg.replace("ig_", "").replace("yt_", "")
         await deliver_content(callback.message, payload, source)
     else:
-        await callback.message.answer("✅ **Access Restored.** Welcome back to MSANODE.")
+        await callback.message.answer("✅ **Access Restored.** Welcome back to MSANODE .")
 
 async def deliver_content(message: types.Message, payload: str, source: str):
     data = await get_content(payload)
@@ -455,3 +455,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"⚠️ System Alert: {e}")
             time.sleep(15)
+
