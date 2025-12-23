@@ -169,8 +169,18 @@ async def is_banned(user_id):
         return user is not None
     except: return False
 
+async def is_member(user_id):
+    """Strictly checks if user is still inside the Telegram channel."""
+    try:
+        user_status = await bot.get_chat_member(CHANNEL_ID, user_id)
+        if user_status.status in ['member', 'administrator', 'creator']:
+            return True
+    except:
+        return False
+    return False
+
 async def log_user(user: types.User, source: str):
-    """Detailed Psychological Logging for MSANODE."""
+    """Detects New vs Returning Users and logs to MSANode Database."""
     now_str = datetime.now().strftime("%d-%m-%Y %I:%M %p")
     user_id = str(user.id)
     username = f"@{user.username}" if user.username else "None"
@@ -188,15 +198,18 @@ async def log_user(user: types.User, source: str):
                 "source": source,
                 "status": "Active"
             })
-            await send_admin_report(f"👤 **NEW RECRUIT**\n**Name:** {user.first_name}\n**User:** {username}\n**ID:** `{user_id}`\n**Source:** {source}\n**Time:** {now_str}")
+            await send_admin_report(f"👤 **NEW RECRUIT**\n**Name:** {user.first_name}\n**User:** {username}\n**Source:** {source}\n**Status:** New Entry")
+            return "NEW"
         else:
             update_fields = {"last_active": now_str, "status": "Active"}
             if existing.get("source") in ["Unknown", None, "Direct"]:
                 update_fields["source"] = source
                 
             col_users.update_one({"user_id": user_id}, {"$set": update_fields, "$inc": {"interaction_count": 1}})
+            return "RETURNING"
     except Exception as e: 
         print(f"❌ LOG ERROR: {e}")
+        return "ERROR"
 
 async def get_content(code: str):
     try:
@@ -257,27 +270,25 @@ async def process_finish(message: types.Message, state: FSMContext):
     await state.clear()
 
 # ==========================================
-# 🚨 WATCHDOG: PSYCHOLOGICAL RETENTION
+# 🚨 WATCHDOG: MSANODE RETENTION SHIELD
 # ==========================================
 
 @dp.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
 async def on_user_leave(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
-    await log_user(user, "LEFT_CHANNEL")
-    await send_admin_report(f"📉 **USER LEFT VAULT**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
+    await send_admin_report(f"📉 **OPERATIVE DISCONNECTED**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
     try:
-        await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou just disconnected from the MSANODE Alpha Vault. Most people quit right before the breakthrough. Don't be 'most people'.", 
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-Join The 1%", url=CHANNEL_LINK)]]))
+        await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou just disconnected from the MSANODE Alpha Vault. Most people quit right before the breakthrough. Don't be 'most people'. Access is now LOCKED.", 
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-establish Connection", url=CHANNEL_LINK)]]))
     except: pass
 
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_user_join(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
-    await log_user(user, "JOINED_CHANNEL")
-    await send_admin_report(f"📈 **USER JOINED VAULT**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
-    try: await bot.send_message(user.id, f"🤝 **Welcome back to MSANODE, {user.first_name}.**\n\nYour commitment to the grind is noted. The vault is open.")
+    await send_admin_report(f"📈 **OPERATIVE RE-SYNCED**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
+    try: await bot.send_message(user.id, f"🤝 **Clearance Restored, {user.first_name}.**\n\nYour commitment to the grind is noted. The MSANode Vault is open.")
     except: pass
 
 # ==========================================
@@ -288,7 +299,7 @@ async def on_user_join(event: ChatMemberUpdated):
 async def cmd_start(message: types.Message, command: CommandObject):
     if await is_banned(message.from_user.id): return
     if await check_maintenance():
-        await message.answer("🚧 **UPGRADING MSANODE...**We will be back soon. Check Back After Some Time")
+        await message.answer("🚧 **UPGRADING MSANODE CORE...** We will be back soon. Check back after some time.")
         return 
 
     raw_arg = command.args
@@ -300,15 +311,12 @@ async def cmd_start(message: types.Message, command: CommandObject):
         elif raw_arg.startswith("yt_"): source = "YouTube"; payload = raw_arg.replace("yt_", "")
         else: payload = raw_arg
     
-    await log_user(message.from_user, source)
+    # --- 1. IDENTITY LOGGING ---
+    user_status = await log_user(message.from_user, source)
 
-    # --- GATEKEEPER: CROSS PROMOTION LOGIC ---
-    try:
-        user_status = await bot.get_chat_member(CHANNEL_ID, message.from_user.id)
-        if user_status.status in ['left', 'kicked', 'restricted']: raise Exception("Not Member")
-    except Exception:
+    # --- 2. THE GATEKEEPER (ALWAYS CHECK MEMBERSHIP) ---
+    if not await is_member(message.from_user.id):
         kb = InlineKeyboardBuilder()
-        # Cross Promo: If from IG, force YT. If from YT, force IG.
         if source == "Instagram":
             kb.row(InlineKeyboardButton(text="🔴 Subscribe on YouTube", url=YOUTUBE_LINK))
             kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
@@ -319,15 +327,22 @@ async def cmd_start(message: types.Message, command: CommandObject):
         kb.row(InlineKeyboardButton(text="✅ I HAVE JOINED BOTH", callback_data=f"check_{raw_arg or 'none'}"))
         
         await message.answer(
-            f"**Yo {message.from_user.first_name}! Welcome to MSANODE.** 👋\n\nTo unlock my private blueprints, you must be part of the community on all platforms. Commitment is the price of success.",
+            f"**Identity Rejected, {message.from_user.first_name}.** ✋\n\nThe MSANode Data Core is reserved for active members of the family. To unlock my private blueprints, you must re-establish your connection on all platforms.",
             reply_markup=kb.as_markup()
         )
         return
 
+    # --- 3. PERSONAL BRANDED WELCOME ---
+    if user_status == "NEW":
+        await message.answer(f"**Connection Established, Recruit {message.from_user.first_name}!** 👋\n\nWelcome to the MSANODE Alpha Hub. You have successfully bypassed the initial filters. Ready for execution?")
+    else:
+        await message.answer(f"**Identity Verified, Operative {message.from_user.first_name}.** ✅\n\nWelcome back to the MSANODE Core. Re-syncing your requested data now...")
+
     if not payload:
         kb = InlineKeyboardBuilder()
         kb.row(InlineKeyboardButton(text="🔴 YouTube Channel", url=YOUTUBE_LINK), InlineKeyboardButton(text="📸 Instagram Page", url=INSTAGRAM_LINK))
-        await message.answer(f"**Welcome to the MSANODE Hub, {message.from_user.first_name}! 👋**\n\nYou are in. To get a specific guide, use the M-Code from my latest video.", reply_markup=kb.as_markup())
+        await asyncio.sleep(1.0)
+        await message.answer(f"**MSANODE HUB ONLINE.**\n\nTo unlock a specific blueprint, use the M-Code from my latest video.", reply_markup=kb.as_markup())
         return
 
     await deliver_content(message, payload, source)
@@ -335,42 +350,42 @@ async def cmd_start(message: types.Message, command: CommandObject):
 @dp.callback_query(F.data.startswith("check_"))
 async def check_join(callback: types.CallbackQuery):
     raw_arg = callback.data.split("_", 1)[1]
-    try:
-        user_status = await bot.get_chat_member(CHANNEL_ID, callback.from_user.id)
-        if user_status.status in ['left', 'kicked', 'restricted']:
-            await callback.answer("❌ You haven't joined the MSANODE channel yet! ", show_alert=True)
-            return
+    
+    # RE-VERIFYING MEMBERSHIP ON BUTTON CLICK
+    if not await is_member(callback.from_user.id):
+        await callback.answer("❌ PROTOCOL FAILED: Join the channel first!", show_alert=True)
+        return
         
-        try: await callback.message.delete()
-        except: pass
-        
-        if raw_arg != "none":
-            source = "Instagram" if raw_arg.startswith("ig_") else "YouTube"
-            payload = raw_arg.replace("ig_", "").replace("yt_", "")
-            await deliver_content(callback.message, payload, source)
-        else:
-            await callback.message.answer("✅ **Access Restored.** Welcome back to MSANODE.")
-    except:
-        await callback.answer("❌ Verification failed. Join the channel first!", show_alert=True)
+    try: await callback.message.delete()
+    except: pass
+    
+    await callback.message.answer(f"**Clearance Granted, {callback.from_user.first_name}.** ✅")
+    
+    if raw_arg != "none":
+        source = "Instagram" if raw_arg.startswith("ig_") else "YouTube"
+        payload = raw_arg.replace("ig_", "").replace("yt_", "")
+        await deliver_content(callback.message, payload, source)
+    else:
+        await callback.message.answer("✅ **Access Restored.** Welcome back to MSANODE.")
 
 async def deliver_content(message: types.Message, payload: str, source: str):
     data = await get_content(payload)
-    name = message.chat.first_name if message.chat.first_name else "User"
+    name = message.chat.first_name if message.chat.first_name else "Operative"
     
     if not data: 
         await message.answer(f"❌ **Error:** Code `{payload}` not found in the MSANODE Data Core.")
         return
     
     # 1. THE PDF DELIVERY
-    await message.answer(f"**Access Granted, {name}.** 🔓\n\nHere is your requested MSANODE blueprint:\n{data['main_link']}")
+    await message.answer(f"**Transmission Successful, {name}.** 🔓\n\nHere is your requested MSANODE blueprint:\n{data['main_link']}")
     await send_admin_report(f"📦 **BLUEPRINT DELIVERED**\n**User:** {name}\n**Code:** `{payload}`\n**Source:** {source}")
 
     # 2. THE PSYCHOLOGICAL AFFILIATE (DELAYED)
     if data['aff_link'] and len(data['aff_link']) > 5:
         await asyncio.sleep(1.5)
         kb_aff = InlineKeyboardBuilder().button(text="🚀 UNLOCK THE ENGINE", url=data['aff_link'])
-        await message.answer(f"**Wait, {name}...** 🤫\n\n{data['aff_text']}", reply_markup=kb_aff.as_markup())
-        await send_admin_report(f"💰 **AFFILIATE LINK CLICKED**\n**User:** {name}\n**Link:** {data['aff_link']}")
+        await message.answer(f"🤫 **Wait, one more tool for the army...**\n\n{data['aff_text']}", reply_markup=kb_aff.as_markup())
+        await send_admin_report(f"💰 **AFFILIATE SHOWN**\n**User:** {name}\n**Link:** {data['aff_link']}")
 
     # 3. THE CROSS-PLATFORM PSYCHOLOGY
     await asyncio.sleep(1.5)
@@ -379,20 +394,20 @@ async def deliver_content(message: types.Message, payload: str, source: str):
         video = list(col_viral.aggregate(pipeline))
         if video:
             kb_cross = InlineKeyboardBuilder().button(text="▶️ WATCH FULL STRATEGY", url=video[0]['link'])
-            await message.answer(f"🔥 **Deep Dive Needed?**\n\nI just dropped a breakdown on YouTube: Check Out Now . DONT MISS !!!!\n{video[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
+            await message.answer(f"🔥 **Deep Dive Needed?**\n\nI just dropped a breakdown on YouTube: Check Out Now. DONT MISS !!!!\n{video[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
     else: 
         pipeline = [{"$sample": {"size": 1}}]
         reel = list(col_reels.aggregate(pipeline))
         if reel:
             kb_cross = InlineKeyboardBuilder().button(text="📸 WATCH MORE NEW ", url=reel[0]['link'])
-            await message.answer(f"⚡ **Need it in 60s?**\n\nCheck the more  version on Instagram: Check Out Now . DONT MISS !!!\n{reel[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
+            await message.answer(f"⚡ **Need it in 60s?**\n\nCheck more versions on Instagram: Check Out Now. DONT MISS !!!\n{reel[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
 
 # ==========================================
 # 🚀 THE SUPREME RESTART
 # ==========================================
 
 async def main():
-    print(f"✅ MSANODE Bot Online...")
+    print(f"✅ MSANODE Bot Supreme Hub is Online...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
@@ -402,6 +417,7 @@ if __name__ == "__main__":
         try:
             asyncio.run(main())
         except TelegramConflictError:
+            print("⚠️ Conflict detected. Re-syncing in 5s...")
             time.sleep(5)
         except Exception as e:
             print(f"⚠️ System Error: {e}")
