@@ -4,6 +4,7 @@ import random
 import html
 import threading
 import time
+import sys
 from aiohttp import web
 import pymongo
 import os
@@ -20,21 +21,29 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramConflictError, TelegramForbiddenError
 
 # ==========================================
-# ⚡ MSANODE CONFIGURATION
+# ⚡ MSANODE CONFIGURATION (ENVIRONMENT ONLY)
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-OWNER_ID = 6988593629 
-ADMIN_LOG_CHANNEL = os.getenv("ADMIN_LOG_CHANNEL") # Private Channel ID for Reports
+ADMIN_LOG_CHANNEL = os.getenv("ADMIN_LOG_CHANNEL")
 
-if not BOT_TOKEN or not MONGO_URI:
-    print("❌ ERROR: Environment Variables not found! Check Render settings.")
+# Pull IDs as Integers safely
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", 0))
+    CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
+except (TypeError, ValueError):
+    OWNER_ID = 0
+    CHANNEL_ID = 0
 
-CHANNEL_ID = -1003480585973 
-CHANNEL_LINK = "https://t.me/msanode" 
-BOT_USERNAME = "@msanodebot"
-YOUTUBE_LINK = "https://youtube.com/@msanodeofficial?si=Se3-GQpOoMt0Ur_3" 
-INSTAGRAM_LINK = "https://www.instagram.com/msanodeofficial?igsh=MXZjb2VjY2Z6MzR1Nw==" 
+# Links & Branding
+CHANNEL_LINK = os.getenv("CHANNEL_LINK") 
+BOT_USERNAME = os.getenv("BOT_USERNAME")
+YOUTUBE_LINK = os.getenv("YOUTUBE_LINK") 
+INSTAGRAM_LINK = os.getenv("INSTAGRAM_LINK") 
+
+if not BOT_TOKEN or not MONGO_URI or not OWNER_ID:
+    print("❌ CRITICAL ERROR: Mandatory Environment Variables (BOT_TOKEN, MONGO_URI, OWNER_ID) missing!")
+    sys.exit(1)
 
 # 🧠 PSYCHOLOGY: MSANODE Alpha Titles
 CLICKBAIT_TITLES = [
@@ -120,7 +129,7 @@ def run_health_server():
         print(f"📡 Health Server Note: {e}")
 
 # --- MONGODB CONNECTION ---
-print("🔄 Connecting to MSANode Database...")
+print("🔄 Connecting to MSANODE Database...")
 try:
     client = pymongo.MongoClient(MONGO_URI)
     db = client["MSANodeDB"]
@@ -133,12 +142,12 @@ try:
     print(f"✅ SUCCESSFULLY CONNECTED TO MSANODE MONGODB")
 except Exception as e:
     print(f"❌ CRITICAL CONNECTION ERROR: {e}")
-    exit()
+    sys.exit(1)
 
 # --- HELPERS ---
 
 async def send_admin_report(text: str):
-    """Sends real-time logs to the private MSANode Admin Channel."""
+    """Sends real-time logs to the private MSANODE Admin Channel."""
     if ADMIN_LOG_CHANNEL:
         try:
             await bot.send_message(
@@ -164,7 +173,7 @@ async def is_banned(user_id):
     except: return False
 
 async def log_user(user: types.User, source: str):
-    """Detailed Psychological Logging for MSANode."""
+    """Detailed Psychological Logging for MSANODE."""
     now_str = datetime.now().strftime("%d-%m-%Y %I:%M %p")
     user_id = str(user.id)
     username = f"@{user.username}" if user.username else "None"
@@ -292,7 +301,7 @@ async def on_user_leave(event: ChatMemberUpdated):
     await log_user(user, "LEFT_CHANNEL")
     await send_admin_report(f"📉 **USER LEFT VAULT**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
     try:
-        await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou just disconnected from the MSANode Alpha Vault. Most people quit right before the breakthrough. Don't be 'most people'.", 
+        await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou just disconnected from the MSANODE Alpha Vault. Most people quit right before the breakthrough. Don't be 'most people'.", 
                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-Join The 1%", url=CHANNEL_LINK)]]))
     except: pass
 
@@ -302,7 +311,7 @@ async def on_user_join(event: ChatMemberUpdated):
     user = event.new_chat_member.user
     await log_user(user, "JOINED_CHANNEL")
     await send_admin_report(f"📈 **USER JOINED VAULT**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
-    try: await bot.send_message(user.id, f"🤝 **Welcome back to MSANode, {user.first_name}.**\n\nYour commitment to the grind is noted. The vault is open.")
+    try: await bot.send_message(user.id, f"🤝 **Welcome back to MSANODE, {user.first_name}.**\n\nYour commitment to the grind is noted. The vault is open.")
     except: pass
 
 # ==========================================
@@ -336,15 +345,15 @@ async def cmd_start(message: types.Message, command: CommandObject):
         # Cross Promo: If from IG, force YT. If from YT, force IG.
         if source == "Instagram":
             kb.row(InlineKeyboardButton(text="🔴 Subscribe on YouTube", url=YOUTUBE_LINK))
-            kb.row(InlineKeyboardButton(text="🚀 Join MSANode Telegram", url=CHANNEL_LINK))
+            kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
         else:
             kb.row(InlineKeyboardButton(text="📸 Follow on Instagram", url=INSTAGRAM_LINK))
-            kb.row(InlineKeyboardButton(text="🚀 Join MSANode Telegram", url=CHANNEL_LINK))
+            kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
             
         kb.row(InlineKeyboardButton(text="✅ I HAVE JOINED BOTH", callback_data=f"check_{raw_arg or 'none'}"))
         
         await message.answer(
-            f"**Yo {message.from_user.first_name}! Welcome to MSANode.** 👋\n\nTo unlock my private blueprints, you must be part of the family on all platforms. Commitment is the price of success.",
+            f"**Yo {message.from_user.first_name}! Welcome to MSANODE.** 👋\n\nTo unlock my private blueprints, you must be part of the community on all platforms. Commitment is the price of success.",
             reply_markup=kb.as_markup()
         )
         return
@@ -352,7 +361,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
     if not payload:
         kb = InlineKeyboardBuilder()
         kb.row(InlineKeyboardButton(text="🔴 YouTube Channel", url=YOUTUBE_LINK), InlineKeyboardButton(text="📸 Instagram Page", url=INSTAGRAM_LINK))
-        await message.answer(f"**Welcome to the MSANode Hub, {message.from_user.first_name}! 👋**\n\nYou are in. To get a specific guide, use the M-Code from my latest video.", reply_markup=kb.as_markup())
+        await message.answer(f"**Welcome to the MSANODE Hub, {message.from_user.first_name}! 👋**\n\nYou are in. To get a specific guide, use the M-Code from my latest video.", reply_markup=kb.as_markup())
         return
 
     await deliver_content(message, payload, source)
@@ -363,7 +372,7 @@ async def check_join(callback: types.CallbackQuery):
     try:
         user_status = await bot.get_chat_member(CHANNEL_ID, callback.from_user.id)
         if user_status.status in ['left', 'kicked', 'restricted']:
-            await callback.answer("❌ You haven't joined the MSANode channel yet!", show_alert=True)
+            await callback.answer("❌ You haven't joined the MSANODE channel yet!", show_alert=True)
             return
         
         try: await callback.message.delete()
@@ -374,7 +383,7 @@ async def check_join(callback: types.CallbackQuery):
             payload = raw_arg.replace("ig_", "").replace("yt_", "")
             await deliver_content(callback.message, payload, source)
         else:
-            await callback.message.answer("✅ **Access Restored.** Welcome back to MSANode.")
+            await callback.message.answer("✅ **Access Restored.** Welcome back to MSANODE.")
     except:
         await callback.answer("❌ Verification failed. Join the channel first!", show_alert=True)
 
@@ -383,11 +392,11 @@ async def deliver_content(message: types.Message, payload: str, source: str):
     name = message.chat.first_name if message.chat.first_name else "User"
     
     if not data: 
-        await message.answer(f"❌ **Error:** Code `{payload}` not found in the MSANode Data Core.")
+        await message.answer(f"❌ **Error:** Code `{payload}` not found in the MSANODE Data Core.")
         return
     
     # 1. THE PDF DELIVERY
-    await message.answer(f"**Access Granted, {name}.** 🔓\n\nHere is your requested MSANode blueprint:\n{data['main_link']}")
+    await message.answer(f"**Access Granted, {name}.** 🔓\n\nHere is your requested MSANODE blueprint:\n{data['main_link']}")
     await send_admin_report(f"📦 **BLUEPRINT DELIVERED**\n**User:** {name}\n**Code:** `{payload}`\n**Source:** {source}")
 
     # 2. THE PSYCHOLOGICAL AFFILIATE (DELAYED)
@@ -417,7 +426,7 @@ async def deliver_content(message: types.Message, payload: str, source: str):
 # ==========================================
 
 async def main():
-    print(f"✅ MSANode Bot {BOT_USERNAME} is Online...")
+    print(f"✅ MSANODE Bot Online...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
@@ -427,7 +436,6 @@ if __name__ == "__main__":
         try:
             asyncio.run(main())
         except TelegramConflictError:
-            print("⚠️ Conflict detected. Re-syncing in 5s...")
             time.sleep(5)
         except Exception as e:
             print(f"⚠️ System Error: {e}")
