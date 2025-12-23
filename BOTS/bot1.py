@@ -198,7 +198,7 @@ async def log_user(user: types.User, source: str):
                 "source": source,
                 "status": "Active"
             })
-            await send_admin_report(f"👤 **NEW RECRUIT**\n**Name:** {user.first_name}\n**User:** {username}\n**Source:** {source}\n**Status:** New Entry")
+            await send_admin_report(f"👤 **NEW RECRUIT**\n**Name:** {user.first_name}\n**Source:** {source}\n**Status:** New Entry")
             return "NEW"
         else:
             update_fields = {"last_active": now_str, "status": "Active"}
@@ -314,9 +314,10 @@ async def cmd_start(message: types.Message, command: CommandObject):
     # --- 1. IDENTITY LOGGING ---
     user_status = await log_user(message.from_user, source)
 
-    # --- 2. THE GATEKEEPER (ALWAYS CHECK MEMBERSHIP) ---
+    # --- 2. THE GATEKEEPER (STRICT MEMBERSHIP CHECK) ---
     if not await is_member(message.from_user.id):
         kb = InlineKeyboardBuilder()
+        # Cross-Promo Button Logic: If from YT, prioritize IG follow. If from IG, prioritize YT sub.
         if source == "Instagram":
             kb.row(InlineKeyboardButton(text="🔴 Subscribe on YouTube", url=YOUTUBE_LINK))
             kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
@@ -324,7 +325,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
             kb.row(InlineKeyboardButton(text="📸 Follow on Instagram", url=INSTAGRAM_LINK))
             kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
             
-        kb.row(InlineKeyboardButton(text="✅ I HAVE JOINED BOTH", callback_data=f"check_{raw_arg or 'none'}"))
+        kb.row(InlineKeyboardButton(text="✅ I HAVE JOINED ALL", callback_data=f"check_{raw_arg or 'none'}"))
         
         await message.answer(
             f"**Identity Rejected, {message.from_user.first_name}.** ✋\n\nThe MSANode Data Core is reserved for active members of the family. To unlock my private blueprints, you must re-establish your connection on all platforms.",
@@ -387,20 +388,41 @@ async def deliver_content(message: types.Message, payload: str, source: str):
         await message.answer(f"🤫 **Wait, one more tool for the army...**\n\n{data['aff_text']}", reply_markup=kb_aff.as_markup())
         await send_admin_report(f"💰 **AFFILIATE SHOWN**\n**User:** {name}\n**Link:** {data['aff_link']}")
 
-    # 3. THE CROSS-PLATFORM PSYCHOLOGY
+    # 3. THE CROSS-PLATFORM PSYCHOLOGY (INTELLIGENT SYNC)
     await asyncio.sleep(1.5)
-    if source == "Instagram":
-        pipeline = [{"$sample": {"size": 1}}]
-        video = list(col_viral.aggregate(pipeline))
-        if video:
-            kb_cross = InlineKeyboardBuilder().button(text="▶️ WATCH FULL STRATEGY", url=video[0]['link'])
-            await message.answer(f"🔥 **Deep Dive Needed?**\n\nI just dropped a breakdown on YouTube: Check Out Now. DONT MISS !!!!\n{video[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
-    else: 
+    
+    if source == "YouTube":
+        # Coming from YT? Push to IG for "Daily Alpha" hacks
         pipeline = [{"$sample": {"size": 1}}]
         reel = list(col_reels.aggregate(pipeline))
+        
+        msg = f"⚡ **Maximize Your Edge, {name}.**\n\nYou've seen the deep dive, but I drop daily automation hacks on my Instagram stories. Join the elite there for real-time updates. Check Out Now. DONT MISS !!!!"
+        
+        kb_ig = InlineKeyboardBuilder()
         if reel:
-            kb_cross = InlineKeyboardBuilder().button(text="📸 WATCH MORE NEW ", url=reel[0]['link'])
-            await message.answer(f"⚡ **Need it in 60s?**\n\nCheck more versions on Instagram: Check Out Now. DONT MISS !!!\n{reel[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
+            msg += f"\n\n🔥 **Trending Now:**\n{reel[0].get('desc', 'Check this version out!')}"
+            kb_ig.button(text="📸 WATCH MORE NEW", url=reel[0]['link'])
+        else:
+            kb_ig.button(text="📸 FOLLOW INSTAGRAM", url=INSTAGRAM_LINK)
+            
+        await message.answer(msg, reply_markup=kb_ig.as_markup())
+        
+    else: 
+        # Coming from Instagram? Push to YT for "Full Strategy" deep dives
+        pipeline = [{"$sample": {"size": 1}}]
+        video = list(col_viral.aggregate(pipeline))
+        
+        msg = f"🔥 **Go Beyond the Surface, {name}.**\n\nInstagram is for speed, but YouTube is for the real money. I just dropped a breakdown on YouTube that you can't afford to miss. Check Out Now. DONT MISS !!!!"
+        
+        kb_yt = InlineKeyboardBuilder()
+        if video:
+            msg += f"\n\n▶️ **Full Strategy Revealed:**\n{video[0].get('desc', 'Check this strategy!')}"
+            kb_yt.button(text="▶️ WATCH FULL STRATEGY", url=video[0]['link'])
+        else:
+            kb_yt.button(text="▶️ SUBSCRIBE YOUTUBE", url=YOUTUBE_LINK)
+            
+        await message.answer(msg, reply_markup=kb_yt.as_markup())
+
 # ==========================================
 # 🚀 THE SUPREME GHOST-PROOF RESTART
 # ==========================================
