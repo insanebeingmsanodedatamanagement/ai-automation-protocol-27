@@ -198,7 +198,7 @@ async def log_user(user: types.User, source: str):
                 "source": source,
                 "status": "Active"
             })
-            await send_admin_report(f"👤 **NEW RECRUIT**\n**Name:** {user.first_name}\n**Source:** {source}\n**Status:** New Entry")
+            await send_admin_report(f"👤 **NEW RECRUIT**\n**Name:** {user.first_name}\n**User:** {username}\n**ID:** `{user_id}`\n**Source:** {source}\n**Time:** {now_str}")
             return "NEW"
         else:
             update_fields = {"last_active": now_str, "status": "Active"}
@@ -288,7 +288,7 @@ async def on_user_join(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
     await send_admin_report(f"📈 **OPERATIVE RE-SYNCED**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
-    try: await bot.send_message(user.id, f"🤝 **Clearance Restored, WELCOME BACK TO FAMILY {user.first_name}.**\n\nYour commitment to the grind is noted. The MSANode Vault is is now Exclusively open.")
+    try: await bot.send_message(user.id, f"🤝 **Clearance Restored, WELCOME BACK TO FAMILY {user.first_name}.**\n\nYour commitment to the grind is noted. The MSANode Vault is now Exclusively open.")
     except: pass
 
 # ==========================================
@@ -317,7 +317,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
     # --- 2. THE GATEKEEPER (STRICT MEMBERSHIP CHECK) ---
     if not await is_member(message.from_user.id):
         kb = InlineKeyboardBuilder()
-        # Cross-Promo Button Logic: If from YT, prioritize IG follow. If from IG, prioritize YT sub.
+        # Cross-Promo Logic: If from YT, push IG. If from IG, push YT.
         if source == "Instagram":
             kb.row(InlineKeyboardButton(text="🔴 Subscribe on YouTube", url=YOUTUBE_LINK))
             kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
@@ -367,7 +367,7 @@ async def check_join(callback: types.CallbackQuery):
         payload = raw_arg.replace("ig_", "").replace("yt_", "")
         await deliver_content(callback.message, payload, source)
     else:
-        await callback.message.answer("✅ **Access Restored.** Welcome back to MSANODE .")
+        await callback.message.answer("✅ **Access Restored.** Welcome back to MSANODE.")
 
 async def deliver_content(message: types.Message, payload: str, source: str):
     data = await get_content(payload)
@@ -453,6 +453,5 @@ if __name__ == "__main__":
             print("☢️ Nuclear Option: Waiting 20 seconds to force-kill the competing instance...")
             time.sleep(20) # Long sleep forces the other bot to time out
         except Exception as e:
-            print(f"⚠️ System Alert: {e}")
+            print(f"⚠️ System Error: {e}")
             time.sleep(15)
-
