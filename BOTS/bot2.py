@@ -12,17 +12,18 @@ import pymongo
 import pytz 
 from collections import Counter
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, StateFilter, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest, TelegramConflictError
 
 # ==========================================
-# ⚡ CONFIGURATION
+# ⚡ CONFIGURATION (GHOST PROTOCOL)
 # ==========================================
-# ⚠️ REPLACE WITH YOUR REAL KEYS
 # Securely fetch from Render Environment
 MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN")
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
@@ -31,6 +32,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 # Safety Check: If Render isn't set up right, the bot will tell you why
 if not all([MANAGER_BOT_TOKEN, MAIN_BOT_TOKEN, MONGO_URI]):
     print("❌ ERROR: One or more environment variables are missing in Render!")
+
 OWNER_ID = 6988593629 
 
 # Timezone for Reports
@@ -44,9 +46,9 @@ logger = logging.getLogger(__name__)
 
 manager_bot = Bot(token=MANAGER_BOT_TOKEN)
 worker_bot = Bot(token=MAIN_BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
-# GLOBAL TRACKERS
+# GLOBAL TRACKERS (IRON DOME)
 ERROR_COUNTER = 0
 LAST_ERROR_TIME = time.time()
 LAST_REPORT_DATE = None 
@@ -71,12 +73,12 @@ class BanState(StatesGroup):
     waiting_for_id = State()
 
 # --- MONGODB CONNECTION ---
-print("🔄 Connecting Manager to MongoDB...")
+print("🔄 Connecting Manager to MSANode MongoDB...")
 try:
     client = pymongo.MongoClient(MONGO_URI)
     db = client["MSANodeDB"]
     
-    # Collections
+    # Collections (Full Infrastructure)
     col_users = db["user_logs"]
     col_admins = db["admins"]
     col_settings = db["settings"]
@@ -86,13 +88,14 @@ try:
     col_banned = db["banned_users"]
     col_broadcast_logs = db["broadcast_logs"]
     
-    print("✅ Connected to MongoDB Atlas")
+    print("✅ Connected to MSANode Data Core")
 except Exception as e:
     print(f"❌ CRITICAL DB ERROR: {e}")
     exit()
+
 # --- RENDER PORT BINDER (SHIELD) ---
 async def handle_health(request):
-    return web.Response(text="CORE 2 (MANAGER BOT) IS ACTIVE")
+    return web.Response(text="MSANODE CORE 2 (MANAGER BOT) IS ACTIVE")
 
 def run_health_server():
     try:
@@ -102,8 +105,9 @@ def run_health_server():
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"📡 Health Server Note: {e}")
+
 # ==========================================
-# 🛡️ IRON DOME & HELPERS
+# 🛡️ IRON DOME & HELPERS (UNREDUCED)
 # ==========================================
 async def send_alert(msg):
     """Sends critical alerts to Owner."""
@@ -165,7 +169,7 @@ def is_admin(user_id):
     except: return False
 
 # ==========================================
-# 👁️ SUPERVISOR ROUTINE
+# 👁️ SUPERVISOR ROUTINE (UNREDUCED WATCHDOG)
 # ==========================================
 @safe_execute
 async def supervisor_routine():
@@ -204,16 +208,19 @@ async def supervisor_routine():
             active = col_active.count_documents({})
             banned = col_banned.count_documents({})
             
+            # Format: DD-MM-YYYY 04:08 PM
+            fmt_time = now_ist.strftime('%d-%m-%Y %I:%M %p')
+            
             daily_msg = (
                 f"🌅 **DAILY EMPIRE REPORT** 🌅\n"
-                f"📅 {now_ist.strftime('%d-%m-%Y %I:%M %p')}\n"
+                f"📅 {fmt_time}\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"✅ **Manager Bot:** Online\n"
                 f"✅ **Main Bot:** Online\n"
                 f"✅ **Database:** Connected\n\n"
                 f"📊 **Stats:**\n"
                 f"👥 Total Users: `{users}`\n"
-                f"📄 Files: `{active}`\n"
+                f"📄 Vault Codes: `{active}`\n"
                 f"🚫 Banned: `{banned}`\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🤖 *Checks running every 5 mins.*"
@@ -223,13 +230,13 @@ async def supervisor_routine():
             
         await asyncio.sleep(30) 
 
-# --- TASKS ---
+# --- TASKS (UNREDUCED) ---
 @safe_execute
 async def scheduled_health_check():
     """Updates Status in DB."""
     while True:
         try:
-            now = datetime.now().strftime("%d-%m-%Y %I:%M %p")
+            now = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
             col_settings.update_one({"setting": "manager_status"}, {"$set": {"last_check": now, "status": "Online"}}, upsert=True)
             try:
                 await worker_bot.get_me()
@@ -258,7 +265,88 @@ def back_kb():
     return kb.as_markup()
 
 # ==========================================
-# 👑 THE DASHBOARD UI
+# 👑 NEW APEX COMMANDS (MASTER SADIQ)
+# ==========================================
+
+@dp.message(Command("delete_user"))
+async def delete_user_manual(message: types.Message, command: CommandObject):
+    """Surgically erases a user ID from the entire MSANode database."""
+    if not is_admin(message.from_user.id): return
+    target_id = command.args
+    if not target_id:
+        await message.answer("❌ **ID REQUIRED**\nUsage: `/delete_user <id>`")
+        return
+    
+    res = col_users.delete_one({"user_id": target_id.strip()})
+    if res.deleted_count > 0:
+        await message.answer(f"🗑 **Operative Purged.**\nUser ID `{target_id}` has been erased from the records.")
+    else:
+        await message.answer("❌ User ID not found in database.")
+
+@dp.message(Command("list"))
+async def list_users_directory(message: types.Message):
+    """Returns a clean, professional directory of Username and ID only."""
+    if not is_admin(message.from_user.id): return
+    cursor = col_users.find({}, {"username": 1, "user_id": 1, "_id": 0})
+    operatives = list(cursor)
+    
+    if not operatives:
+        await message.answer("📂 **Database Empty.** No recruits found.")
+        return
+
+    report = "📋 **MSANODE OPERATIVE LIST**\n━━━━━━━━━━━━━━━━━━\n"
+    count = 0
+    for op in operatives:
+        count += 1
+        username = op.get("username") or "None"
+        uid = op.get("user_id")
+        report += f"{count}. {username} | `{uid}`\n"
+        
+        # Avoid character limit
+        if len(report) > 3900:
+            await message.answer(report)
+            report = ""
+            
+    report += f"━━━━━━━━━━━━━━━━━━\n👥 **Total Recruit Count:** `{count}`"
+    await message.answer(report)
+
+@dp.message(Command("stats"))
+async def supreme_stats_audit(message: types.Message):
+    """Enhanced overall audit of every MSANode asset."""
+    if not is_admin(message.from_user.id): return
+    
+    # Database Counts
+    users = col_users.count_documents({})
+    codes = col_active.count_documents({})
+    yt = col_viral.count_documents({})
+    ig = col_reels.count_documents({})
+    banned = col_banned.count_documents({})
+    
+    # Traffic Logic
+    res = list(col_users.aggregate([{"$group": {"_id": "$source", "count": {"$sum": 1}}}]))
+    cnt = {r['_id']: r['count'] for r in res}
+    
+    now_str = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+    
+    msg = (
+        f"📊 **MSANODE EMPIRE AUDIT**\n"
+        f"📅 `{now_str}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👥 **Total Operatives:** `{users}`\n"
+        f"🔑 **Vault M-Codes:** `{codes}`\n"
+        f"🎥 **YT Videos:** `{yt}`\n"
+        f"📸 **IG Reels:** `{ig}`\n"
+        f"🚫 **Total Banned:** `{banned}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📈 **Source Traffic Analysis:**\n"
+        f"🔴 YT Origin: `{cnt.get('YouTube', 0)}`\n"
+        f"📸 IG Origin: `{cnt.get('Instagram', 0)}`\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    await message.answer(msg)
+
+# ==========================================
+# 👑 THE DASHBOARD UI (UNREDUCED)
 # ==========================================
 @safe_execute
 async def show_dashboard_ui(message_obj, user_id, is_edit=False):
@@ -320,7 +408,7 @@ async def show_dashboard_ui(message_obj, user_id, is_edit=False):
             await message_obj.edit_text(text, reply_markup=kb.as_markup())
         else: 
             await message_obj.answer(text, reply_markup=kb.as_markup())
-    except TelegramBadRequest as e:
+    except TelegramBadRequest:
         pass
 
 @dp.message(Command("start"), StateFilter("*"))
@@ -343,7 +431,7 @@ async def sleep_mode(callback: types.CallbackQuery):
     await callback.message.answer("💤 **System Running in Background.**\nType `/start` to wake up.")
 
 # ==========================================
-# 📢 BROADCAST SYSTEM
+# 📢 BROADCAST SYSTEM (UNREDUCED)
 # ==========================================
 @dp.callback_query(F.data == "btn_broadcast")
 async def broadcast_menu(callback: types.CallbackQuery):
@@ -444,7 +532,7 @@ async def execute_broadcast(callback: types.CallbackQuery, state: FSMContext):
         if msg_ids: 
             col_broadcast_logs.insert_one({
                 "batch_id": batch_id, 
-                "date": datetime.now().strftime("%d-%m-%Y %I:%M %p"), 
+                "date": datetime.now(IST).strftime("%d-%m-%Y %I:%M %p"), 
                 "messages": msg_ids, 
                 "type": data['ctype'], 
                 "original_text": data['text']
@@ -511,7 +599,7 @@ async def edit_last_execute(message: types.Message, state: FSMContext):
     await show_dashboard_ui(message, message.from_user.id, is_edit=False)
 
 # ==========================================
-# 🚫 BAN SYSTEM & ADMIN
+# 🚫 BAN SYSTEM & ADMIN (UNREDUCED)
 # ==========================================
 @dp.callback_query(F.data == "btn_ban_menu")
 async def ban_menu(callback: types.CallbackQuery, state: FSMContext):
@@ -529,7 +617,7 @@ async def execute_ban(message: types.Message, state: FSMContext):
     
     col_banned.update_one(
         {"user_id": target_id},
-        {"$set": {"banned_at": datetime.now(), "banned_by": message.from_user.first_name}},
+        {"$set": {"banned_at": datetime.now(IST), "banned_by": message.from_user.first_name}},
         upsert=True
     )
     col_users.update_one({"user_id": target_id}, {"$set": {"status": "BLOCKED"}})
@@ -558,7 +646,7 @@ async def add_admin_finish(message: types.Message, state: FSMContext):
     await show_dashboard_ui(message, message.from_user.id, is_edit=False)
 
 # ==========================================
-# 🩺 DIAGNOSTICS & SYSTEM
+# 🩺 DIAGNOSTICS & SYSTEM (UNREDUCED)
 # ==========================================
 @dp.callback_query(F.data == "btn_diagnosis")
 async def run_diagnosis(callback: types.CallbackQuery):
@@ -598,7 +686,7 @@ async def toggle_maintenance(callback: types.CallbackQuery):
     new_val = not (curr and curr.get("value"))
     col_settings.update_one({"setting": "maintenance"}, {"$set": {"value": new_val}}, upsert=True)
     await callback.answer(f"Maintenance: {'ON' if new_val else 'OFF'}")
-    await show_dashboard_ui(callback.message, callback.from_user.id)
+    await show_dashboard_ui(callback.message, callback.from_user.id, is_edit=True)
 
 @dp.callback_query(F.data == "btn_backup")
 async def backup_data(callback: types.CallbackQuery):
@@ -610,14 +698,14 @@ async def backup_data(callback: types.CallbackQuery):
             with open("Users.csv", 'w', newline='', encoding='utf-8') as f: 
                 csv.DictWriter(f, df[0].keys()).writeheader()
                 csv.DictWriter(f, df[0].keys()).writerows(df)
-            await callback.message.answer_document(FSInputFile("Users.csv"), caption="💾 Users")
+            await callback.message.answer_document(FSInputFile("Users.csv"), caption="💾 Full Encrypted Backup")
             os.remove("Users.csv")
     except: 
-        await callback.message.answer("❌ Error")
+        await callback.message.answer("❌ Backup Error")
     await show_dashboard_ui(callback.message, callback.from_user.id)
 
 # ==========================================
-# 📈 TRAFFIC & SNIPER
+# 📈 TRAFFIC & SNIPER (UNREDUCED)
 # ==========================================
 @dp.callback_query(F.data == "btn_traffic")
 async def traffic_stats(callback: types.CallbackQuery):
@@ -627,10 +715,11 @@ async def traffic_stats(callback: types.CallbackQuery):
     cnt = {r['_id']: r['count'] for r in res}
     
     report = (
-        f"📈 **TRAFFIC**\n"
+        f"📈 **TRAFFIC ANALYSIS**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
         f"🔴 YT: {cnt.get('YouTube', 0)}\n"
         f"📸 IG: {cnt.get('Instagram', 0)}\n"
-        f"📊 Total: {total}"
+        f"📊 Total Entry: {total}"
     )
     await callback.message.edit_text(report, reply_markup=back_kb())
 
@@ -668,32 +757,29 @@ async def execute_sniper(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "cancel_send")
 async def cancel_op(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await show_dashboard_ui(callback.message, callback.from_user.id, is_edit=False)
+    await show_dashboard_ui(callback.message, callback.from_user.id, is_edit=True)
 
 @dp.callback_query(F.data == "btn_help")
 async def help_guide(callback: types.CallbackQuery):
     help_text = (
         "📘 **APEX MANAGER PROTOCOL**\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "**🤖 AUTOMATION (Active)**\n"
+        "**⚡ COMMANDS**\n"
+        "• `/stats` - Database assets audit.\n"
+        "• `/list` - Recruits directory.\n"
+        "• `/delete_user <id>` - Erase user.\n\n"
+        "**🤖 AUTOMATION**\n"
         "• **Watchdog:** Checks System every 5 mins.\n"
         "• **Daily Report:** Sent at 08:40 AM.\n"
-        "• **Panic Protocol:** Auto-Backup & Lock if crashed.\n\n"
+        "• **Panic Protocol:** Auto-Backup & Lockdown.\n\n"
         "**📢 MARKETING**\n"
         "• **Broadcast:** Blast msg to all users.\n"
-        "• **Unsend/Edit:** Fix mistakes in last broadcast.\n\n"
-        "**🛡️ SECURITY**\n"
-        "• **Ban:** Block User ID instantly.\n"
-        "• **Sniper:** Send private DM to 1 user.\n"
-        "• **Maintenance:** Force 'System Upgrade' mode.\n\n"
-        "**📊 DATA**\n"
-        "• **Traffic:** See YouTube vs Instagram %.\n"
-        "• **Backup:** Download User Database (CSV)."
+        "• **Unsend/Edit:** Fix mistakes in last broadcast."
     )
     await callback.message.edit_text(help_text, reply_markup=back_kb(), parse_mode="Markdown")
 
 # ==========================================
-# MAIN EXECUTION
+# 🚀 NUCLEAR MAIN EXECUTION (GHOST SHIELD)
 # ==========================================
 async def main():
     print("👑 Manager Bot (Apex God Mode) is Online...")
@@ -702,37 +788,32 @@ async def main():
     except: 
         pass
     
+    # Purge existing conflicts on start
+    await manager_bot.delete_webhook(drop_pending_updates=True)
+    
     asyncio.create_task(supervisor_routine()) 
     asyncio.create_task(scheduled_health_check())
     asyncio.create_task(scheduled_pruning_cleanup()) 
-    await dp.start_polling(manager_bot)
-# --- RENDER PORT BINDER (SHIELD) ---
-async def handle_health(request):
-    return web.Response(text="CORE 2 (MANAGER BOT) IS ACTIVE")
-
-def run_health_server():
-    try:
-        app = web.Application()
-        app.router.add_get('/', handle_health)
-        port = int(os.environ.get("PORT", 10000))
-        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
-    except Exception as e:
-        print(f"📡 Health Server Note: {e}")
-# ================= THE SUPREME RESTART (FIXED) =================
-if __name__ == "__main__":
-    print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 2 (MANAGER)")
     
-    # 1. Start the Health Server for Render (Fixes "No open ports")
-    # This must run so Render marks the bot as "Live"
+    await dp.start_polling(manager_bot, skip_updates=True)
+
+if __name__ == "__main__":
+    # Start the Health Server for Render (Fixes "No open ports")
     threading.Thread(target=run_health_server, daemon=True).start()
     
-    # 2. Start the Manager Core
-    try:
-        # Give the health server a moment to bind to port 10000
-        time.sleep(2)
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("🛑 Manager Bot Stopped Safely")
-    except Exception as e:
-        print(f"💥 CRITICAL ERROR: {e}")
-        traceback.print_exc()
+    while True:
+        try:
+            # Give the health server a moment to bind
+            time.sleep(2)
+            asyncio.run(main())
+        except TelegramConflictError:
+            # NUCLEAR OPTION: Kill ghost instances
+            print("💀 GHOST DETECTED! Waiting 20 seconds to purge ghost...")
+            time.sleep(20)
+        except (KeyboardInterrupt, SystemExit):
+            print("🛑 Manager Bot Stopped Safely")
+            break
+        except Exception as e:
+            print(f"💥 CRITICAL ERROR: {e}")
+            traceback.print_exc()
+            time.sleep(15)
