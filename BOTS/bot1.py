@@ -401,24 +401,27 @@ async def deliver_content(message: types.Message, payload: str, source: str):
         if reel:
             kb_cross = InlineKeyboardBuilder().button(text="📸 WATCH MORE NEW ", url=reel[0]['link'])
             await message.answer(f"⚡ **Need it in 60s?**\n\nCheck more versions on Instagram: Check Out Now. DONT MISS !!!\n{reel[0].get('desc', 'Check this out!')}", reply_markup=kb_cross.as_markup())
-
 # ==========================================
-# 🚀 THE SUPREME RESTART
+# 🚀 THE SUPREME GHOST-PROOF RESTART
 # ==========================================
 
 async def main():
-    print(f"✅ MSANODE Bot Supreme Hub is Online...")
+    # Force delete webhook and drop all pending updates to clear the conflict
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    print(f"✅ MSANODE Ghost Shield Active. Starting polling...")
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
+    # Start the Health Server for Render/UptimeRobot
     threading.Thread(target=run_health_server, daemon=True).start()
+    
     while True:
         try:
             asyncio.run(main())
         except TelegramConflictError:
-            print("⚠️ Conflict detected. Re-syncing in 5s...")
-            time.sleep(5)
+            # If a ghost is detected, we wait 10 seconds for it to die
+            print("⚠️ CONFLICT DETECTED: Another instance is running. Waiting 10s to kill the ghost...")
+            time.sleep(10)
         except Exception as e:
             print(f"⚠️ System Error: {e}")
-            time.sleep(10)
+            time.sleep(15)
