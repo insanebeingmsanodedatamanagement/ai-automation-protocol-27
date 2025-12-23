@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_LOG_CHANNEL = os.getenv("ADMIN_LOG_CHANNEL")
 
-# Pull IDs as Integers safely from Environment
+# Pull IDs safely
 try:
     OWNER_ID = int(os.getenv("OWNER_ID", 0))
     CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
@@ -35,7 +35,6 @@ except (TypeError, ValueError):
     OWNER_ID = 0
     CHANNEL_ID = 0
 
-# Links & Branding from Environment
 CHANNEL_LINK = os.getenv("CHANNEL_LINK") 
 BOT_USERNAME = os.getenv("BOT_USERNAME")
 YOUTUBE_LINK = os.getenv("YOUTUBE_LINK") 
@@ -144,12 +143,12 @@ except Exception as e:
 # --- HELPERS ---
 
 async def send_admin_report(text: str):
-    """Sends real-time logs to the private MSANODE Admin Channel."""
+    """Sends real-time dossier logs to the private MSANODE Admin Channel."""
     if ADMIN_LOG_CHANNEL:
         try:
             await bot.send_message(
                 ADMIN_LOG_CHANNEL, 
-                f"📡 **MSANODE LIVE REPORT**\n────────────────────\n{text}", 
+                f"📡 **MSANODE INTELLIGENCE DOSSIER**\n────────────────────\n{text}", 
                 parse_mode="Markdown"
             )
         except Exception as e:
@@ -180,7 +179,8 @@ async def is_member(user_id):
     return False
 
 async def log_user(user: types.User, source: str):
-    """Detects New vs Returning Users and logs to MSANode Database."""
+    """Handles User Identity and Silent Status Updates with precise formatting."""
+    # FORMAT: dd-mm-yyyy hh:mm AM/PM (e.g. 23-12-2025 04:08 PM)
     now_str = datetime.now().strftime("%d-%m-%Y %I:%M %p")
     user_id = str(user.id)
     username = f"@{user.username}" if user.username else "None"
@@ -196,15 +196,15 @@ async def log_user(user: types.User, source: str):
                 "joined_date": now_str,
                 "interaction_count": 1,
                 "source": source,
-                "status": "Active"
+                "status": "Active",
+                "has_reported": False # Flag for one-time dossier
             })
-            await send_admin_report(f"👤 **NEW RECRUIT**\n**Name:** {user.first_name}\n**User:** {username}\n**ID:** `{user_id}`\n**Source:** {source}\n**Time:** {now_str}")
             return "NEW"
         else:
+            # Silent Database Update for Returning Operatives
             update_fields = {"last_active": now_str, "status": "Active"}
             if existing.get("source") in ["Unknown", None, "Direct"]:
                 update_fields["source"] = source
-                
             col_users.update_one({"user_id": user_id}, {"$set": update_fields, "$inc": {"interaction_count": 1}})
             return "RETURNING"
     except Exception as e: 
@@ -277,7 +277,8 @@ async def process_finish(message: types.Message, state: FSMContext):
 async def on_user_leave(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
-    await send_admin_report(f"📉 **OPERATIVE DISCONNECTED**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
+    # Silent Database status update
+    col_users.update_one({"user_id": str(user.id)}, {"$set": {"status": "Disconnected"}})
     try:
         await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou just disconnected from the MSANODE Vault. Most people quit right before the breakthrough. Don't be 'most people'. Access is now LOCKED.", 
                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-establish MEMBERSHIP", url=CHANNEL_LINK)]]))
@@ -287,12 +288,12 @@ async def on_user_leave(event: ChatMemberUpdated):
 async def on_user_join(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
-    await send_admin_report(f"📈 **OPERATIVE RE-SYNCED**\n**Name:** {user.first_name}\n**ID:** `{user.id}`")
+    col_users.update_one({"user_id": str(user.id)}, {"$set": {"status": "Active"}})
     try: await bot.send_message(user.id, f"🤝 **Clearance Restored, WELCOME BACK TO FAMILY {user.first_name}.**\n\nYour commitment to the grind is noted. The MSANode Vault is now Exclusively open.")
     except: pass
 
 # ==========================================
-# 🤖 BOT LOGIC: THE MSANODE FLOW
+# 🤖 BOT LOGIC: THE MSANODE HUB
 # ==========================================
 
 @dp.message(CommandStart())
@@ -311,13 +312,12 @@ async def cmd_start(message: types.Message, command: CommandObject):
         elif raw_arg.startswith("yt_"): source = "YouTube"; payload = raw_arg.replace("yt_", "")
         else: payload = raw_arg
     
-    # --- 1. IDENTITY LOGGING ---
+    # --- 1. IDENTITY ENGINE ---
     user_status = await log_user(message.from_user, source)
 
     # --- 2. THE GATEKEEPER (STRICT MEMBERSHIP CHECK) ---
     if not await is_member(message.from_user.id):
         kb = InlineKeyboardBuilder()
-        # Cross-Promo Logic: If from YT, push IG. If from IG, push YT.
         if source == "Instagram":
             kb.row(InlineKeyboardButton(text="🔴 Subscribe on YouTube", url=YOUTUBE_LINK))
             kb.row(InlineKeyboardButton(text="🚀 Join MSANODE Telegram", url=CHANNEL_LINK))
@@ -352,7 +352,6 @@ async def cmd_start(message: types.Message, command: CommandObject):
 async def check_join(callback: types.CallbackQuery):
     raw_arg = callback.data.split("_", 1)[1]
     
-    # RE-VERIFYING MEMBERSHIP ON BUTTON CLICK
     if not await is_member(callback.from_user.id):
         await callback.answer("❌ PROTOCOL FAILED: Join the channel first!", show_alert=True)
         return
@@ -371,56 +370,70 @@ async def check_join(callback: types.CallbackQuery):
 
 async def deliver_content(message: types.Message, payload: str, source: str):
     data = await get_content(payload)
+    user_id = str(message.chat.id)
     name = message.chat.first_name if message.chat.first_name else "Operative"
+    username = f"@{message.chat.username}" if message.chat.username else "None"
     
     if not data: 
         await message.answer(f"❌ **Error:** Code `{payload}` not found in the MSANODE VAULT.")
         return
     
+    # --- INTELLIGENCE REPORTING (ONE TIME DOSSIER ONLY) ---
+    user_doc = col_users.find_one({"user_id": user_id})
+    if user_doc and not user_doc.get("has_reported", False):
+        report_time = datetime.now().strftime("%d-%m-%Y %I:%M %p")
+        dossier = (
+            f"👤 **NEW RECRUIT CAPTURED**\n"
+            f"**Name:** {name}\n"
+            f"**Username:** {username}\n"
+            f"**ID:** `{user_id}`\n"
+            f"**Source:** {source}\n"
+            f"**M-Code Used:** `{payload}`\n"
+            f"**PDF Sent:** {data['main_link']}\n"
+            f"**Affiliate Sent:** {data['aff_link'] if data['aff_link'] else 'None'}\n"
+            f"**Time:** {report_time}"
+        )
+        await send_admin_report(dossier)
+        col_users.update_one({"user_id": user_id}, {"$set": {"has_reported": True}})
+
     # 1. THE PDF DELIVERY
     await message.answer(f"**Transmission Successful, {name}.** 🔓\n\nHere is your requested MSANODE blueprint:\n{data['main_link']}")
-    await send_admin_report(f"📦 **BLUEPRINT DELIVERED**\n**User:** {name}\n**Code:** `{payload}`\n**Source:** {source}")
 
     # 2. THE PSYCHOLOGICAL AFFILIATE (DELAYED)
     if data['aff_link'] and len(data['aff_link']) > 5:
         await asyncio.sleep(1.5)
         kb_aff = InlineKeyboardBuilder().button(text="🚀 UNLOCK THE ENGINE", url=data['aff_link'])
         await message.answer(f"🤫 **Wait, one more tool for the army...**\n\n{data['aff_text']}", reply_markup=kb_aff.as_markup())
-        await send_admin_report(f"💰 **AFFILIATE SHOWN**\n**User:** {name}\n**Link:** {data['aff_link']}")
 
     # 3. THE CROSS-PLATFORM PSYCHOLOGY (INTELLIGENT SYNC)
     await asyncio.sleep(1.5)
     
     if source == "YouTube":
-        # Coming from YT? Push to IG for "Daily Alpha" hacks
+        # FROM YT -> PUSH IG + REMIND YT
         pipeline = [{"$sample": {"size": 1}}]
         reel = list(col_reels.aggregate(pipeline))
-        
         msg = f"⚡ **Maximize Your Edge, {name}.**\n\nYou've seen the deep dive, but I drop daily automation hacks on my Instagram stories. Join the elite there for real-time updates. Check Out Now. DONT MISS !!!!"
-        
         kb_ig = InlineKeyboardBuilder()
         if reel:
-            msg += f"\n\n🔥 **Trending Now:**\n{reel[0].get('desc', 'Check this version out!')}"
-            kb_ig.button(text="📸 WATCH MORE NEW", url=reel[0]['link'])
+            msg += f"\n\n🔥 **Trending Now on Instagram:**\n{reel[0].get('desc', 'New Hack Active')}"
+            kb_ig.row(InlineKeyboardButton(text="📸 WATCH DAILY ALPHA", url=reel[0]['link']))
         else:
-            kb_ig.button(text="📸 FOLLOW INSTAGRAM", url=INSTAGRAM_LINK)
-            
+            kb_ig.row(InlineKeyboardButton(text="📸 FOLLOW INSTAGRAM", url=INSTAGRAM_LINK))
+        kb_ig.row(InlineKeyboardButton(text="▶️ STAY TUNED ON YOUTUBE", url=YOUTUBE_LINK))
         await message.answer(msg, reply_markup=kb_ig.as_markup())
         
     else: 
-        # Coming from Instagram? Push to YT for "Full Strategy" deep dives
+        # FROM IG -> PUSH YT + REMIND IG
         pipeline = [{"$sample": {"size": 1}}]
         video = list(col_viral.aggregate(pipeline))
-        
         msg = f"🔥 **Go Beyond the Surface, {name}.**\n\nInstagram is for speed, but YouTube is for the real money. I just dropped a breakdown on YouTube that you can't afford to miss. Check Out Now. DONT MISS !!!!"
-        
         kb_yt = InlineKeyboardBuilder()
         if video:
-            msg += f"\n\n▶️ **Full Strategy Revealed:**\n{video[0].get('desc', 'Check this strategy!')}"
-            kb_yt.button(text="▶️ WATCH FULL STRATEGY", url=video[0]['link'])
+            msg += f"\n\n▶️ **New Deep Dive on YouTube:**\n{video[0].get('desc', 'Elite Strategy Revealed')}"
+            kb_yt.row(InlineKeyboardButton(text="▶️ WATCH FULL STRATEGY", url=video[0]['link']))
         else:
-            kb_yt.button(text="▶️ SUBSCRIBE YOUTUBE", url=YOUTUBE_LINK)
-            
+            kb_yt.row(InlineKeyboardButton(text="▶️ SUBSCRIBE YOUTUBE", url=YOUTUBE_LINK))
+        kb_yt.row(InlineKeyboardButton(text="📸 STAY TUNED ON INSTA", url=INSTAGRAM_LINK))
         await message.answer(msg, reply_markup=kb_yt.as_markup())
 
 # ==========================================
@@ -432,7 +445,7 @@ async def main():
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         print("🛠 Purging old sessions... MSANode Shield Active.")
-        await asyncio.sleep(2) # Breath time for the server
+        await asyncio.sleep(2)
     except Exception as e:
         print(f"⚠️ Webhook Purge Note: {e}")
 
@@ -448,10 +461,10 @@ if __name__ == "__main__":
         try:
             asyncio.run(main())
         except TelegramConflictError:
-            # THIS IS THE KEY: If we see conflict, we wait long enough to kill the ghost
+            # NUCLEAR OPTION: Wait 20 seconds to kill any competing instances
             print("💀 GHOST DETECTED! Conflict Error 409.")
             print("☢️ Nuclear Option: Waiting 20 seconds to force-kill the competing instance...")
-            time.sleep(20) # Long sleep forces the other bot to time out
+            time.sleep(20) 
         except Exception as e:
             print(f"⚠️ System Error: {e}")
             time.sleep(15)
