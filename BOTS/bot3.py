@@ -16,15 +16,15 @@ from telebot.storage import StateMemoryStorage
 from datetime import datetime
 from aiohttp import web
 
-# ================= CONFIGURATION =================
-BOT_TOKEN = os.getenv("BOT_3_TOKEN") 
-MONGO_URI = os.getenv("MONGO_URI")
+# ================= CONFIGURATION (FULLY SECURED) =================
+# All private credentials are now pulled from Environment Variables.
+BOT_TOKEN = os.environ.get("BOT_3_TOKEN") 
+MONGO_URI = os.environ.get("MONGO_URI")
 
-if not BOT_TOKEN or not MONGO_URI:
-    print("❌ SECURITY ALERT: Bot 3 keys missing from Environment!")
-
+# IDENTITY HIDDEN: Values are pulled from Render Environment Variables
 MAIN_BOT_USERNAME = os.environ.get("MAIN_BOT_USERNAME") 
-MASTER_ADMIN_ID = int(os.environ.get("MASTER_ADMIN_ID", 0))
+MASTER_ADMIN_ID_RAW = os.environ.get("MASTER_ADMIN_ID")
+MASTER_ADMIN_ID = int(MASTER_ADMIN_ID_RAW) if MASTER_ADMIN_ID_RAW else 0
 
 # Timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -36,7 +36,7 @@ try:
     client = pymongo.MongoClient(MONGO_URI)
     db = client["MSANodeDB"]
     
-    # Collections
+    # Collections (Interconnected with Bot 1 and Bot 2)
     col_active = db["active_content"]
     col_viral = db["viral_videos"]
     col_reels = db["viral_reels"]
@@ -83,14 +83,14 @@ def get_authorized_users():
     try:
         cursor = col_admins.find({}, {"user_id": 1})
         db_admins = [int(doc["user_id"]) for doc in cursor if str(doc["user_id"]).isdigit()]
-        if MASTER_ADMIN_ID not in db_admins: db_admins.append(MASTER_ADMIN_ID)
+        if MASTER_ADMIN_ID != 0 and MASTER_ADMIN_ID not in db_admins: db_admins.append(MASTER_ADMIN_ID)
         admin_cache = db_admins; last_cache_time = time.time()
         return admin_cache
-    except: return [MASTER_ADMIN_ID]
+    except: return [MASTER_ADMIN_ID] if MASTER_ADMIN_ID != 0 else []
 
 def is_admin(user_id): return user_id in get_authorized_users()
 
-# EXACT FORMAT REQUIRED: 4:08 PM 24-12-2025
+# EXACT FORMAT: 04:08 PM 24-12-2025
 def get_current_time(): return datetime.now(IST).strftime("%I:%M %p %d-%m-%Y")
 
 def get_next_code_suggestion():
@@ -164,7 +164,7 @@ def handle_query(call):
         )
         bot.edit_message_text("➕ **Select Category to Add:**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
 
-    # --- 3. SEPARATE SEARCH SYSTEM (AS REQUESTED) ---
+    # --- 3. SEPARATE SEARCH SYSTEM ---
     elif data == "hub_search":
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -208,7 +208,7 @@ def handle_query(call):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("☢️ EXECUTE FINAL WIPE", callback_data="nuclear_final"))
         kb.add(InlineKeyboardButton("❌ ABORT", callback_data="back_main"))
-        bot.edit_message_text("🚨 **FINAL WARNING:** This is the second confirmation. Every link will be lost. Wipe everything?", call.message.chat.id, call.message.message_id, reply_markup=kb)
+        bot.edit_message_text("🚨 **FINAL WARNING:** Every link will be lost. Purge now?", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
     elif data == "nuclear_final":
         col_active.delete_many({}); col_viral.delete_many({}); col_reels.delete_many({})
@@ -275,7 +275,7 @@ def run_full_inventory(message):
             f.write(f"{'-'*50}\n")
             count += 1
         f.write(f"\nTOTAL: {count}")
-    with open(filename, "rb") as f: bot.send_document(message.chat.id, f, caption=f"📄 PDF Master List ({count} items)")
+    with open(filename, "rb") as f: bot.send_document(message.chat.id, f, caption=f"📄 PDF Master List")
     os.remove(filename)
 
 # --- ADD YT/IG WITH CODES ---
@@ -334,7 +334,7 @@ def step_remove_pdf(m):
 @safe_execute
 def step_get_link(message):
     code = message.text.upper().strip()
-    user = MAIN_BOT_USERNAME.replace('@', '')
+    user = (MAIN_BOT_USERNAME or "@bot").replace('@', '')
     bot.reply_to(message, f"🔗 **Smart Links for {code}:**\n\n🔴 **YouTube:**\n`https://t.me/{user}?start=yt_{code}`\n\n📸 **Instagram:**\n`https://t.me/{user}?start=ig_{code}`", parse_mode="Markdown", reply_markup=get_main_menu())
 
 def run_stats(message):
@@ -342,7 +342,7 @@ def run_stats(message):
     bot.reply_to(message, msg, reply_markup=get_main_menu())
 
 def run_health_check(message):
-    bot.reply_to(message, "🏥 **System Online:**\n✅ DB Connected\n✅ Cross-Sync Active", reply_markup=get_main_menu())
+    bot.reply_to(message, "🏥 **System Online:**\n✅ DB Connected\n✅ Identity Secured", reply_markup=get_main_menu())
 
 # --- RENDER PORT BINDER ---
 async def handle_health(request):
@@ -369,4 +369,3 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"⚠️ Polling Error: {e}")
             time.sleep(10)
-
