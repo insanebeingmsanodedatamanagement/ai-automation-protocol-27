@@ -361,7 +361,7 @@ async def deliver_content(message: types.Message, payload: str, source: str):
         msg = f"⚡ **Maximize Edge, {name}.**\n\nYou've seen the deep strategy, but I drop daily automation on Instagram. Join elite there:"
         if reel:
             msg += f"\n\n{title}\n{reel[0].get('desc', 'Check Daily Alpha')}"
-            kb.row(InlineKeyboardButton(text="📸 WATCH DAILY ALPHA", url=reel[0]['link']))
+            kb.row(InlineKeyboardButton(text="📸 WATCH MORE", url=reel[0]['link']))
         else: kb.row(InlineKeyboardButton(text="📸 FOLLOW INSTAGRAM", url=INSTAGRAM_LINK))
         kb.row(InlineKeyboardButton(text="▶️ STAY TUNED ON YOUTUBE", url=YOUTUBE_LINK))
         await message.answer(msg, reply_markup=kb.as_markup())
@@ -395,3 +395,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"⚠️ Error: {e}")
             time.sleep(15)
+
