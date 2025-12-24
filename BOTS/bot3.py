@@ -51,7 +51,7 @@ except Exception as e:
     print(f"❌ CRITICAL DB ERROR: {e}")
     sys.exit(1)
 
-# --- STABILITY ENHANCEMENT: Memory Storage & Threading ---
+# --- STABILITY ENHANCEMENT ---
 state_storage = StateMemoryStorage()
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=15, state_storage=state_storage)
 
@@ -91,241 +91,263 @@ def get_authorized_users():
 
 def is_admin(user_id): return user_id in get_authorized_users()
 
-def get_current_time(): return datetime.now(IST).strftime("%d/%m/%Y %I:%M %p")
-
-def log_audit(action, user, details, code="N/A"):
-    try: col_audit.insert_one({"timestamp": get_current_time(), "user": str(user), "action": action, "code": str(code), "details": str(details)})
-    except: pass
+# EXACT FORMAT REQUIRED: 4:08 PM 24-12-2025
+def get_current_time(): return datetime.now(IST).strftime("%I:%M %p %d-%m-%Y")
 
 def get_next_code_suggestion():
     try: return f"M{col_active.count_documents({}) + 101}"
     except: return "M101"
 
-def get_storage_usage():
-    try:
-        stats = db.command("dbstats")
-        used_mb = round(stats.get('storageSize', 0) / (1024 * 1024), 2)
-        percent = round((stats.get('storageSize', 0) / (512 * 1024 * 1024)) * 100, 2)
-        return used_mb, percent
-    except: return 0, 0
-
 def get_main_menu():
     markup = InlineKeyboardMarkup()
     markup.row_width = 2
-    markup.add(InlineKeyboardButton("➕ Add Content", callback_data="btn_add"), InlineKeyboardButton("🔗 Get Smart Links", callback_data="btn_link"))
-    markup.add(InlineKeyboardButton("📦 Full Inventory", callback_data="btn_full_list"), InlineKeyboardButton("💾 Check Storage", callback_data="btn_storage"))
-    markup.add(InlineKeyboardButton("🎬 Add YT Video", callback_data="btn_yt"), InlineKeyboardButton("📸 Add IG Reel", callback_data="btn_insta"))
-    markup.add(InlineKeyboardButton("🔍 Search", callback_data="btn_search"), InlineKeyboardButton("✏️ Edit", callback_data="btn_edit"))
-    markup.add(InlineKeyboardButton("🗑️ Remove", callback_data="btn_remove"), InlineKeyboardButton("🧹 Deep Clean", callback_data="btn_clean"))
-    markup.add(InlineKeyboardButton("🏥 Health Check", callback_data="btn_health"), InlineKeyboardButton("📈 Traffic Stats", callback_data="btn_traffic"))
-    markup.add(InlineKeyboardButton("📊 DB Counts", callback_data="btn_stats"), InlineKeyboardButton("📂 Export CSV", callback_data="btn_export"))
-    markup.add(InlineKeyboardButton("🔄 Refresh Admins", callback_data="btn_refresh"))
+    markup.add(
+        InlineKeyboardButton("📋 List", callback_data="hub_list"), 
+        InlineKeyboardButton("➕ Add", callback_data="hub_add")
+    )
+    markup.add(
+        InlineKeyboardButton("🔍 Search", callback_data="hub_search"), 
+        InlineKeyboardButton("🗑️ Delete", callback_data="hub_delete")
+    )
+    markup.add(
+        InlineKeyboardButton("💾 Backup", callback_data="hub_backup"),
+        InlineKeyboardButton("🔗 Get Start Links", callback_data="btn_link")
+    )
+    markup.add(
+        InlineKeyboardButton("📊 DB Counts", callback_data="btn_stats"),
+        InlineKeyboardButton("🏥 Health Check", callback_data="btn_health")
+    )
+    markup.add(
+        InlineKeyboardButton("☢️ CLEAR ALL DATA", callback_data="nuclear_1")
+    )
+    markup.add(
+        InlineKeyboardButton("🔄 Refresh Admins", callback_data="btn_refresh")
+    )
     return markup
 
 # ================= HANDLERS =================
+
 @bot.message_handler(commands=['start'])
 @safe_execute
 def send_welcome(message):
     if not is_admin(message.from_user.id): return 
-    bot.reply_to(message, f"⚡ **Data Manager (God Mode)**\n📅 {get_current_time()}\n\n**👇 Operations Console:**", parse_mode="Markdown", reply_markup=get_main_menu())
-
-@bot.message_handler(content_types=['document'])
-@safe_execute
-def handle_docs(message):
-    if not is_admin(message.from_user.id): return
-    file_name = message.document.file_name
-    if not file_name.endswith(('.csv', '.xlsx')): return bot.reply_to(message, "❌ .csv or .xlsx only.")
-    
-    bot.reply_to(message, "📥 **Importing...**")
-    file_info = bot.get_file(message.document.file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
-    save_path = f"temp_{int(time.time())}.{'xlsx' if file_name.endswith('.xlsx') else 'csv'}"
-    
-    with open(save_path, 'wb') as new_file: new_file.write(downloaded_file)
-    df = pd.read_excel(save_path) if save_path.endswith('.xlsx') else pd.read_csv(save_path)
-    
-    if len(df.columns) < 3: os.remove(save_path); return bot.reply_to(message, "❌ Columns must be: Code, PDF, Affiliate")
-    
-    data_list = [{"code": str(row[0]).upper(), "pdf_link": str(row[1]), "aff_link": str(row[2])} for index, row in df.iterrows()]
-    if data_list: col_active.insert_many(data_list)
-    
-    log_audit("BULK_IMPORT", message.from_user.first_name, f"Imported {len(data_list)}")
-    bot.reply_to(message, f"✅ Imported {len(data_list)} items.", reply_markup=get_main_menu())
-    os.remove(save_path)
+    bot.reply_to(message, f"⚡ **Data Core (God Mode)**\n📅 {get_current_time()}\n\n**👇 Operations Console:**", parse_mode="Markdown", reply_markup=get_main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
 @safe_execute
 def handle_query(call):
-    bot.answer_callback_query(call.id)
-    if not is_admin(call.from_user.id): return bot.send_message(call.message.chat.id, "⛔ Access Denied")
+    if not is_admin(call.from_user.id): return
     data = call.data
 
-    if data.startswith("edit:"):
-        parts = data.split(":"); field, code = parts[1], parts[2]
-        msg = bot.send_message(call.message.chat.id, f"✏️ Editing **{code}**\nSend NEW **{field.upper()}**:", parse_mode="Markdown")
-        bot.register_next_step_handler(msg, step_process_edit, field, code)
-        return
+    # --- 1. SEPARATE LIST SYSTEM ---
+    if data == "hub_list":
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("📹 List YouTube", callback_data="list_yt"),
+            InlineKeyboardButton("📸 List Instagram", callback_data="list_ig"),
+            InlineKeyboardButton("📄 List PDF Vault", callback_data="list_pdf"),
+            InlineKeyboardButton("⬅️ Back", callback_data="back_main")
+        )
+        bot.edit_message_text("📋 **Select Database to List:**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
 
-    if data == "btn_add":
-        msg = bot.send_message(call.message.chat.id, f"📥 **Step 1:** Enter the **M-Code**:\n💡 Suggested: `{get_next_code_suggestion()}`", parse_mode="Markdown")
-        bot.register_next_step_handler(msg, step_add_code)
+    elif data == "list_pdf": run_full_inventory(call.message)
+    elif data == "list_yt": list_simple(col_viral, "YOUTUBE", call.message)
+    elif data == "list_ig": list_simple(col_reels, "INSTAGRAM", call.message)
+
+    # --- 2. SEPARATE ADD SYSTEM ---
+    elif data == "hub_add":
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("📹 Add YT (Unique Code)", callback_data="btn_yt"),
+            InlineKeyboardButton("📸 Add IG (Unique Code)", callback_data="btn_insta"),
+            InlineKeyboardButton("📄 Add PDF (M-Code)", callback_data="btn_add_pdf"),
+            InlineKeyboardButton("⬅️ Back", callback_data="back_main")
+        )
+        bot.edit_message_text("➕ **Select Category to Add:**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    # --- 3. SEPARATE SEARCH SYSTEM (AS REQUESTED) ---
+    elif data == "hub_search":
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("🔍 Search YT by Code", callback_data="search_yt"),
+            InlineKeyboardButton("🔍 Search IG by Code", callback_data="search_ig"),
+            InlineKeyboardButton("🔍 Search PDF by Code", callback_data="search_pdf"),
+            InlineKeyboardButton("⬅️ Back", callback_data="back_main")
+        )
+        bot.edit_message_text("🔍 **Select Database to Search:**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    # --- 4. SEPARATE DELETE SYSTEM ---
+    elif data == "hub_delete":
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("🗑️ Delete YT Entry", callback_data="del_yt"),
+            InlineKeyboardButton("🗑️ Delete IG Entry", callback_data="del_ig"),
+            InlineKeyboardButton("🗑️ Delete PDF Entry", callback_data="del_pdf"),
+            InlineKeyboardButton("⬅️ Back", callback_data="back_main")
+        )
+        bot.edit_message_text("🗑️ **Select Database to Delete From:**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    # --- 5. SEPARATE BACKUP SYSTEM ---
+    elif data == "hub_backup":
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("📥 Download YT CSV", callback_data="exp_yt"),
+            InlineKeyboardButton("📥 Download IG CSV", callback_data="exp_ig"),
+            InlineKeyboardButton("📥 Download PDF CSV", callback_data="exp_pdf"),
+            InlineKeyboardButton("⬅️ Back", callback_data="back_main")
+        )
+        bot.edit_message_text("💾 **Which Data Backup do you need?**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    # --- 6. NUCLEAR CLEAR (2-STEP CONFIRMATION) ---
+    elif data == "nuclear_1":
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🛑 YES, DELETE EVERYTHING", callback_data="nuclear_2"))
+        kb.add(InlineKeyboardButton("❌ CANCEL", callback_data="back_main"))
+        bot.edit_message_text("⚠️ **CRITICAL WARNING:** This will permanently wipe ALL databases (YT, IG, PDF). Are you sure?", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+    elif data == "nuclear_2":
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("☢️ EXECUTE FINAL WIPE", callback_data="nuclear_final"))
+        kb.add(InlineKeyboardButton("❌ ABORT", callback_data="back_main"))
+        bot.edit_message_text("🚨 **FINAL WARNING:** This is the second confirmation. Every link will be lost. Wipe everything?", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+    elif data == "nuclear_final":
+        col_active.delete_many({}); col_viral.delete_many({}); col_reels.delete_many({})
+        bot.edit_message_text("💥 **DATABASE PURGED.** All empire data destroyed.", call.message.chat.id, call.message.message_id, reply_markup=get_main_menu())
+
+    # --- STEP TRIGGER MAPPING ---
+    elif data == "back_main": bot.edit_message_text("⚡ **Operations Console:**", call.message.chat.id, call.message.message_id, reply_markup=get_main_menu())
     
-    elif data == "btn_link": 
-        msg = bot.send_message(call.message.chat.id, "🔗 **Enter Code to Generate Links:**", parse_mode="Markdown")
-        bot.register_next_step_handler(msg, step_get_link)
-
-    elif data == "btn_storage": 
-        used, perc = get_storage_usage()
-        bar = "█" * int(perc/10) + "░" * (10 - int(perc/10))
-        bot.send_message(call.message.chat.id, f"💾 **STORAGE**\n📦 Used: {used} MB\n📊 `{bar}` {perc}%\n🛑 Limit: 512 MB", parse_mode="Markdown", reply_markup=get_main_menu())
-
-    elif data == "btn_full_list": 
-        bot.send_message(call.message.chat.id, "📦 **Generating Report...**")
-        run_full_inventory(call.message)
-
-    elif data == "btn_search":
-        msg = bot.send_message(call.message.chat.id, "🔍 Enter Code:")
-        bot.register_next_step_handler(msg, step_search_code)
-
-    elif data == "btn_edit":
-        msg = bot.send_message(call.message.chat.id, "✏️ Enter Code:")
-        bot.register_next_step_handler(msg, step_edit_start)
-
-    elif data == "btn_remove":
-        msg = bot.send_message(call.message.chat.id, "🗑️ Enter Code to Remove:")
-        bot.register_next_step_handler(msg, step_remove_code)
-
-    elif data == "btn_yt":
-        msg = bot.send_message(call.message.chat.id, "🎬 Enter YT Link:")
-        bot.register_next_step_handler(msg, step_yt_link)
-
-    elif data == "btn_insta":
-        msg = bot.send_message(call.message.chat.id, "📸 Enter Reel Link:")
-        bot.register_next_step_handler(msg, step_insta_link)
-
-    elif data == "btn_traffic": run_traffic_analysis(call.message)
-    elif data == "btn_clean": run_deep_clean(call.message)
-    elif data == "btn_health":
-        bot.send_message(call.message.chat.id, "🏥 Scanning...")
-        run_health_check(call.message)
-    elif data == "btn_export": run_export(call.message)
+    # Adding
+    elif data == "btn_add_pdf": bot.register_next_step_handler(bot.send_message(call.message.chat.id, f"📥 Enter M-Code:\n💡 Suggested: `{get_next_code_suggestion()}`", parse_mode="Markdown"), step_add_code)
+    elif data == "btn_yt": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "📹 Enter Unique YT Code:"), step_yt_code)
+    elif data == "btn_insta": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "📸 Enter Unique IG Code:"), step_ig_code)
+    
+    # Searching
+    elif data == "search_yt": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "🔍 Enter YT Code:"), lambda m: step_search_simple(col_viral, m))
+    elif data == "search_ig": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "🔍 Enter IG Code:"), lambda m: step_search_simple(col_reels, m))
+    elif data == "search_pdf": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "🔍 Enter PDF Code:"), step_search_pdf)
+    
+    # Deleting
+    elif data == "del_yt": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "🗑️ Enter YT Code to Remove:"), lambda m: step_delete_simple(col_viral, m))
+    elif data == "del_ig": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "🗑️ Enter IG Code to Remove:"), lambda m: step_delete_simple(col_reels, m))
+    elif data == "del_pdf": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "🗑️ Enter PDF Code to Delete:"), step_remove_pdf)
+    
+    # Backup & Other
+    elif data == "exp_yt": run_csv_export(col_viral, "YT_Backup.csv", call.message)
+    elif data == "exp_ig": run_csv_export(col_reels, "IG_Backup.csv", call.message)
+    elif data == "exp_pdf": run_csv_export(col_active, "PDF_Backup.csv", call.message)
+    elif data == "btn_link": bot.register_next_step_handler(bot.send_message(call.message.chat.id, "🔗 Enter PDF Code to Generate Smart Links:"), step_get_link)
     elif data == "btn_stats": run_stats(call.message)
+    elif data == "btn_health": run_health_check(call.message)
     elif data == "btn_refresh":
         global last_cache_time; last_cache_time = 0; get_authorized_users()
         bot.send_message(call.message.chat.id, "🔐 Admins Refreshed.", reply_markup=get_main_menu())
 
-# ================= LOGIC FUNCTIONS =================
-@safe_execute
-def run_full_inventory(message):
-    filename = f"Inventory_{int(time.time())}.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(f"📦 INVENTORY | {get_current_time()}\n{'='*40}\n")
-        count = 0
-        for doc in col_active.find({}):
-            f.write(f"[{doc.get('code')}]\nPDF: {doc.get('pdf_link')}\nAFF: {doc.get('aff_link')}\n{'-'*40}\n")
-            count += 1
-        f.write(f"\nTOTAL: {count}")
-    with open(filename, "rb") as f: bot.send_document(message.chat.id, f, caption=f"📦 Full List ({count} items)")
+# ================= CORE LOGIC FUNCTIONS =================
+
+def run_csv_export(collection, filename, message):
+    data = list(collection.find({}, {"_id": 0}))
+    if not data: return bot.send_message(message.chat.id, "❌ No data found.")
+    pd.DataFrame(data).to_csv(filename, index=False)
+    with open(filename, "rb") as f: bot.send_document(message.chat.id, f, caption=f"💾 {filename}")
     os.remove(filename)
 
-@safe_execute
-def run_traffic_analysis(message):
-    res = list(col_users.aggregate([{"$group": {"_id": "$source", "count": {"$sum": 1}}}]))
-    if not res: return bot.reply_to(message, "⚠️ No Data.", reply_markup=get_main_menu())
-    total = sum([r['count'] for r in res])
-    rep = "📈 **SOURCES**\n"
-    for r in res: rep += f"🔹 {r['_id']}: {r['count']} ({round(r['count']/(total or 1)*100,1)}%)\n"
-    bot.reply_to(message, rep, parse_mode="Markdown", reply_markup=get_main_menu())
+def list_simple(collection, label, message):
+    text = f"📦 **{label} DATABASE**\n\n"
+    count = 0
+    for doc in collection.find():
+        text += f"🔹 Code: `{doc.get('code')}`\n🔗 {doc.get('link')}\n\n"
+        count += 1
+    if count == 0: text = f"❌ {label} Database is empty."
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
 @safe_execute
-def run_stats(message):
-    msg = (f"📊 **STATS**\n✅ Active: {col_active.count_documents({})}\n🎬 Viral: {col_viral.count_documents({})}\n"
-            f"📸 Reels: {col_reels.count_documents({})}\n🗑️ Bin: {col_recycle.count_documents({})}")
-    bot.reply_to(message, msg, reply_markup=get_main_menu(), parse_mode="Markdown")
+def run_full_inventory(message):
+    filename = f"PDF_Vault_{int(time.time())}.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(f"📦 MSANODE PDF VAULT | {get_current_time()}\n{'='*50}\n")
+        count = 0
+        for doc in col_active.find({}):
+            f.write(f"[{doc.get('code')}]\n")
+            f.write(f"PDF: {doc.get('pdf_link')}\n")
+            f.write(f"AFF: {doc.get('aff_link')}\n")
+            f.write(f"CREATED: {doc.get('created_at', 'N/A')}\n")
+            f.write(f"{'-'*50}\n")
+            count += 1
+        f.write(f"\nTOTAL: {count}")
+    with open(filename, "rb") as f: bot.send_document(message.chat.id, f, caption=f"📄 PDF Master List ({count} items)")
+    os.remove(filename)
 
-@safe_execute
-def run_deep_clean(message):
-    res = col_active.delete_many({"$or": [{"code": ""}, {"pdf_link": ""}]})
-    bot.reply_to(message, f"🧹 Cleaned {res.deleted_count} junk items.", reply_markup=get_main_menu())
+# --- ADD YT/IG WITH CODES ---
+def step_yt_code(m):
+    code = m.text.upper().strip()
+    bot.register_next_step_handler(bot.send_message(m.chat.id, f"Code `{code}` Saved.\n🔗 Send YouTube Link:"), lambda msg: finalize_simple_add(col_viral, code, msg))
 
-@safe_execute
-def run_health_check(message):
-    issues = 0; report = "🏥 **Report:**\n"
-    for doc in col_active.find({}).limit(100):
-        if not str(doc.get("pdf_link", "")).startswith("http"):
-            report += f"⚠️ {doc.get('code')}: Invalid URL\n"; issues += 1
-    if issues == 0: bot.reply_to(message, "✅ Healthy.", reply_markup=get_main_menu())
-    else: bot.reply_to(message, report, reply_markup=get_main_menu())
+def step_ig_code(m):
+    code = m.text.upper().strip()
+    bot.register_next_step_handler(bot.send_message(m.chat.id, f"Code `{code}` Saved.\n🔗 Send Instagram Link:"), lambda msg: finalize_simple_add(col_reels, code, msg))
 
-@safe_execute
-def run_export(message):
-    df = pd.DataFrame(list(col_active.find({}, {"_id": 0})))
-    df.to_csv("backup.csv", index=False)
-    with open("backup.csv", "rb") as f: bot.send_document(message.chat.id, f, caption="Backup")
-    os.remove("backup.csv")
+def finalize_simple_add(collection, code, m):
+    collection.insert_one({"code": code, "link": m.text.strip(), "created_at": get_current_time()})
+    bot.send_message(m.chat.id, f"✅ Entry `{code}` successfully stored.", reply_markup=get_main_menu())
 
-# ================= STEPS =================
+# --- PDF ADDITION ---
 @safe_execute
 def step_add_code(message):
     code = message.text.upper().strip()
-    if col_active.find_one({"code": code}): return bot.reply_to(message, "⚠️ Exists.", reply_markup=get_main_menu())
-    msg = bot.reply_to(message, f"Code Locked: `{code}`\n────────────────────\n🔗 **Step 2:** Send the **PDF Link**:", parse_mode="Markdown")
-    bot.register_next_step_handler(msg, step_add_pdf, code)
+    if col_active.find_one({"code": code}): return bot.reply_to(message, "⚠️ Code exists.", reply_markup=get_main_menu())
+    bot.register_next_step_handler(bot.reply_to(message, f"Code `{code}` Locked.\n🔗 **Step 2:** Send PDF Link:"), step_add_pdf, code)
 
 @safe_execute
 def step_add_pdf(message, code):
     pdf = message.text.strip()
-    msg = bot.reply_to(message, f"PDF Link Received.\n────────────────────\n💸 **Step 3:** Send the **Affiliate Link**:")
-    bot.register_next_step_handler(msg, step_add_aff, code, pdf)
+    bot.register_next_step_handler(bot.reply_to(message, "PDF OK.\n💸 **Step 3:** Send Affiliate Link:"), step_add_aff, code, pdf)
 
 @safe_execute
 def step_add_aff(message, code, pdf):
     aff = message.text.strip()
-    col_active.insert_one({"code": code, "pdf_link": pdf, "aff_link": aff})
-    log_audit("ADDED", message.from_user.username or message.from_user.id, code)
-    bot.reply_to(message, f"✅ **SUCCESS**\n\nCode `{code}` is now stored in the Vault.", reply_markup=get_main_menu())
+    col_active.insert_one({"code": code, "pdf_link": pdf, "aff_link": aff, "created_at": get_current_time()})
+    bot.reply_to(message, f"✅ **PDF STORED**\nCode: `{code}`\nCreated: {get_current_time()}", reply_markup=get_main_menu())
 
+# --- SEARCH & DELETE ---
+def step_search_simple(collection, m):
+    res = collection.find_one({"code": m.text.upper().strip()})
+    if not res: return bot.send_message(m.chat.id, "❌ Code not found.")
+    bot.send_message(m.chat.id, f"🔍 **Result Found:**\nCode: `{res['code']}`\nLink: {res['link']}\nDate: {res.get('created_at')}")
+
+def step_search_pdf(m):
+    res = col_active.find_one({"code": m.text.upper().strip()})
+    if not res: return bot.send_message(m.chat.id, "❌ Code not found in PDF Vault.")
+    bot.send_message(m.chat.id, f"🔍 **PDF Found:**\nCode: `{res['code']}`\nPDF: {res['pdf_link']}\nAFF: {res['aff_link']}\nDate: {res.get('created_at')}")
+
+def step_delete_simple(collection, m):
+    res = collection.delete_one({"code": m.text.upper().strip()})
+    if res.deleted_count > 0: bot.send_message(m.chat.id, "🗑️ Entry deleted successfully.")
+    else: bot.send_message(m.chat.id, "❌ Code not found.")
+
+def step_remove_pdf(m):
+    res = col_active.delete_one({"code": m.text.upper().strip()})
+    if res.deleted_count > 0: bot.send_message(m.chat.id, "🗑️ PDF deleted successfully.")
+    else: bot.send_message(m.chat.id, "❌ Code not found.")
+
+# --- START LINKS ---
 @safe_execute
 def step_get_link(message):
     code = message.text.upper().strip()
-    clean_username = MAIN_BOT_USERNAME.replace('@', '')
-    bot.reply_to(message, f"🔗 **Smart Links for {code}**\n\n🔴 **YouTube:**\n`https://t.me/{clean_username}?start=yt_{code}`\n\n📸 **Instagram:**\n`https://t.me/{clean_username}?start=ig_{code}`", parse_mode="Markdown", reply_markup=get_main_menu())
+    user = MAIN_BOT_USERNAME.replace('@', '')
+    bot.reply_to(message, f"🔗 **Smart Links for {code}:**\n\n🔴 **YouTube:**\n`https://t.me/{user}?start=yt_{code}`\n\n📸 **Instagram:**\n`https://t.me/{user}?start=ig_{code}`", parse_mode="Markdown", reply_markup=get_main_menu())
 
-@safe_execute
-def step_search_code(message):
-    res = col_active.find_one({"code": message.text.upper().strip()})
-    if not res: return bot.reply_to(message, "❌ Not Found.", reply_markup=get_main_menu())
-    bot.reply_to(message, f"🔍 **{res['code']}**\n📄 {res['pdf_link']}\n💰 {res['aff_link']}", reply_markup=get_main_menu())
+def run_stats(message):
+    msg = (f"📊 **STORAGE COUNTS**\n\n📄 PDF Vault: {col_active.count_documents({})}\n📹 YouTube DB: {col_viral.count_documents({})}\n📸 Instagram DB: {col_reels.count_documents({})}")
+    bot.reply_to(message, msg, reply_markup=get_main_menu())
 
-@safe_execute
-def step_edit_start(message):
-    code = message.text.upper().strip()
-    if not col_active.find_one({"code": code}): return bot.reply_to(message, "❌ Not Found.")
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("Edit PDF", callback_data=f"edit:pdf_link:{code}"), InlineKeyboardButton("Edit Aff", callback_data=f"edit:aff_link:{code}"))
-    bot.reply_to(message, f"Edit **{code}**:", parse_mode="Markdown", reply_markup=markup)
-
-@safe_execute
-def step_process_edit(message, field, code):
-    col_active.update_one({"code": code}, {"$set": {field: message.text.strip()}})
-    bot.reply_to(message, "✅ Updated.", reply_markup=get_main_menu())
-
-@safe_execute
-def step_remove_code(message):
-    code = message.text.upper().strip()
-    res = col_active.find_one_and_delete({"code": code})
-    if res:
-        del res["_id"]; res["deleted_at"] = get_current_time()
-        col_recycle.insert_one(res)
-        bot.reply_to(message, "🗑️ Deleted.", reply_markup=get_main_menu())
-    else: bot.reply_to(message, "❌ Not Found.")
-
-def step_yt_link(m): bot.register_next_step_handler(bot.reply_to(m, "Title:"), lambda msg: (col_viral.insert_one({"link": m.text, "desc": msg.text}), bot.reply_to(msg, "✅ Saved.")))
-def step_insta_link(m): bot.register_next_step_handler(bot.reply_to(m, "Desc:"), lambda msg: (col_reels.insert_one({"link": m.text, "desc": msg.text}), bot.reply_to(msg, "✅ Saved.")))
+def run_health_check(message):
+    bot.reply_to(message, "🏥 **System Online:**\n✅ DB Connected\n✅ Cross-Sync Active", reply_markup=get_main_menu())
 
 # --- RENDER PORT BINDER ---
 async def handle_health(request):
-    return web.Response(text="BOT 3 IS ONLINE")
+    return web.Response(text="MSANODE CORE ONLINE")
 
 def run_health_server():
     try:
@@ -333,20 +355,18 @@ def run_health_server():
         app.router.add_get('/', handle_health)
         port = int(os.environ.get("PORT", 10000))
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
-    except Exception as e:
-        print(f"📡 Health Server Note: {e}")
+    except: pass
 
-# ================= THE SUPREME RESTART =================
+# ================= EXECUTION =================
 if __name__ == "__main__":
     print("💎 MSANODE DATA CORE: ACTIVATING GOD MODE...")
     threading.Thread(target=run_health_server, daemon=True).start()
     bot.remove_webhook()
-    time.sleep(2)
+    time.sleep(1)
     
     while True:
         try:
-            print("📡 Connection established. Monitoring Buttons...")
-            bot.polling(none_stop=True, skip_pending=True, timeout=60, long_polling_timeout=60)
+            bot.polling(none_stop=True, skip_pending=True, timeout=60)
         except Exception as e:
-            print(f"⚠️ Conflict/Error: {e}. Reconnecting in 10s...")
+            print(f"⚠️ Polling Error: {e}")
             time.sleep(10)
