@@ -200,18 +200,30 @@ def create_goldmine_pdf(text, filename):
     story = [Paragraph(p.strip().replace('\n', ' '), styles['GB']) for p in t.split('\n\n') if p.strip()]
     doc.build(story, onFirstPage=draw_canvas_extras, onLaterPages=draw_canvas_extras)
 
+# ==========================================
+# 🧠 SECURE DRIVE SERVICE (FIXED)
+# ==========================================
 def get_drive_service():
     creds = None
+    # Check if token exists
     if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'rb') as t: creds = pickle.load(t)
+        with open(TOKEN_FILE, 'rb') as t:
+            creds = pickle.load(t)
+            
+    # If no valid creds, we cannot re-auth on Render
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token: creds.refresh(Request())
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                with open(TOKEN_FILE, 'wb') as t:
+                    pickle.dump(creds, t)
+            except Exception as e:
+                # This is where the 'invalid_grant' happens
+                raise Exception("TOKEN_EXPIRED: Master Sadiq, your Drive Token is dead. Re-auth locally.")
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, ['https://www.googleapis.com/auth/drive.file'])
-            creds = flow.run_local_server(port=8080)
-        with open(TOKEN_FILE, 'wb') as t: pickle.dump(creds, t)
+            raise Exception("AUTH_MISSING: Credentials not found or invalid.")
+            
     return build('drive', 'v3', credentials=creds)
-
 def upload_to_drive(filename):
     service = get_drive_service()
     media = MediaIoBaseUpload(io.FileIO(filename, 'rb'), mimetype='application/pdf')
@@ -249,22 +261,35 @@ async def start(message: types.Message, state: FSMContext):
     await message.answer("💎 **MSANODE BOT 4**\nAt your service, Master Sadiq.", reply_markup=get_main_menu())
 
 @dp.message(F.text == "📊 Storage Info")
+# ==========================================
+# 📊 STORAGE HANDLER (SECURED)
+# ==========================================
+@dp.message(F.text == "📊 Storage Info")
 async def storage_info(message: types.Message):
     try:
-        # 1. Mongo Logic
+        # 1. MongoDB Logic (Always Works)
         stats = db_client["MSANodeDB"].command("collstats", "pdf_library")
         m_count = stats.get('count', 0)
         m_used = stats.get('size', 0) / (1024 * 1024)
         m_limit = 512.0
         m_perc = (m_used / m_limit) * 100
         
-        # 2. Drive Logic
-        service = get_drive_service()
-        about = service.about().get(fields="storageQuota").execute()
-        quota = about.get('storageQuota', {})
-        d_limit = int(quota.get('limit')) / (1024**3)
-        d_used = int(quota.get('usage')) / (1024**3)
-        d_perc = (d_used / d_limit) * 100
+        # 2. Drive Logic (Handles the Token Error)
+        try:
+            service = get_drive_service()
+            about = service.about().get(fields="storageQuota").execute()
+            quota = about.get('storageQuota', {})
+            d_limit = int(quota.get('limit')) / (1024**3)
+            d_used = int(quota.get('usage')) / (1024**3)
+            d_perc = (d_used / d_limit) * 100
+            drive_report = (
+                f"☁️ **Google Drive (Files)**\n"
+                f"Used: `{d_used:.2f} GB` / `{d_limit:.0f} GB`\n"
+                f"`{generate_progress_bar(d_perc)}`"
+            )
+        except Exception as drive_err:
+            logging.error(f"Drive Storage Error: {drive_err}")
+            drive_report = "⚠️ **Drive Access Error:** Token Expired. Please re-authenticate locally and update Render."
 
         msg = (
             f"📊 **MASTER SADIQ'S STORAGE CENTER**\n"
@@ -273,15 +298,12 @@ async def storage_info(message: types.Message):
             f"Records: `{m_count}`\n"
             f"Used: `{m_used:.2f} MB` / `{m_limit} MB`\n"
             f"`{generate_progress_bar(m_perc)}`\n\n"
-            f"☁️ **Google Drive (Files)**\n"
-            f"Used: `{d_used:.2f} GB` / `{d_limit:.0f} GB`\n"
-            f"`{generate_progress_bar(d_perc)}`\n\n"
-            f"✅ **System Status: Optimal**"
+            f"{drive_report}\n\n"
+            f"✅ **System Status: Checking...**"
         )
         await message.answer(msg)
     except Exception as e:
-        await message.answer(f"⚠️ Analytics failed, Master Sadiq: `{e}`")
-
+        await message.answer(f"❌ Analytics Engine Failure: `{e}`")
 @dp.message(F.text == "📄 Generate PDF")
 async def gen_btn(message: types.Message, state: FSMContext):
     await state.update_data(raw_script="")
@@ -592,4 +614,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Bot 4 Shutdown.")
+
 
