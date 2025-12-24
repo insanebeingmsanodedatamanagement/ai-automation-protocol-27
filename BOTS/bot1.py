@@ -228,19 +228,36 @@ async def get_content(code: str):
 async def on_user_leave(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
+    
+    # Update Database Status
     col_users.update_one({"user_id": str(user.id)}, {"$set": {"status": "LEFT"}})
+    
     try:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Re-Join MSANode", url=CHANNEL_LINK)]])
-        await bot.send_message(user.id, f"⚠️ **Wait, {user.first_name}...**\n\nYou left the MSANode VAULT . Access to blueprints is now locked."Kindly Re Join To MSANODE VAULT Memebership To Unlock!!!, reply_markup=kb)
-    except: pass
+        # Corrected Indentation & Syntax
+        await bot.send_message(
+            user.id, 
+            f"⚠️ **Wait, {user.first_name}...**\n\nYou left the MSANode VAULT. Access to blueprints is now locked. Kindly Re-Join To MSANODE VAULT Membership To Unlock!!!", 
+            reply_markup=kb
+        )
+    except Exception:
+        pass # Prevents crash if user blocks bot
 
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_user_join(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     user = event.new_chat_member.user
+    
+    # Restore Database Status
     col_users.update_one({"user_id": str(user.id)}, {"$set": {"status": "Active"}})
-    try: await bot.send_message(user.id, f"🤝 **Membership Restored, {user.first_name}.** Welcome Back To The MSANODE Family")
-    except: pass
+    
+    try: 
+        await bot.send_message(
+            user.id, 
+            f"🤝 **Membership Restored, {user.first_name}.** Welcome Back To The MSANODE Family"
+        )
+    except Exception: 
+        pass
 
 # ==========================================
 # 🤖 BOT LOGIC: MSANODE INTELLIGENCE HUB
@@ -395,4 +412,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"⚠️ Error: {e}")
             time.sleep(15)
+
 
