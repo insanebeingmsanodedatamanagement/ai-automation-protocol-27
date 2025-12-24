@@ -23,9 +23,8 @@ MONGO_URI = os.getenv("MONGO_URI")
 if not BOT_TOKEN or not MONGO_URI:
     print("❌ SECURITY ALERT: Bot 3 keys missing from Environment!")
 
-# Hardcoded for the new empire identity
-MAIN_BOT_USERNAME = "@msanodebot" 
-MASTER_ADMIN_ID = 6988593629 
+MAIN_BOT_USERNAME = os.environ.get("MAIN_BOT_USERNAME") 
+MASTER_ADMIN_ID = int(os.environ.get("MASTER_ADMIN_ID", 0))
 
 # Timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -370,3 +369,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"⚠️ Polling Error: {e}")
             time.sleep(10)
+
