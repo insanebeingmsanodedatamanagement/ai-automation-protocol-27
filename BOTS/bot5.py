@@ -36,24 +36,30 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
 # ==========================================
-# ⚡ CONFIGURATION
+# ⚡ CONFIGURATION (SECURED)
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_5_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
-if not all([BOT_TOKEN, GEMINI_KEY, MONGO_URI]):
-    print("❌ Bot 5 Error: Missing AI or Bot credentials in Render Environment!")
-CHANNEL_ID = -1003480585973 
-LOG_CHANNEL_ID = -1003689609198 
-OWNER_ID = 6988593629 
+# IDENTITY HIDDEN: Pulled from Environment. No plain text IDs remain.
+OWNER_ID_RAW = os.getenv("MASTER_ADMIN_ID")
+CHANNEL_ID_RAW = os.getenv("MAIN_CHANNEL_ID")
+LOG_CHANNEL_ID_RAW = os.getenv("LOG_CHANNEL_ID")
 
+if not all([BOT_TOKEN, GEMINI_KEY, MONGO_URI, OWNER_ID_RAW, CHANNEL_ID_RAW, LOG_CHANNEL_ID_RAW]):
+    print("❌ Bot 5 Error: Missing AI or Bot credentials in Render Environment!")
+    import sys
+    sys.exit(1)
+
+OWNER_ID = int(OWNER_ID_RAW)
+CHANNEL_ID = int(CHANNEL_ID_RAW)
+LOG_CHANNEL_ID = int(LOG_CHANNEL_ID_RAW)
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-scheduler = AsyncIOScheduler()
-
+scheduler = AsyncIOScheduler(timezone=pytz.timezone('Asia/Kolkata'))
 # MongoDB Connection
 db_client = None
 db = None
@@ -380,337 +386,21 @@ def run_health_server():
 # 📡 UTILITY LOGIC
 # ==========================================
 
-async def get_next_m_code():
-    """Queries the database for the total number of entries and returns the next ID."""
+async def get_next_x_code(prefix="X"):
+    """Generates sequential codes: X1, X2, X3... across breaches and schedules."""
     try:
-        count = col_vault.count_documents({})
-        return f"M{count + 1}"
+        # Count documents in both vault and schedules to get a global sequential number
+        vault_count = col_vault.count_documents({})
+        sched_count = col_schedules.count_documents({})
+        return f"{prefix}{vault_count + sched_count + 1}"
     except Exception as e:
-        logging.error(f"Error getting next M-code: {e}")
-        return "M1"
+        logging.error(f"X-Code Gen Error: {e}")
+        return f"{prefix}{random.randint(100, 999)}"
 REWARD_POOL = [
     "GitHub Student Pack ($200k in Premium Infrastructure)",
     "Top 7 AI Tools that make ChatGPT look like a Toy",
     "Google's Hidden Professional Cybersecurity Certification",
-    "Microsoft Azure $100 Cloud Compute Credit Hack",
-    "JetBrains All Products Professional IDE Suite for Students",
-    "DigitalOcean production-ready Cloud Hosting Credits",
-    "The 'Student Developer' Vault of Free API Keys",
-    "AWS Educate: Premium ML and Cloud Infrastructure Credits",
-    "Secret Canva Pro invitation links for verified EDU users",
-    "Leaked List of Websites for Free Engineering Textbooks",
-    "Notion Personal Pro Lifetime License for Students",
-    "3 AI Search Engines that bypass standard Web Indexing",
-     "Top 5 Free AI Tools for Civil and Mechanical Engineers (Live 2026)",
-    "Hottest Free AI Automation Tools for CSE Students (GitHub Leaks)",
-    "Professional AutoCAD and SolidWorks Free Alternative Rewards",
-    "Elite AI Debugging Tools for Senior Software Engineers (Free)",
-    "MATLAB and Wolfram Alpha Pro: Free Institutional Access Hacks",
-    "Affinity Professional Design Suite: Lifetime Free Access Rewards",
-    "Top 5 AI PCB Design and Circuit Simulation Tools (2026 Free)",
-    "Industrial IoT and Robotics Simulation Pro Tools (Free Access)",
-    "Leaked Free License for JetBrains All Products (2026 Student)",
-    "High-End Fluid Dynamics and Thermal Analysis Tools (Free Tier)",
-    "Trending AI Code Editors killing VS Code in 2026 (Free)",
-    "Professional PLC Programming and SCADA Simulation Rewards",
-    "Top 5 AI SQL and Database Architecture Tools (Zero Cost)",
-    "Industrial Structural Analysis Pro Software Alternatives",
-    "Elite VS Code Extension Packs for God-Level Productivity",
-    "Hottest Free Tools for VR/AR Development and 3D Modeling",
-    "Professional Game Engine Asset Packs (Unity/Unreal Free Rewards)",
-    "Top 5 AI Testing and Quality Assurance Automation Tools",
-    "Hidden Free Linux Distros for High-Performance Engineering",
-    "Latest Free Tools for Quantum Computing Simulation and Research",
-
-    # --- PROFESSIONAL CERTIFICATIONS AND REWARDS (20) ---
-    "Verified Free Professional Certificates from Google and Microsoft",
-    "Ivy League Free Course Rewards with Shareable Certificates",
-    "Hidden Cybersecurity Certification Scholarships (Full Vouchers)",
-    "Cloud Architect Professional Certification Training (Zero Cost)",
-    "Project Management (PMP) Free Training and Certification Packs",
-    "Medical and Bioinformatics Professional Certs (Free Access)",
-    "Latest Free AI Ethics and Governance Certifications (2026)",
-    "Meta and IBM Professional Certificate Rewards (Scholarship Links)",
-    "Oracle Cloud Infrastructure (OCI) Free Certification Vouchers",
-    "Salesforce Professional Administrator Training (Free Reward)",
-    "AWS Certified Cloud Practitioner: Free Prep and Exam Hacks",
-    "Cisco Networking Academy: Professional Badge Rewards (Free)",
-    "Red Hat Enterprise Linux (RHEL) Free Training Certification",
-    "HubSpot Academy: Industrial Marketing and Sales Certifications",
-    "DeepLearning.AI: Free AI Specialization Access Protocols",
-    "Blockchain and Smart Contract Developer Certs (Zero Cost)",
-    "Data Analyst Professional Certifications: Free Voucher Leaks",
-    "Full-Stack Web Dev Professional Certs (Industry Recognized)",
-    "Advanced UI/UX Certification Rewards from Top Agencies",
-    "Hottest Free Certificates for 5G and Telecom Engineering",
-
-    # --- AI AGENTS, PROMPTS AND GOD-MODE (20) ---
-    "God-Mode Prompt Packs for Academic Research and Exam Bypassing",
-    "Advanced Prompt Engineering for AI Image and Video Generation",
-    "Elite Act As Persona Prompts for Medical and Legal Research",
-    "Agentic AI Workflow Prompts for Automating Complex Tasks",
-    "Jailbreak-Style Productivity Prompts for Unfiltered AI Output",
-    "Reasoning Model (O1/O3) Prompt Packs for Complex Logic Math",
-    "Multi-Agent Orchestration Prompts for Auto-Building Startups",
-    "Custom GPT Instruction Leaks for Bypassing Academic Filters",
-    "Top 5 AI Agent Platforms for Personal Workflow Automation",
-    "Hottest Prompt Injection Methods for Research Synthesis",
-    "Professional Midjourney and DALL-E 3 Style Prompt Vaults",
-    "AI Voice Cloning and Audio Engineering God-Mode Prompts",
-    "Advanced SEO and Content Strategy Prompt Packs for 2026",
-    "Prompt Engineering for Automated Python Script Generation",
-    "Reasoning-Chain Prompts for Solving Advanced Physics and Calc",
-    "Social Engineering and Psychology Act As Prompt Packs",
-    "Automated Side-Hustle Prompts for AI-Driven Revenue",
-    "Prompt Packs for Generating High-End Figma UI Components",
-    "Hidden Prompts for Extracting Raw Data from Obscured Sites",
-    "Elite LLM Fine-Tuning Prompts for Niche-Specific Intelligence",
-
-    # --- FOUNDER, SAAS AND FREELANCE (20) ---
-    "High-Ticket Freelance Automation Templates (Notion/Figma)",
-    "SaaS Startup OS: Premium Notion Templates for AI Founders",
-    "Hidden Free Developer Credits: $1000+ Vercel/AWS/GCP Rewards",
-    "Premium API Access Leaks: Zero-Cost LLM Inference for Devs",
-    "Shopify and E-commerce Premium Theme Leaks (Free for Founders)",
-    "AWS Activate for AI: $100k+ Foundation Model Credits (2026)",
-    "Vercel and Supabase Founder Rewards for Next-Gen AI Apps",
-    "Hottest Free High-Performance VPS for Hosting AI Agents",
-    "Industrial CRM and Lead Generation Templates (Free Access)",
-    "Elite Pitch Deck and Investor Presentation Templates (Figma)",
-    "Founder's Tech Stack: $10k+ in Free Tool Subsidies (Verified)",
-    "Premium Stripe and Fintech Infrastructure Free Tiers for Startups",
-    "Automation Gold Templates for Zapier and Make.com (Free)",
-    "Hottest Free Tools for Finding High-Paying Remote Clients",
-    "Zero-Cost Professional Email and Domain Methods for Startups",
-    "Founder's Intellectual Property (IP) and Legal Template Packs",
-    "Top 5 AI Tools for Automating Client Onboarding (Free)",
-    "Premium GitHub Action Workflows for Auto-Deployment Leaks",
-    "SaaS Landing Page Templates with Highest Conversion Rates",
-    "Exclusive Access to Private Beta Founder Tools (Invites)",
-
-
-    # --- ACADEMIC WEAPONRY AND CREATIVE ASSETS (20) ---
-    "3 Secret AI Tools that write Plagiarism-Free Academic Papers",
-    "Leaked Course Masterclasses from Stanford and MIT (Direct Access)",
-    "Hottest Free Tools for Rapid Language Learning and Translation",
-    "Top 5 AI Math and Physics Solvers for Elite STEM Performance",
-    "The Anki God-Tier Deck Collection for Medical and Engineering",
-    "NotebookLM Advanced Protocols for Research Paper Synthesis",
-    "Perplexity Pro: 1-Year Reward Links for Academic Dominance",
-    "Adobe Creative Cloud Alternatives: Pro Suite Rewards (Free)",
-    "Premium UI/UX Design System Templates for Figma (Live Trends)",
-    "Industrial-Grade Content Creation Templates for 2026 Growth",
-    "Top 5 AI Music and SFX Generation Tools (Commercial License Free)",
-    "Premium TradingView Indicator Leaks for Crypto and Forex",
-    "Elite Financial Modeling and Excel Mastery Templates (Free)",
-    "Bloomberg Terminal Alternatives: Professional Market Data Tools",
-    "High-End Cybersecurity Lab Access (TryHackMe/HackTheBox Pro)",
-    "3 Secret Websites for Free High-End Engineering Textbooks",
-    "Elite Resume and Portfolio Templates that Beat ATS Systems",
-    "Hottest Free Tools for Automated Video Editing and Subtitling",
-    "Top 5 AI Web Scraping Tools for Mass Research Automation",
-    "Leaked PDF Management Pro Suites for Academic Heavy-Lifters",
-
-    # --- SECTOR 1: AGENTIC AI & AUTONOMOUS SYSTEMS (20) ---
-    "Agentic AI Workflow Blueprints for Multi-Platform Automation",
-    "Top 5 Micro-LLM Deployment Rewards for Edge Computing (2026)",
-    "Hottest Free Autonomous Agent Platforms for Devs (Zero Cost)",
-    "Elite Prompt Packs for GPT-5 Reasoning and Deep Logic",
-    "Grok-4 Technical Nuance Prompting for Competitive Intelligence",
-    "Reasoning Model (o1/o3) Protocols for Complex Engineering Math",
-    "AI Agent Orchestration Templates for Self-Building Startups",
-    "Hidden Free Credits for 2026 Agentic Infrastructure (AgentFlow)",
-    "Ambient AI Smart Office Setup Hacks for Energy Efficiency",
-    "Top 5 AI Tools for Real-Time Human-AI Interaction Design",
-    "Neuro-morphic Computing Simulation Tools (Free Academic Access)",
-    "Leaked API Credits for Fast-Track LLM Inference (2026 Tiers)",
-    "Autonomous Content Arbitrage Systems for YouTube/TikTok (Free)",
-    "Elite AI Debugging Protocols for Self-Correcting Codebases",
-    "Hottest Prompt Injection Defense Frameworks for AI Founders",
-    "Top 5 AI Personal Assistants for High-Stakes Schedule Management",
-    "AI-Powered Energy Efficient Burner Design Protocols (Mechanical)",
-    "Visual Inspection AI Systems for Hardware Quality Control (Free)",
-    "Automated Threat Hunting Protocols using Agentic AI (Cyber)",
-    "Top 5 AI Tools for Real-Time Multi-Language Voice Translation",
-
-    # --- SECTOR 2: PROFESSIONAL CERTS & GOVERNANCE (20) ---
-    "Verified Free AI Ethics and Governance Certificates (2026)",
-    "Grow with Google: AI Essentials and Prompting Rewards (Free)",
-    "Microsoft Azure AI Fundamentals (AZ-900) 2026 Voucher Leaks",
-    "Okta Identity and Access Management (IAM) Professional Certs",
-    "Post-Quantum Cryptography Professional Prep and Vouchers",
-    "ESG and Carbon Management Professional Certification (Free)",
-    "FinOps Certified Practitioner Rewards for Cloud Cost Control",
-    "AI-Powered Clinical Documentation Professional Certs (Medical)",
-    "LegalTech AI Compliance and Contract Reviewer Certifications",
-    "Digital Immune System (DIS) Architecture Training (Free Access)",
-    "NIST AI Risk Management Framework Professional Badge Rewards",
-    "Elite Data Privacy and GDPR 2.0 Compliance Vouchers (2026)",
-    "Top 5 Free Certifications for 6G and Edge Network Engineering",
-    "Sustainable Finance Professional Cert Rewards (Global Vouchers)",
-    "Google Professional Workspace Administrator Cert (2026 Leaks)",
-    "Certified AI Product Manager (AICPM) Free Training Protocols",
-    "Blockchain-Based Data Integrity Professional Certifications",
-    "Top 5 Free Certificates for Generative AI in Healthcare",
-    "Enterprise AI Governance Training for Executive Leadership",
-    "Hottest Free Vouchers for Advanced Penetration Testing Labs",
-
-
-    # --- SECTOR 3: FOUNDER & STARTUP ARBITRAGE (20) ---
-    "2026 B2B SaaS Vertical ERP Management Templates (Free)",
-    "AI-Driven Legal Contract Analyzer Frameworks (Founder Leaks)",
-    "ESG Dashboard Templates for Carbon Tracking and Compliance",
-    "AI-Led Interview Solutions for Rapid Founder Hiring (Free)",
-    "Digital Banking Experience Design Templates (Plumery Style)",
-    "Browser-Based Detection and Response (SquareX) Security Hacks",
-    "Construction Quality AI Management Software (Academic Rewards)",
-    "Real-Time Driver Behavior and Logistics Monitoring Protocols",
-    "Compliance-as-a-Service (CaaS) Blueprints for Global Startups",
-    "Zero-Trust Network Access (ZTNA) Model Implementation Labs",
-    "Automated Tax Collaboration Platform Templates (Founder Grade)",
-    "SaaS Landing Page Templates for 2026 High-Conversion Trends",
-    "Hidden Startup Subsidies: $100k+ Foundation Model Credits",
-    "Founder’s Intellectual Property (IP) Protection Protocol Packs",
-    "Top 5 AI Tools for Automated Market Sentiment Analysis (2026)",
-    "Hottest Free VPS for 2026 Global Edge Deployment (Vercel Leaks)",
-    "Elite Pitch Deck and Financial Forecasting Templates (AI-Ready)",
-    "SaaS Revenue Recognition and Automated Accounting Frameworks",
-    "Founder’s Guide to Zero-Cost Global Payroll Infrastructure",
-    "Top 5 AI Tools for Automating SaaS Customer Success (Free)",
-
-    # --- SECTOR 4: ACADEMIC WEAPONRY & GPA HACKS (20) ---
-    "NotebookLM Advanced Protocols for Research Synthesis (Elite)",
-    "3 Secret AI Tools for Plagiarism-Free Academic Paper Generation",
-    "Top 5 AI Math and Physics Solvers for 2026 STEM Performance",
-    "The Anki God-Tier Deck Collection for Medical and CSE (2026)",
-    "Perplexity Pro: 1-Year Academic Reward Links for Students",
-    "Leaked MIT and Harvard Masterclasses (Direct Reward Access)",
-    "Hottest Free Tools for Rapid Technical Language Mastery",
-    "Elite LaTeX and Scientific Publishing Template Packs (Zero Cost)",
-    "Zero-Cost High-End Presentation Tools for Research Defense",
-    "Leaked PDF Management Pro Suites for Academic Heavy-Lifters",
-    "SimScale Academic Tier: Free CFD and Thermal Analysis Leaks",
-    "Fusion 360 Student: Industrial Generative Design Rewards",
-    "Top 5 AI Study Assistants that bypass AI Content Detectors",
-    "Hottest Free Tools for Automated Study Schedule Generation",
-    "Elite Academic Citation and Referencing Automation Protocols",
-    "Visual-Spatial Reasoning Prompt Packs for Design and Geometry",
-    "3 Secret Websites for Free High-End Engineering Textbooks",
-    "Elite Resume and Portfolio Templates that Beat 2026 ATS",
-    "Hottest Free Tools for Automated Video Editing for Creators",
-    "Top 5 AI Web Scraping Tools for Mass Academic Research",
-
-
-    # --- 🏗 INDUSTRIAL & ENGINEERING WEAPONRY (20) ---
-    "Professional AutoCAD & SolidWorks Free Alternative Rewards (2026)",
-    "Hottest Free AI Automation Tools for CSE Students (GitHub Leaks)",
-    "Top 5 Free AI Tools for Civil & Mechanical Engineers (Live 2026)",
-    "Elite AI Debugging Tools for Senior Software Engineers (Free)",
-    "MATLAB & Wolfram Alpha Pro: Free Institutional Access Hacks",
-    "Affinity Professional Design Suite: Lifetime Free Access Protocol",
-    "Top 5 AI PCB Design & Circuit Simulation Tools (2026 Free)",
-    "Industrial IoT & Robotics Simulation Pro Tools (Free Access)",
-    "Leaked Free License for JetBrains All Products (2026 Student)",
-    "High-End Fluid Dynamics & Thermal Analysis Tools (Free Tier)",
-    "Professional PLC Programming & SCADA Simulation (Verified Free)",
-    "Top 5 AI SQL & Database Architecture Tools (Zero Cost)",
-    "Industrial Structural Analysis Pro Software Alternatives",
-    "Elite VS Code Extension Packs for God-Level Productivity",
-    "Hottest Free Tools for VR/AR Development & 3D Modeling",
-    "Professional Game Engine Asset Packs (Unity/Unreal Free Rewards)",
-    "Top 5 AI Testing & Quality Assurance Automation Tools",
-    "Hidden Free Linux Distros for High-Performance Engineering",
-    "Latest Free Tools for Quantum Computing Simulation & Research",
-    "Industrial Automation & Control Systems Free Professional Training",
-
-    # --- 🎓 PROFESSIONAL CERTIFICATIONS & VOUCHERS (20) ---
-    "Verified Free Professional Certificates from Google & Microsoft (2026)",
-    "Ivy League Free Course Rewards with Shareable Certificates",
-    "Hidden Cybersecurity Certification Scholarships (Full Exam Vouchers)",
-    "Cloud Architect Professional Certification Training (Zero Cost)",
-    "Project Management (PMP) 2026 Free Training & Certification Packs",
-    "Medical & Bioinformatics Professional Certs (Free Access)",
-    "Latest Free AI Ethics & Governance Certifications (High Demand)",
-    "Meta & IBM Professional Certificate Rewards (Scholarship Links)",
-    "Oracle Cloud Infrastructure (OCI) Free Certification Vouchers",
-    "Salesforce Professional Administrator Training (Free Reward)",
-    "AWS Certified Cloud Practitioner: Free Prep & Exam Hacks",
-    "Cisco Networking Academy: Professional Badge Rewards (Free)",
-    "Red Hat Enterprise Linux (RHEL) Free Training Certification",
-    "HubSpot Academy: Industrial Marketing & Sales Certifications",
-    "DeepLearning.AI: Free AI Specialization Access Protocols",
-    "Blockchain & Smart Contract Developer Certs (Zero Cost)",
-    "Data Analyst Professional Certifications: Free Voucher Leaks",
-    "Full-Stack Web Dev Professional Certs (Industry Recognized)",
-    "Advanced UI/UX Certification Rewards from Top Agencies",
-    "Hottest Free Certificates for 5G & Telecom Engineering",
-
-    # --- 🧠 AI AGENTS & PROMPT WEAPONRY (20) ---
-    "God-Mode Prompt Packs for Academic Research & Exam Bypassing",
-    "Advanced Prompt Engineering for AI Image & Video Generation",
-    "Elite 'Act As' Persona Prompts for Medical & Legal Research",
-    "Agentic AI Workflow Prompts for Automating Complex Tasks",
-    "Jailbreak-Style Productivity Prompts for Unfiltered AI Output",
-    "Reasoning Model (O1/O3) Prompt Packs for Complex Logic Math",
-    "Multi-Agent Orchestration Prompts for Auto-Building Startups",
-    "Custom GPT Instruction Leaks for Bypassing Academic Filters",
-    "Top 5 AI Agent Platforms for Personal Workflow Automation",
-    "Hottest Prompt Injection Methods for Research Synthesis",
-    "Professional Midjourney & DALL-E 3 Style Prompt Vaults",
-    "AI Voice Cloning & Audio Engineering God-Mode Prompts",
-    "Advanced SEO & Content Strategy Prompt Packs for 2026",
-    "Prompt Engineering for Automated Python Script Generation",
-    "Reasoning-Chain Prompts for Solving Advanced Physics & Calc",
-    "Social Engineering & Psychology 'Act As' Prompt Packs",
-    "Automated Side-Hustle Prompts for AI-Driven Revenue",
-    "Prompt Packs for Generating High-End Figma UI Components",
-    "Hidden Prompts for Extracting Raw Data from Obscured Sites",
-    "Elite LLM Fine-Tuning Prompts for Niche-Specific Intelligence",
-
-    # --- 🚀 FOUNDER, SAAS & REVENUE ARBITRAGE (20) ---
-    "High-Ticket Freelance Automation Templates (Notion/Figma)",
-    "SaaS Startup OS: Premium Notion Templates for AI Founders",
-    "Hidden Free Developer Credits: $1000+ Vercel/AWS/GCP Rewards",
-    "Premium API Access Leaks: Zero-Cost LLM Inference for Devs",
-    "Shopify & E-commerce Premium Theme Leaks (Free for Founders)",
-    "AWS Activate for AI: $100k+ Foundation Model Credits (2026)",
-    "Vercel & Supabase Founder Rewards for Next-Gen AI Apps",
-    "Hottest Free High-Performance VPS for Hosting AI Agents",
-    "Industrial CRM & Lead Generation Templates (Free Access)",
-    "Elite Pitch Deck & Investor Presentation Templates (Figma)",
-    "Founder's Tech Stack: $10k+ in Free Tool Subsidies (Verified)",
-    "Premium Stripe & Fintech Infrastructure Free Tiers for Startups",
-    "Automation Gold Templates for Zapier & Make.com (Free)",
-    "Hottest Free Tools for Finding High-Paying Remote Clients",
-    "Zero-Cost Professional Email & Domain Methods for Startups",
-    "Founder's Intellectual Property (IP) & Legal Template Packs",
-    "Top 5 AI Tools for Automating Client Onboarding (Free)",
-    "Premium GitHub Action Workflows for Auto-Deployment Leaks",
-    "SaaS Landing Page Templates with Highest Conversion Rates",
-    "Exclusive Access to Private Beta Founder Tools (Invites)",
-
-    # --- 📚 ACADEMIC WEAPONRY & SPECIALIZED NICHE (20) ---
-    "3 Secret AI Tools that write Plagiarism-Free Academic Papers",
-    "Leaked Course Masterclasses from Stanford & MIT (Direct Access)",
-    "Hottest Free Tools for Rapid Language Learning & Translation",
-    "Top 5 AI Math & Physics Solvers for Elite STEM Performance",
-    "The 'Anki' God-Tier Deck Collection for Medical & Engineering",
-    "NotebookLM Advanced Protocols for Research Paper Synthesis",
-    "Perplexity Pro: 1-Year Reward Links for Academic Dominance",
-    "Adobe Creative Cloud Alternatives: Pro Suite Rewards (Free)",
-    "Premium UI/UX Design System Templates for Figma (Live Trends)",
-    "Industrial-Grade Content Creation Templates for 2026 Growth",
-    "Top 5 AI Music & SFX Generation Tools (Commercial License Free)",
-    "Premium TradingView Indicator Leaks for Crypto & Forex",
-    "Elite Financial Modeling & Excel Mastery Templates (Free)",
-    "Bloomberg Terminal Alternatives: Professional Market Data Tools",
-    "High-End Cybersecurity Lab Access (TryHackMe/HackTheBox Pro)",
-    "3 Secret Websites for Free High-End Engineering Textbooks",
-    "Elite Resume & Portfolio Templates that Beat ATS Systems",
-    "Hottest Free Tools for Automated Video Editing & Subtitling",
-    "Top 5 AI Web Scraping Tools for Mass Research Automation",
-    "Leaked PDF Management Pro Suites for Academic Heavy-Lifters",
-
+    
 
 ]
 
@@ -1159,9 +849,17 @@ async def api_usage_cb(cb: types.CallbackQuery):
 
 @dp.callback_query(F.data == "swap_engine")
 async def swap_engine_cb(cb: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=m, callback_data=f"selmod_{i}")] for i, m in enumerate(MODEL_POOL)])
-    await cb.message.edit_text("🎯 <b>SELECT NEW ENGINE:</b>", reply_markup=kb, parse_mode=ParseMode.HTML)
-
+    kb_list = []
+    for i, m in enumerate(MODEL_POOL):
+        kb_list.append([InlineKeyboardButton(text=f"⚙️ {m}", callback_data=f"selmod_{i}")])
+    
+    # Add the "ADD MODE" button as requested
+    kb_list.append([InlineKeyboardButton(text="➕ ADD CUSTOM MODE", callback_data="add_custom_mode")])
+    kb_list.append([InlineKeyboardButton(text="🔙 BACK", callback_data="cancel_api")])
+    
+    await cb.message.edit_text("🎯 <b>ENGINE SELECTION PROTOCOL:</b>", 
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list), 
+                               parse_mode=ParseMode.HTML)
 @dp.callback_query(F.data.startswith("selmod_"))
 async def sel_model_exec(cb: types.CallbackQuery):
     global CURRENT_MODEL_INDEX, model
@@ -1200,7 +898,21 @@ async def backup_mirror(message: types.Message):
 # ==========================================
 # Collections are automatically created when first used
 # No need for explicit schema definitions like SQLAlchemy
-
+@dp.callback_query(F.data.startswith("del_x_"))
+async def delete_record_surgical(cb: types.CallbackQuery):
+    code = cb.data.split("_")[2]
+    
+    # Delete from Vault
+    res = col_vault.delete_one({"m_code": code})
+    # Also delete from Schedules if it's there
+    col_schedules.delete_one({"m_code": code})
+    
+    if res.deleted_count > 0:
+        await cb.answer(f"🗑️ Record {code} Purged.", show_alert=True)
+        await broadcast_audit("SURGICAL_DELETE", code, "Entry wiped from database by Owner.")
+        await cb.message.delete()
+    else:
+        await cb.answer("❌ Error: Record not found.")
 # ==========================================
 # 🔄 GLOBAL API COUNTER (MongoDB)
 # ==========================================
@@ -1513,41 +1225,60 @@ async def sched_lock(cb: types.CallbackQuery, state: FSMContext):
 # ==========================================
 # 🚀 BACKGROUND EXECUTION (INTELLIGENCE)
 # ==========================================
-
+# --- STEP 1: Add to your PENDING_APPROVALS logic ---
 async def trigger_review(m_code, target_time):
-    """Fires 60m before target. Generates and asks for permission."""
+    """Fires exactly 60m before target."""
     content, topic = await generate_content()
-    PENDING_APPROVALS[m_code] = {"content": content, "topic": topic, "confirmed": False, "target": target_time}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔥 CONFIRM FIRE", callback_data=f"arm_{m_code}")]])
-    await bot.send_message(OWNER_ID, f"⏳ <b>REVIEW (T-60m): {m_code}</b>\nFire scheduled at: <code>{target_time}</code>\n────────────────────\n\n{content}", reply_markup=kb, parse_mode=ParseMode.HTML)
+    
+    # Check Integrity (Does AI content look okay?)
+    integrity = "PASSED" if len(content) > 100 else "FAILED"
+    
+    PENDING_APPROVALS[m_code] = {
+        "content": content, 
+        "topic": topic, 
+        "confirmed": False, 
+        "target": target_time,
+        "integrity": integrity
+    }
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 CONFIRM FIRE", callback_data=f"arm_{m_code}")],
+        [InlineKeyboardButton(text="🗑️ ABORT / DELETE", callback_data=f"del_x_{m_code}")]
+    ])
+    
+    await bot.send_message(OWNER_ID, 
+        f"⏳ <b>PRE-FLIGHT CHECK (T-60m): {m_code}</b>\n"
+        f"Fire scheduled at: <code>{target_time}</code>\n"
+        f"Integrity Check: <b>{integrity}</b>\n"
+        f"────────────────────\n\n{content}", 
+        reply_markup=kb, parse_mode=ParseMode.HTML)
 
-@dp.callback_query(F.data.startswith("arm_"))
-async def arm_post(cb: types.CallbackQuery):
-    """Sets flag to True. Execution job will handle the rest at scheduled time."""
-    m_code = cb.data.split("_")[1]
-    if m_code in PENDING_APPROVALS:
-        PENDING_APPROVALS[m_code]["confirmed"] = True
-        await cb.message.edit_text(f"✅ <b>POST ARMED:</b> Intelligence locked for <code>{PENDING_APPROVALS[m_code]['target']}</code>.", parse_mode=ParseMode.HTML)
-
+# --- STEP 2: The T-0 Execution Logic ---
 async def execute_guarded_fire(m_code):
-    """The Precision Trigger."""
+    """The Precision Trigger at T-0."""
     if m_code in PENDING_APPROVALS:
-        data = PENDING_APPROVALS[m_code]
-        if data.get("confirmed"):
-            vault_msg = await bot.send_message(CHANNEL_ID, data['content'], parse_mode=ParseMode.HTML, reply_markup=get_engagement_markup(m_code))
+        task = PENDING_APPROVALS[m_code]
+        
+        # AUTO-FIRE LOGIC: Fire if confirmed OR if integrity passed but I missed the button
+        should_fire = task["confirmed"] or (task["integrity"] == "PASSED")
+        
+        if should_fire:
+            # Deploy to public channel
+            vault_msg = await bot.send_message(CHANNEL_ID, task['content'], 
+                                               reply_markup=get_engagement_markup(m_code))
+            
+            # Sync to Database
             col_vault.insert_one({
-                "m_code": m_code,
-                "msg_id": vault_msg.message_id,
-                "topic": data['topic'],
-                "content": data['content'],
-                "reaction_lock": 0,
-                "is_unlocked": False,
-                "created_at": datetime.now(),
-                "last_verified": datetime.now()
+                "m_code": m_code, "msg_id": vault_msg.message_id, "content": task['content'],
+                "is_unlocked": False, "created_at": datetime.now(), "clicks": 0
             })
-            await bot.send_message(LOG_CHANNEL_ID, f"📢 <b>DEPLOYED:</b> <code>{m_code}</code> fired successfully.")
+            
+            # Audit Mirror
+            await broadcast_audit("SCHEDULED_FIRE", m_code, "Auto-fired via Fail-Safe Protocol")
         else:
-            await bot.send_message(OWNER_ID, f"❌ <b>ABORTED:</b> <code>{m_code}</code> fire time reached but no confirmation was received.")
+            await bot.send_message(OWNER_ID, f"❌ <b>ABORTED:</b> {m_code} failed integrity/confirmation.")
+            await broadcast_audit("FIRE_ABORTED", m_code, "System Integrity Check Failed.")
+            
         del PENDING_APPROVALS[m_code]
 # ==========================================
 # ✏️ REMOTE EDIT (REINFORCED PRIORITY)
@@ -1652,7 +1383,22 @@ async def broadcast_init(message: types.Message, state: FSMContext):
 # ==========================================
 # 📢 SYNDICATE BROADCAST (TELEMETRY SYNCED)
 # ==========================================
-
+async def broadcast_audit(action: str, code: str, details: str = "N/A"):
+    """Full-Spectrum Audit mirroring to Private Channel."""
+    log_text = (
+        f"🛡️ <b>EMPIRE AUDIT ENGINE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔧 <b>ACTION:</b> {action}\n"
+        f"🆔 <b>UNIQUE CODE:</b> <code>{code}</code>\n"
+        f"📝 <b>DETAILS:</b> {details}\n"
+        f"👤 <b>OPERATOR:</b> Master Sadiq\n"
+        f"📅 <b>TIMESTAMP:</b> {get_current_time()}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    # Send to the Private Log Channel defined in your config
+    await bot.send_message(LOG_CHANNEL_ID, log_text, parse_mode=ParseMode.HTML)
+    # Also log to internal console
+    console_out(f"Audit: {action} | {code}")
 @dp.message(BroadcastState.waiting_msg)
 async def broadcast_exec(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
@@ -1849,3 +1595,4 @@ if __name__ == "__main__":
         print(f"💥 CRITICAL STARTUP ERROR: {e}")
         import traceback
         traceback.print_exc()
+
