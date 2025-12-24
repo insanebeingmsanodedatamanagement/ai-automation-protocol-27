@@ -33,19 +33,24 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # ==========================================
-# ⚡ CONFIGURATION
+# ⚡ CONFIGURATION (SECURED GOD-MODE)
 # ==========================================
+# All sensitive IDs are now pulled from Render Environment Variables.
 BOT_TOKEN = os.getenv("BOT_4_TOKEN") 
-MONGO_URI = os.getenv("MONGO_URI") # This one is shared by everyone
+MONGO_URI = os.getenv("MONGO_URI") 
 
-if not BOT_TOKEN:
-    print("❌ Bot 4 Error: BOT_4_TOKEN not found in Render Environment!")
-OWNER_ID = 6988593629 
-PARENT_FOLDER_ID = '1J0iGLcwjTTdQRQJ--A9s8D26a3-gN7IB'
-CREDENTIALS_FILE = 'credentials.json'
-TOKEN_FILE = 'token.pickle'
+# HIDDEN IDENTITY: No plain text ID or Folder link remains.
+OWNER_ID = int(os.environ.get("MASTER_ADMIN_ID", 0)) 
+PARENT_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
+
+# System File Mapping
+CREDENTIALS_FILE = os.environ.get("CRED_FILE_NAME", 'credentials.json')
+TOKEN_FILE = os.environ.get("TOKEN_FILE_NAME", 'token.pickle')
 
 START_TIME = time.time() 
+
+if not BOT_TOKEN or not PARENT_FOLDER_ID:
+    print("❌ CRITICAL ERROR: Bot 4 Security credentials missing!")
 
 # ==========================================
 # 🛠 SETUP
@@ -614,5 +619,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Bot 4 Shutdown.")
+
 
 
