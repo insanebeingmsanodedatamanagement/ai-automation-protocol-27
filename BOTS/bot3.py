@@ -109,18 +109,19 @@ def get_main_menu():
         InlineKeyboardButton("🗑️ Delete", callback_data="hub_delete")
     )
     markup.add(
-        InlineKeyboardButton("💾 Backup", callback_data="hub_backup"),
+        InlineKeyboardButton("🔥 Popularity Stats", callback_data="btn_popularity"), # LIVE CLICK TRACKING
         InlineKeyboardButton("🔗 Get Start Links", callback_data="btn_link")
     )
     markup.add(
-        InlineKeyboardButton("📊 DB Counts", callback_data="btn_stats"),
-        InlineKeyboardButton("🏥 Health Check", callback_data="btn_health")
+        InlineKeyboardButton("💾 Backup", callback_data="hub_backup"),
+        InlineKeyboardButton("📊 DB Counts", callback_data="btn_stats")
+    )
+    markup.add(
+        InlineKeyboardButton("🏥 Health Check", callback_data="btn_health"),
+        InlineKeyboardButton("🔄 Refresh Admins", callback_data="btn_refresh")
     )
     markup.add(
         InlineKeyboardButton("☢️ CLEAR ALL DATA", callback_data="nuclear_1")
-    )
-    markup.add(
-        InlineKeyboardButton("🔄 Refresh Admins", callback_data="btn_refresh")
     )
     return markup
 
@@ -138,7 +139,7 @@ def handle_query(call):
     if not is_admin(call.from_user.id): return
     data = call.data
 
-    # --- 1. SEPARATE LIST SYSTEM ---
+    # --- 1. LIST SYSTEM ---
     if data == "hub_list":
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -153,7 +154,7 @@ def handle_query(call):
     elif data == "list_yt": list_simple(col_viral, "YOUTUBE", call.message)
     elif data == "list_ig": list_simple(col_reels, "INSTAGRAM", call.message)
 
-    # --- 2. SEPARATE ADD SYSTEM ---
+    # --- 2. ADD SYSTEM ---
     elif data == "hub_add":
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -164,7 +165,7 @@ def handle_query(call):
         )
         bot.edit_message_text("➕ **Select Category to Add:**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
 
-    # --- 3. SEPARATE SEARCH SYSTEM ---
+    # --- 3. SEARCH SYSTEM ---
     elif data == "hub_search":
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -175,7 +176,7 @@ def handle_query(call):
         )
         bot.edit_message_text("🔍 **Select Database to Search:**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
 
-    # --- 4. SEPARATE DELETE SYSTEM ---
+    # --- 4. DELETE SYSTEM ---
     elif data == "hub_delete":
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -186,7 +187,7 @@ def handle_query(call):
         )
         bot.edit_message_text("🗑️ **Select Database to Delete From:**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
 
-    # --- 5. SEPARATE BACKUP SYSTEM ---
+    # --- 5. BACKUP SYSTEM ---
     elif data == "hub_backup":
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -197,7 +198,11 @@ def handle_query(call):
         )
         bot.edit_message_text("💾 **Which Data Backup do you need?**", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
 
-    # --- 6. NUCLEAR CLEAR (2-STEP CONFIRMATION) ---
+    # --- 6. POPULARITY ANALYTICS ---
+    elif data == "btn_popularity":
+        run_popularity_report(call.message)
+
+    # --- 7. NUCLEAR CLEAR (2-STEP CONFIRMATION) ---
     elif data == "nuclear_1":
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🛑 YES, DELETE EVERYTHING", callback_data="nuclear_2"))
@@ -245,6 +250,20 @@ def handle_query(call):
 
 # ================= CORE LOGIC FUNCTIONS =================
 
+@safe_execute
+def run_popularity_report(message):
+    """Generates a live ranking of blueprints by click counts."""
+    top_docs = list(col_active.find().sort("clicks", -1).limit(20))
+    if not top_docs:
+        return bot.send_message(message.chat.id, "⚠️ No data available yet.")
+    
+    report = "🔥 **MOST POPULAR BLUEPRINTS**\n\n"
+    for i, doc in enumerate(top_docs, 1):
+        clicks = doc.get('clicks', 0)
+        report += f"{i}. Code: `{doc.get('code')}` — ⚡ **{clicks} Clicks**\n"
+    
+    bot.send_message(message.chat.id, report, parse_mode="Markdown", reply_markup=get_main_menu())
+
 def run_csv_export(collection, filename, message):
     data = list(collection.find({}, {"_id": 0}))
     if not data: return bot.send_message(message.chat.id, "❌ No data found.")
@@ -272,6 +291,7 @@ def run_full_inventory(message):
             f.write(f"PDF: {doc.get('pdf_link')}\n")
             f.write(f"AFF: {doc.get('aff_link')}\n")
             f.write(f"CREATED: {doc.get('created_at', 'N/A')}\n")
+            f.write(f"LIVE CLICKS: {doc.get('clicks', 0)}\n")
             f.write(f"{'-'*50}\n")
             count += 1
         f.write(f"\nTOTAL: {count}")
@@ -306,7 +326,14 @@ def step_add_pdf(message, code):
 @safe_execute
 def step_add_aff(message, code, pdf):
     aff = message.text.strip()
-    col_active.insert_one({"code": code, "pdf_link": pdf, "aff_link": aff, "created_at": get_current_time()})
+    # Interconnected logic: Bot 1 increments 'clicks' field
+    col_active.insert_one({
+        "code": code, 
+        "pdf_link": pdf, 
+        "aff_link": aff, 
+        "created_at": get_current_time(), 
+        "clicks": 0
+    })
     bot.reply_to(message, f"✅ **PDF STORED**\nCode: `{code}`\nCreated: {get_current_time()}", reply_markup=get_main_menu())
 
 # --- SEARCH & DELETE ---
@@ -318,7 +345,7 @@ def step_search_simple(collection, m):
 def step_search_pdf(m):
     res = col_active.find_one({"code": m.text.upper().strip()})
     if not res: return bot.send_message(m.chat.id, "❌ Code not found in PDF Vault.")
-    bot.send_message(m.chat.id, f"🔍 **PDF Found:**\nCode: `{res['code']}`\nPDF: {res['pdf_link']}\nAFF: {res['aff_link']}\nDate: {res.get('created_at')}")
+    bot.send_message(m.chat.id, f"🔍 **PDF Found:**\nCode: `{res['code']}`\nPDF: {res['pdf_link']}\nAFF: {res['aff_link']}\nClicks: {res.get('clicks', 0)}")
 
 def step_delete_simple(collection, m):
     res = collection.delete_one({"code": m.text.upper().strip()})
@@ -342,7 +369,7 @@ def run_stats(message):
     bot.reply_to(message, msg, reply_markup=get_main_menu())
 
 def run_health_check(message):
-    bot.reply_to(message, "🏥 **System Online:**\n✅ DB Connected\n✅ Identity Secured", reply_markup=get_main_menu())
+    bot.reply_to(message, "🏥 **System Online:**\n✅ DB Connected\n✅ Analytics Engine Loaded", reply_markup=get_main_menu())
 
 # --- RENDER PORT BINDER ---
 async def handle_health(request):
