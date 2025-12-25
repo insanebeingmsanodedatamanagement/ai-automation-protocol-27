@@ -246,15 +246,6 @@ async def export_data(message: types.Message):
     csv_buf.seek(0)
     await message.answer_document(BufferedInputFile(csv_buf.read(), filename="singularity_vault.csv"), caption="📊 Vault Intelligence Exported.")
 
-async def main():
-    scheduler.add_job(lambda: console_out("Heartbeat: Active"), 'interval', minutes=60)
-    scheduler.start()
-    console_out("◈ SINGULARITY APEX ONLINE")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
 # ==========================================
 # 🗓 SCHEDULE HELPERS (Day Selector)
 # ==========================================
@@ -579,13 +570,6 @@ async def main():
         await dp.start_polling(bot, skip_updates=True)
     except Exception as e:
         logging.error(f"FATAL: {e}")
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
-
 
 # ==========================================
 # 📟 TERMINAL & TELEMETRY ENGINE
@@ -914,12 +898,6 @@ async def main():
         logging.error(f"POLLING ERROR: {e}")
         await asyncio.sleep(5)
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        console_out("System Shutdown Protocol Initiated.")
-
 # ==========================================
 # 🪤 INTERACTION HANDLERS (CALLBACKS)
 # ==========================================
@@ -1060,15 +1038,14 @@ def run_health_server():
 async def main():
     """Handles the async startup of all Singularity subsystems."""
     try:
-        # 1. Initialize Scheduler inside the running loop
-        # This prevents the 'Event loop is closed' error
+        # 1. Send Startup Signal first
+        await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>", parse_mode=ParseMode.HTML)
+        
+        # 2. Initialize Scheduler after loop is running
         scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
         scheduler.start()
         
         console_out("◈ SUBSYSTEMS ARMED")
-        
-        # 2. Send Startup Signal
-        await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>", parse_mode=ParseMode.HTML)
         
         # 3. Start Polling
         await dp.start_polling(bot, skip_updates=True)
@@ -1084,3 +1061,4 @@ if __name__ == "__main__":
         print("◈ Manual Shutdown.")
     except Exception as e:
         print(f"💥 CRITICAL BOOT ERROR: {e}")
+
