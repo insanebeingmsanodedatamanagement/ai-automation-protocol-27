@@ -35,7 +35,7 @@ col_vault = db["vault"]
 col_system = db["system_stats"]
 col_api = db["api_ledger"]
 
-# Models set specifically to Gemini 2.0 series
+# Models set specifically to Gemini 2.5 series as requested
 MODEL_POOL = ["gemini-2.5-flash", "gemini-2.5-pro"]
 CURRENT_MODEL_INDEX = 0
 API_USAGE_COUNT = 0
@@ -50,11 +50,7 @@ CLOUD_PROMPT_PACK = [
     "Design a tactical cloud deployment strategy for AI-powered businesses.",
     "Uncover hidden cloud cost-saving techniques with external resources.",
     "Build a scalable cloud infrastructure blueprint for passive income streams.",
-    "Explore cloud-based arbitrage plays using cutting-edge technologies.",
-    "Craft a cloud migration masterplan for maximum efficiency and profits.",
-    "Reveal cloud security exploits and defensive strategies with real links.",
-    "Develop a cloud-native app idea for viral monetization.",
-    "Analyze cloud market trends for predictive arbitrage opportunities."
+    "Explore cloud-based arbitrage plays using cutting-edge technologies."
 ]
 
 # --- TELEMETRY HELPERS ---
@@ -64,8 +60,23 @@ def console_out(text):
 async def increment_api_count_in_db():
     try:
         col_api.update_one({"_id": "global_ledger"}, {"$inc": {"usage": 1}}, upsert=True)
+    except Exception as e: console_out(f"Ledger Sync Error: {e}")
+
+# ==========================================
+# 📡 HARDCODED PORT BINDER (RENDER SHIELD)
+# ==========================================
+async def start_health_server():
+    """Immediately binds to port 10000 to satisfy Render's health check."""
+    try:
+        app = web.Application()
+        app.router.add_get('/', lambda r: web.Response(text="SINGULARITY_V5_ONLINE", status=200))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', 10000)
+        await site.start()
+        console_out("✅ PORT 10000 BOUND. RENDER SCAN PASSED.")
     except Exception as e:
-        console_out(f"Ledger Sync Error: {e}")
+        console_out(f"❌ PORT BIND FAILED: {e}")
 
 # ==========================================
 # 🧠 ORACLE PROMPT ENGINE (CHIMERA PROTOCOL)
@@ -91,8 +102,6 @@ def get_system_prompt():
     🧠 THE ADVANTAGE: [Explain arbitrage/logic/side-hustle]
     ⚠️ RESTRICTED TOOLKIT:
     • 1. [Real Tool Name]: [Specific Benefit] (Link: [Direct URL])
-    • 2. [Real Tool Name]: [Specific Benefit] (Link: [Direct URL])
-    • 3. [Real Tool Name]: [Specific Benefit] (Link: [Direct URL])
     ⚡ EXECUTION PROTOCOL: [Direct technical steps to earn/deploy]
     👑 MSA NODE DIRECTIVE: "Family: Execute. Action is currency. Hurry Up !!! .Claim Free Rewards Now"
     ━━━━━━━━━━━━━━━━━━━━
@@ -115,22 +124,7 @@ async def generate_content(prompt):
         await increment_api_count_in_db() 
         return clean_content, "AI Directive"
     except Exception as e:
-        console_out(f"GEN ERROR: {e}")
         return f"Error: {html.escape(str(e))[:100]}", "Error"
-
-# ==========================================
-# 📡 HARDCODED PORT BINDER (RENDER SHIELD)
-# ==========================================
-async def start_health_server():
-    try:
-        app = web.Application()
-        app.router.add_get('/', lambda r: web.Response(text="SINGULARITY_V5_LIVE"))
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', 10000)
-        await site.start()
-        console_out("PORT 10000 BOUND.")
-    except Exception as e: console_out(f"PORT ERROR: {e}")
 
 # ==========================================
 # 🕹️ STATE MACHINE & UI
@@ -169,8 +163,7 @@ async def breach_menu(message: types.Message):
 
 @dp.callback_query(F.data == "brauto")
 async def br_auto(cb: types.CallbackQuery, state: FSMContext):
-    target_prompt = random.choice(CLOUD_PROMPT_PACK)
-    content, _ = await generate_content(target_prompt)
+    content, _ = await generate_content(random.choice(CLOUD_PROMPT_PACK))
     await state.update_data(c=content)
     await cb.message.answer(f"📑 <b>PREVIEW:</b>\n\n{content}\n\n<b>FIRE?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔥 FIRE", callback_data="fire")]]), parse_mode=ParseMode.HTML)
 
@@ -192,7 +185,7 @@ async def fire_exec(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.edit_text("🚀 <b>DEPLOYED.</b>")
     await state.clear()
 
-# --- BUTTON 2: SCHEDULE ---
+# --- BUTTON 2: SCHEDULE (T-60 Remind Logic) ---
 async def t60_preflight(job_id, fire_time):
     content, _ = await generate_content(random.choice(CLOUD_PROMPT_PACK))
     PENDING_FIRE[job_id] = {"content": content, "fired": False}
@@ -248,14 +241,14 @@ async def lock_sched(cb: types.CallbackQuery, state: FSMContext):
     t_obj = datetime.strptime(data['time'], "%I:%M %p")
     scheduler.add_job(t60_preflight, CronTrigger(day_of_week=cron_days, hour=(t_obj.hour-1)%24, minute=t_obj.minute), args=[sch_id, data['time']])
     scheduler.add_job(t0_execution, CronTrigger(day_of_week=cron_days, hour=t_obj.hour, minute=t_obj.minute), args=[sch_id])
-    await cb.message.edit_text(f"🔒 <b>LOCKED: {sch_id}</b>\nTime: {data['time']}\nDays: {cron_days}")
+    await cb.message.edit_text(f"🔒 <b>LOCKED: {sch_id}</b>\nTime: {data['time']}\nDays: {cron_days.upper()}")
     await state.clear()
 
 # --- BUTTON 3: MODELS ---
 @dp.message(F.text == "⚙️ MODELS")
 async def model_menu(message: types.Message):
     global CURRENT_MODEL_INDEX
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 SWAP", callback_data="mod_swap")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 SWAP ENGINE", callback_data="mod_swap")]])
     await message.answer(f"⚙️ <b>ACTIVE:</b> <code>{MODEL_POOL[CURRENT_MODEL_INDEX]}</code>", reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @dp.callback_query(F.data == "mod_swap")
@@ -268,7 +261,7 @@ async def mod_swap(cb: types.CallbackQuery):
 @dp.message(F.text == "🔑 API")
 async def api_menu(message: types.Message):
     masked = f"{GEMINI_KEY[:6]}****{GEMINI_KEY[-4:]}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 CHANGE API", callback_data="api_change")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 CHANGE KEY", callback_data="api_change")]])
     await message.answer(f"🔑 <b>API STATUS:</b> ACTIVE\nKey: <code>{masked}</code>", reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @dp.callback_query(F.data == "api_change")
@@ -287,26 +280,20 @@ async def api_save(message: types.Message, state: FSMContext):
 # --- BUTTON 5: SCAN ---
 @dp.message(F.text == "🛡 SCAN")
 async def cmd_scan(message: types.Message):
-    cpu = psutil.cpu_percent()
-    ram = psutil.virtual_memory().percent
-    await message.answer(f"🛡 <b>SYSTEM SCAN</b>\nCPU: {cpu}%\nRAM: {ram}%\nDB: NOMINAL\nPORT: 10000 ACTIVE\nAPI QUOTA: {API_USAGE_COUNT}/1500", parse_mode=ParseMode.HTML)
+    await message.answer(f"🛡 <b>SYSTEM SCAN</b>\nCPU: {psutil.cpu_percent()}%\nRAM: {psutil.virtual_memory().percent}%\nPORT: 10000 ACTIVE\nAPI USE: {API_USAGE_COUNT}/1500", parse_mode=ParseMode.HTML)
 
 # --- BUTTON 6: BROADCAST ---
 @dp.message(F.text == "📢 BROADCAST")
 async def broad_init(message: types.Message, state: FSMContext):
     await state.set_state(SingularityState.waiting_broadcast)
-    await message.answer("📢 <b>BROADCAST:</b> Enter Directive (Auto-Pinned):")
+    await message.answer("📢 <b>BROADCAST:</b> Enter Directive:")
 
 @dp.message(SingularityState.waiting_broadcast)
 async def broad_exec(message: types.Message, state: FSMContext):
-    fmt = (f"<b>◈ SYNDICATE DIRECTIVE ◈</b>\n"
-           f"────────────────────\n\n"
-           f"{html.escape(message.text)}\n\n"
-           f"────────────────────")
-    msg = await bot.send_message(CHANNEL_ID, fmt, parse_mode=ParseMode.HTML)
+    msg = await bot.send_message(CHANNEL_ID, f"<b>◈ SYNDICATE DIRECTIVE ◈</b>\n\n{html.escape(message.text)}", parse_mode=ParseMode.HTML)
     try: await bot.pin_chat_message(CHANNEL_ID, msg.message_id)
     except: pass
-    await message.answer("🚀 <b>BROADCAST DEPLOYED & PINNED.</b>")
+    await message.answer("🚀 <b>DEPLOYED & PINNED.</b>")
     await state.clear()
 
 @dp.callback_query(F.data.startswith("confirm_"))
@@ -319,16 +306,24 @@ async def manual_fire_confirm(cb: types.CallbackQuery):
     await cb.answer()
 
 # ==========================================
-# 🚀 BOOTLOADER
+# 🚀 SUPREME BOOTLOADER
 # ==========================================
 async def main():
     global API_USAGE_COUNT
+    # 1. Start Port FIRST
     await start_health_server()
-    ledger = col_api.find_one({"_id": "global_ledger"})
-    API_USAGE_COUNT = ledger.get("usage", 0) if ledger else 0
-    scheduler.start()
-    await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>")
-    await dp.start_polling(bot)
+    
+    # 2. Start Subsystems
+    try:
+        ledger = col_api.find_one({"_id": "global_ledger"})
+        API_USAGE_COUNT = ledger.get("usage", 0) if ledger else 0
+        scheduler.start()
+        await bot.send_message(OWNER_ID, "💎 <b>SINGULARITY v5.0 ONLINE</b>")
+        console_out("◈ SYSTEM FULLY ARMED. POLLING...")
+        await dp.start_polling(bot)
+    except Exception as e:
+        console_out(f"💥 CRITICAL BOT ERROR: {e}")
+        while True: await asyncio.sleep(3600) # Keep port open for Render
 
 if __name__ == "__main__":
     asyncio.run(main())
