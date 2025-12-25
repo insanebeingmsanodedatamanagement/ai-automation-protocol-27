@@ -115,6 +115,7 @@ CURRENT_MODEL_INDEX = 0
 # 1. State Definition (Must be above handlers)
 class APIState(StatesGroup):
     waiting_api = State()
+    waiting_model = State()
 
 @dp.message(or_f(F.text.contains("API"), Command("api")), StateFilter("*"))
 async def api_management(message: types.Message, state: FSMContext):
@@ -205,6 +206,43 @@ async def api_update(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ <b>RE-INIT FAILED:</b> {html.escape(str(e))}")
     
+    await state.clear()
+
+# ==========================================
+# MODEL MANAGEMENT (ADD CUSTOM MODEL)
+# ==========================================
+
+@dp.callback_query(F.data == "add_custom_mode")
+async def add_custom_mode(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text(
+        "📝 <b>ADD CUSTOM MODEL</b>\n"
+        "Enter the new model name (e.g., gemini-2.0-pro):\n"
+        "────────────────────\n"
+        "⚠️ <b>WARNING:</b> Only add verified Gemini models.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 CANCEL", callback_data="cancel_api")]
+        ]),
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(APIState.waiting_model)
+
+@dp.message(APIState.waiting_model)
+async def add_model_update(message: types.Message, state: FSMContext):
+    new_model = message.text.strip()
+    if new_model and new_model not in MODEL_POOL:
+        MODEL_POOL.append(new_model)
+        await message.answer(
+            f"✅ <b>MODEL ADDED SUCCESSFULLY</b>\n"
+            f"<code>{new_model}</code>\n"
+            "────────────────────\n"
+            "Use /api to select it.",
+            parse_mode=ParseMode.HTML
+        )
+    elif new_model in MODEL_POOL:
+        await message.answer("❌ <b>MODEL ALREADY EXISTS</b>", parse_mode=ParseMode.HTML)
+    else:
+        await message.answer("❌ <b>INVALID MODEL NAME</b>", parse_mode=ParseMode.HTML)
     await state.clear()
 
 # ==========================================
@@ -867,7 +905,8 @@ async def swap_engine_cb(cb: types.CallbackQuery):
                for i, m in enumerate(MODEL_POOL)]
     
     kb_list.append([InlineKeyboardButton(text="➕ ADD NEW MODE", callback_data="add_custom_mode")])
-    kb_list.append([InlineKeyboardButton(text="🔙 BACK", callback_data="cancel_api")])
+    kb_list.append([InlineKeyboardButton(text="� SWAP MODEL", callback_data="swap_model")])
+    kb_list.append([InlineKeyboardButton(text="�🔙 BACK", callback_data="cancel_api")])
     
     await cb.message.edit_text(
         "🎯 <b>2025 ENGINE SELECTION:</b>", 
@@ -882,6 +921,13 @@ async def sel_model_exec(cb: types.CallbackQuery):
     CURRENT_MODEL_INDEX = idx
     # Synchronization with 2025 Overlord Persona is automatic in Part 3
     await cb.message.edit_text(f"✅ <b>ENGINE UPDATED:</b> <code>{MODEL_POOL[idx]}</code>", parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "swap_model")
+async def swap_model_cb(cb: types.CallbackQuery):
+    global CURRENT_MODEL_INDEX
+    CURRENT_MODEL_INDEX = (CURRENT_MODEL_INDEX + 1) % len(MODEL_POOL)
+    new_model = MODEL_POOL[CURRENT_MODEL_INDEX]
+    await cb.message.edit_text(f"🔄 <b>MODEL SWAPPED:</b> <code>{new_model}</code>", parse_mode=ParseMode.HTML)
 
 @dp.message(or_f(F.text == "📦 BACKUP", Command("backup")))
 async def backup_mirror(message: types.Message):
