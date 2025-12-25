@@ -927,7 +927,7 @@ def run_health_server():
     try:
         app = web.Application()
         app.router.add_get('/', handle_ping)
-        port = int(os.environ.get("PORT", 10000))
+        port = 10000
         # We use a simple runner to avoid loop conflicts
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
