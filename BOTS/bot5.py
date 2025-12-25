@@ -916,29 +916,6 @@ async def startup_sequence():
 # ==========================================
 # 📡 RENDER HEALTH SHIELD (IMMEDIATE BIND)
 # ==========================================
-def run_health_server():
-    """
-    This runs in a separate thread and binds to the port 
-    the MILLISECOND the script starts. This satisfies Render.
-    """
-    async def handle_ping(request):
-        return web.Response(text="SINGULARITY_V5_LIVE")
-
-    try:
-        app = web.Application()
-        app.router.add_get('/', handle_ping)
-        port = 10000
-        # We use a simple runner to avoid loop conflicts
-        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
-    except Exception as e:
-        print(f"Health Server Note: {e}")
-async def increment_api_count_in_db():
-    try:
-        col_api.update_one({"_id": "global_ledger"}, {"$inc": {"usage": 1}}, upsert=True)
-    except Exception as e:
-        console_out(f"Ledger Sync Error: {e}")
-
-
 @dp.callback_query(F.data == "brauto")
 async def breach_auto_exec(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.edit_text("🛰 <b>SYNTHESIZING...</b>", parse_mode=ParseMode.HTML)
@@ -960,33 +937,66 @@ async def breach_fire_final(cb: types.CallbackQuery, state: FSMContext):
     await bot.send_message(LOG_CHANNEL_ID, f"🚀 <b>BREACH DEPLOYED: {code}</b>\n\n{content}", parse_mode=ParseMode.HTML)
     await cb.message.edit_text(f"🚀 <b>DEPLOYED:</b> <code>{code}</code>")
     await state.clear()
+
+
+# ==========================================
+# 📡 RENDER PORT BINDER (INSTANT SATISFACTION)
+# ==========================================
+async def start_health_server():
+    """Satisfies Render's port requirement in < 0.1 seconds."""
+    app = web.Application()
+    app.router.add_get('/', lambda r: web.Response(text="SINGULARITY_V5_LIVE"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render binds to 0.0.0.0 and the PORT env var
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    
+    await site.start()
+    print(f"✅ PORT {port} BOUND. RENDER SCANNER SATISFIED.")
+
+# ==========================================
+# 🚀 THE SUPREME STARTUP
+# ==========================================
 async def main():
-    """Handles the async startup of all Singularity subsystems."""
+    """Handles the async startup sequence with immediate port bind."""
     try:
-        # --- CRITICAL: Initialize Database Counters ---
+        # STEP 1: OPEN PORT IMMEDIATELY
+        # Do this BEFORE MongoDB or AI to beat the Render timeout.
+        await start_health_server()
+        
+        # STEP 2: Initialize Identity Engine (Database Counters)
         await startup_sequence() 
         
+        # STEP 3: Sync AI Quota from Database
         global API_USAGE_COUNT
-        API_USAGE_COUNT = 0 
+        ledger = col_api.find_one({"_id": "global_ledger"})
+        API_USAGE_COUNT = ledger.get("usage", 0) if ledger else 0
         
-        # Start Scheduler inside the running loop
+        # STEP 4: Fire up the Subsystems
         scheduler.start()
         scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
         scheduler.add_job(check_system_integrity, 'interval', minutes=60)
         
-        console_out("◈ SUBSYSTEMS ARMED")
+        console_out(f"◈ SYSTEM ARMED | API COUNT: {API_USAGE_COUNT}")
         
-        # Verify Database Connection
-        db_client.admin.command('ping')
-        
-        # Send Startup Signal to Master Sadiq
+        # STEP 5: Notify Master Sadiq & Start Polling
         await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>", parse_mode=ParseMode.HTML)
-        
-        # Start Polling
         print("◈ Bot is now polling...")
         await dp.start_polling(bot, skip_updates=True)
         
     except Exception as e:
-        print(f"FATAL STARTUP ERROR: {e}")
-        try: await bot.send_message(LOG_CHANNEL_ID, f"🚨 FATAL BOOT ERROR: {e}")
+        print(f"💥 FATAL BOOT ERROR: {e}")
+        # If possible, notify via Log Channel
+        try: await bot.send_message(LOG_CHANNEL_ID, f"🚨 FATAL ERROR: {e}")
         except: pass
+
+if __name__ == "__main__":
+    try:
+        # Use asyncio.run for the cleanest loop lifecycle in Python 3.13
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("◈ Manual Shutdown Initiated.")
+    except Exception as e:
+        print(f"💥 CRITICAL EXIT: {e}")
