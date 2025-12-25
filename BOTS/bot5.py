@@ -64,6 +64,8 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 scheduler = AsyncIOScheduler(timezone=IST)
 
+client = genai.Client(api_key=GEMINI_KEY)
+
 # MongoDB Connection
 db_client = None
 db = None
@@ -84,7 +86,6 @@ MODEL_POOL = [
 API_USAGE_COUNT = 0
 CONSOLE_LOGS = [] # Required for your terminal_viewer
 PENDING_APPROVALS = {} # Required for your scheduling logic
-model = None
 
 # ==========================================
 # 🛠 SETUP
@@ -177,7 +178,7 @@ async def api_init(message: types.Message, state: FSMContext):
 
 @dp.message(APIState.waiting_api)
 async def api_update(message: types.Message, state: FSMContext):
-    global GEMINI_KEY, client, model
+    global GEMINI_KEY, client
     new_key = message.text.strip()
     
     # 2025 Validation Standard
@@ -191,9 +192,6 @@ async def api_update(message: types.Message, state: FSMContext):
         
         # 2. Re-configure the 2025 Client (Surgical Fix)
         client = genai.Client(api_key=GEMINI_KEY)
-        
-        # 3. Reset Model Pointers
-        model = None 
         
         await message.answer(
             "🚀 <b>API ROTATION SUCCESSFUL</b>\n"
