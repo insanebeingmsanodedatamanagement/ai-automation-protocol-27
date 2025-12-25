@@ -1032,27 +1032,55 @@ def run_health_server():
 # ==========================================
 # 🚀 THE SUPREME STARTUP
 # ==========================================
-async def main():
-    # Start the 60-min Heartbeat & Auditor
-    scheduler.add_job(check_system_integrity, 'interval', minutes=60)
-    scheduler.start()
+# ==========================================
+# 📡 RENDER HEALTH SHIELD (IMMEDIATE BIND)
+# ==========================================
+def run_health_server():
+    """Satisfies Render's port requirement immediately in a separate thread."""
+    async def handle_ping(request):
+        return web.Response(text="SINGULARITY_V5_LIVE")
 
-    console_out("◈ SINGULARITY APEX: CONNECTING TO TELEGRAM...")
-    
     try:
-        # Send Startup Signal to you
-        await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>", parse_mode=ParseMode.HTML)
-        # Start Polling
-        await dp.start_polling(bot, skip_updates=True)
+        app = web.Application()
+        app.router.add_get('/', handle_ping)
+        port = int(os.environ.get("PORT", 10000))
+        # Use a simplified runner for the thread
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
-        console_out(f"FATAL POLLING ERROR: {e}")
+        print(f"Health Server Note: {e}")
+
+# ==========================================
+# 🚀 THE SUPREME STARTUP (REPAIRED)
+# ==========================================
+async def main():
+    """Handles the async startup of all Singularity subsystems."""
+    try:
+        # 1. Initialize Scheduler inside the running loop
+        # This prevents the 'Event loop is closed' error
+        scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
+        scheduler.start()
+        
+        console_out("◈ SUBSYSTEMS ARMED")
+        
+        # 2. Send Startup Signal
+        await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>", parse_mode=ParseMode.HTML)
+        
+        # 3. Start Polling
+        await dp.start_polling(bot, skip_updates=True)
+        
+    except Exception as e:
+        print(f"FATAL STARTUP ERROR: {e}")
 
 if __name__ == "__main__":
-    # 1. Start Port Binding immediately in a background thread
-    threading.Thread(target=run_health_server, daemon=True).start()
+    # STEP 1: Start the Health Server thread BEFORE starting the loop
+    # This ensures Render sees an open port instantly.
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
     
-    # 2. Run the Bot Logic
+    # STEP 2: Start the Async Loop properly
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("◈ System Shutdown.")
+        print("◈ Manual Shutdown.")
+    except Exception as e:
+        print(f"💥 CRITICAL BOOT ERROR: {e}")
