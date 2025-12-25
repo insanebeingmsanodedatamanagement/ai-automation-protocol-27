@@ -17,16 +17,11 @@ from typing import List, Dict, Any
 import psutil
 from aiogram.filters import Command, StateFilter, or_f
 import time
-import google.generativeai as genai
-from aiogram.filters import or_f
-import pymongo
+import sys
+# 2025 AI SDK REPLACEMENT (Deprecation Fix)
+from google import genai 
+from google.genai import types as ai_types
 
-# Track when the bot was launched
-START_TIME = time.time()
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.date import DateTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -35,6 +30,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+# Track when the bot was launched
+START_TIME = time.time()
+IST = pytz.timezone('Asia/Kolkata')
 
 # ==========================================
 # ⚡ CONFIGURATION (SECURED)
@@ -50,7 +53,6 @@ LOG_CHANNEL_ID_RAW = os.getenv("LOG_CHANNEL_ID")
 
 if not all([BOT_TOKEN, GEMINI_KEY, MONGO_URI, OWNER_ID_RAW, CHANNEL_ID_RAW, LOG_CHANNEL_ID_RAW]):
     print("❌ Bot 5 Error: Missing AI or Bot credentials in Render Environment!")
-    import sys
     sys.exit(1)
 
 OWNER_ID = int(OWNER_ID_RAW)
@@ -60,7 +62,8 @@ LOG_CHANNEL_ID = int(LOG_CHANNEL_ID_RAW)
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-scheduler = AsyncIOScheduler(timezone=pytz.timezone('Asia/Kolkata'))
+scheduler = AsyncIOScheduler(timezone=IST)
+
 # MongoDB Connection
 db_client = None
 db = None
@@ -69,11 +72,20 @@ col_api_ledger = None
 col_vault = None
 col_schedules = None
 col_settings = None
-MODEL_POOL = ["gemini-2.5-flash", "gemini-2.5-pro","gemini-2.5-flash-preview-09-2025","gemini-2.5-flash-lite","gemini-2.5-flash-lite-preview-09-2025"]
+
+# 2025 Model Configuration
+MODEL_POOL = [
+    "gemini-2.0-flash", 
+    "gemini-2.0-pro",
+    "gemini-2.0-flash-preview-09-2025",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-lite-preview-09-2025"
+]
 API_USAGE_COUNT = 0
 CONSOLE_LOGS = [] # Required for your terminal_viewer
 PENDING_APPROVALS = {} # Required for your scheduling logic
 model = None
+
 # ==========================================
 # 🛠 SETUP
 # ==========================================
@@ -95,9 +107,11 @@ def connect_db():
         return False
 
 connect_db()
+
 # Global variables for bot state
 CURRENT_MODEL_INDEX = 0 
-#1. State Definition (Must be above handlers)
+
+# 1. State Definition (Must be above handlers)
 class APIState(StatesGroup):
     waiting_api = State()
 
@@ -109,7 +123,7 @@ async def api_management(message: types.Message, state: FSMContext):
     await state.clear()
 
     global GEMINI_KEY
-    key_hash = GEMINI_KEY[-8:]
+    key_hash = GEMINI_KEY[-8:] if GEMINI_KEY else "NONE"
 
     ledger = col_api_ledger.find_one({"key_hash": key_hash})
     current_usage = ledger.get("usage_count", 0) if ledger else 0
@@ -140,6 +154,7 @@ async def cancel_handler(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text("<b>🔙 NAVIGATION RESET.</b>\nSystem on Standby.", parse_mode=ParseMode.HTML)
     await cb.answer("State Cleared")
+
 @dp.message(or_f(F.text.contains("API"), Command("api")), StateFilter("*"))
 async def api_init(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
@@ -147,38 +162,37 @@ async def api_init(message: types.Message, state: FSMContext):
     global GEMINI_KEY
     await state.clear()
     
-    # Mask the key so it's safe if someone is looking over your shoulder
-    masked_key = f"{GEMINI_KEY[:8]}****{GEMINI_KEY[-4:]}"
+    # Secure Masking Logic
+    masked_key = f"{GEMINI_KEY[:8]}****{GEMINI_KEY[-4:]}" if GEMINI_KEY else "UNDEFINED"
     
     await message.answer(
         "🔑 <b>API MANAGEMENT PROTOCOL</b>\n"
         f"CURRENT KEY: <code>{masked_key}</code>\n"
         "────────────────────\n"
         "📥 <b>Enter the NEW Gemini API Key:</b>\n"
-        "<i>Note: This will re-initialize the AI Engine immediately.</i>",
+        "<i>Note: This will re-initialize the 2025 AI Client immediately.</i>",
         parse_mode=ParseMode.HTML
     )
     await state.set_state(APIState.waiting_api)
 
 @dp.message(APIState.waiting_api)
 async def api_update(message: types.Message, state: FSMContext):
-    global GEMINI_KEY, model
+    global GEMINI_KEY, client, model
     new_key = message.text.strip()
     
-    # Validation: Gemini keys usually start with 'AIza'
+    # 2025 Validation Standard
     if not new_key.startswith("AIza") or len(new_key) < 20:
-        await message.answer("❌ <b>INVALID KEY:</b> That does not look like a valid Gemini API Key.")
+        await message.answer("❌ <b>INVALID KEY:</b> Source does not match Gemini standards.")
         return
 
     try:
         # 1. Update Global Variable
         GEMINI_KEY = new_key
         
-        # 2. Re-configure the Library
-        genai.configure(api_key=GEMINI_KEY)
+        # 2. Re-configure the 2025 Client (Surgical Fix)
+        client = genai.Client(api_key=GEMINI_KEY)
         
-        # 3. Reset the Model instance
-        # This forces generate_content() to re-build the model with the new key
+        # 3. Reset Model Pointers
         model = None 
         
         await message.answer(
@@ -188,19 +202,20 @@ async def api_update(message: types.Message, state: FSMContext):
             "<b>STATUS:</b> Operational",
             parse_mode=ParseMode.HTML
         )
-        console_out("System: API Key Rotated.")
+        console_out("System: 2025 AI Client Rotated.")
         
     except Exception as e:
         await message.answer(f"❌ <b>RE-INIT FAILED:</b> {html.escape(str(e))}")
     
     await state.clear()
+
 # ==========================================
-# VIRTUAL CONSOLE STORAGE (MUST BE AT TOP)
+# VIRTUAL CONSOLE STORAGE (LOGGING ENGINE)
 # ==========================================
 
 def console_out(text):
     global CONSOLE_LOGS
-    timestamp = datetime.now().strftime("%H:%M:%S")
+    timestamp = datetime.now(IST).strftime("%H:%M:%S")
     entry = f"[{timestamp}] {text}"
     CONSOLE_LOGS.append(entry)
     if len(CONSOLE_LOGS) > 12: 
@@ -208,13 +223,14 @@ def console_out(text):
     logging.info(text)
 
 async def get_api_usage_safe():
+    """Retrieves usage from MongoDB system_stats."""
     try:
         stats = col_system_stats.find_one({"_id": 1})
         if not stats:
             col_system_stats.insert_one({
                 "_id": 1,
                 "api_total": 0,
-                "last_reset": datetime.now()
+                "last_reset": datetime.now(IST)
             })
             return 0
         return stats.get("api_total", 0)
@@ -222,30 +238,32 @@ async def get_api_usage_safe():
         return 0
 
 async def increment_api_count(api_key):
-    """Increments the local persistent counter for the current key."""
-    key_hash = api_key[-8:] # Use last 8 chars as a unique identifier
+    """Increments the local persistent counter for the current key hash."""
+    key_hash = api_key[-8:] 
     try:
-        # Try to find existing record
         existing = col_api_ledger.find_one({"key_hash": key_hash})
 
         if not existing:
-            # Create new record if this key hasn't been used before
             col_api_ledger.insert_one({
                 "key_hash": key_hash,
-                "usage_count": 1
+                "usage_count": 1,
+                "last_active": datetime.now(IST)
             })
             return 1
         else:
-            # Increment existing record
             new_count = existing.get("usage_count", 0) + 1
             col_api_ledger.update_one(
                 {"key_hash": key_hash},
-                {"$set": {"usage_count": new_count}}
+                {"$set": {"usage_count": new_count, "last_active": datetime.now(IST)}}
             )
             return new_count
     except Exception as e:
-        logging.error(f"Error incrementing API count: {e}")
+        logging.error(f"Ledger Sync Error: {e}")
         return 0
+
+# ==========================================
+# 📟 REMOTE TERMINAL (COMMAND CENTER)
+# ==========================================
 
 @dp.message(F.text.contains("TERMINAL"), StateFilter("*"))
 async def terminal_viewer(message: types.Message, state: FSMContext):
@@ -316,9 +334,9 @@ def get_system_prompt():
     
     STRICT CONSTRAINTS:
     - COLD START: Begin IMMEDIATELY with '━━━━━━━━━━━━━━━━━━━━' followed by the '🚨 OPERATION' header.
-    - NO PRE-TEXT: Never explain your mandate, never use disclaimers, and never say "I cannot generate viral content." 
-    - DIRECT LINKS: Provide REAL, EXTERNAL HTTPS LINKS to the actual tools (e.g., chain.link, openai.com, ankr.com).
-    - NO BRANDING: Do not create fake msanode.net links. Provide the source tools directly.
+    - NO PRE-TEXT: Never explain your mandate or use disclaimers.
+    - DIRECT LINKS: Provide REAL, EXTERNAL HTTPS LINKS to tools (e.g., chain.link, openai.com).
+    - NO BRANDING: Do not create fake links.
     - FORMATTING: NO EMOJIS in body text. Emojis allowed ONLY in headers.
     - NO AI FILLER.
 
@@ -336,24 +354,23 @@ def get_system_prompt():
     ━━━━━━━━━━━━━━━━━━━━
     """
 
-genai.configure(api_key=GEMINI_KEY)
-
 async def generate_content(prompt="Generate a viral AI side hustle reel script"):
-    global model, API_USAGE_COUNT
+    global API_USAGE_COUNT
     if API_USAGE_COUNT >= 1500:
         return "⚠️ API Limit Reached", "Limit"
 
     try:
-        if model is None:
-            model = genai.GenerativeModel(
-                model_name=MODEL_POOL[CURRENT_MODEL_INDEX],
+        # 2025 SDK: client.models.generate_content
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=MODEL_POOL[CURRENT_MODEL_INDEX],
+            contents=prompt[:500],
+            config=ai_types.GenerateContentConfig(
                 system_instruction=get_system_prompt()
             )
-            console_out(f"Oracle Online: {MODEL_POOL[CURRENT_MODEL_INDEX]}")
-
-        response = await asyncio.to_thread(model.generate_content, prompt[:500])
+        )
+        
         raw_text = response.text if response else "No response"
-        # Project Chimera Stability Shield: HTML Escaping
         clean_content = html.escape(raw_text)[:3500] 
         
         API_USAGE_COUNT += 1
@@ -367,10 +384,18 @@ async def generate_content(prompt="Generate a viral AI side hustle reel script")
 
 async def alchemy_transform(raw_text):
     try:
-        prompt = get_system_prompt() + f"\n\nINPUT DATA:\n{raw_text}\n\nINSTRUCTION: Rewrite into MSANODE Protocol."
-        resp = await model.generate_content_async(prompt)
+        # 2025 SDK: client.models.generate_content
+        resp = await asyncio.to_thread(
+            client.models.generate_content,
+            model=MODEL_POOL[CURRENT_MODEL_INDEX],
+            contents=f"INPUT DATA:\n{raw_text}\n\nINSTRUCTION: Rewrite into MSANODE Protocol.",
+            config=ai_types.GenerateContentConfig(
+                system_instruction=get_system_prompt()
+            )
+        )
         return re.sub(r"^(Here is|Sure).*?\n", "", resp.text, flags=re.IGNORECASE).strip()
     except: return "⚠️ Alchemy Failed."
+
 # --- RENDER PORT BINDER (SHIELD) ---
 async def handle_health(request):
     return web.Response(text="CORE 5 (AI SINGULARITY) IS ACTIVE")
@@ -383,31 +408,30 @@ def run_health_server():
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"📡 Health Server Note: {e}")
+
 # ==========================================
-# 📡 UTILITY LOGIC
+# 📡 UTILITY LOGIC (X-IDENTITY ENGINE)
 # ==========================================
 async def get_next_x_code(prefix="X"):
-    """Generates sequential codes: X1, X2, X3... across breaches and schedules."""
+    """Surgical Sequential Counter: X1, X2, X3... across breaches and schedules."""
     try:
-        # Check global counter in system stats
-        stats = col_system_stats.find_one({"_id": "global_counter"})
-        if not stats:
-            col_system_stats.insert_one({"_id": "global_counter", "count": 0})
-            new_count = 1
-        else:
-            new_count = stats["count"] + 1
-        
-        col_system_stats.update_one({"_id": "global_counter"}, {"$set": {"count": new_count}})
+        # Atomically increment the global counter in MongoDB
+        stats = col_system_stats.find_one_and_update(
+            {"_id": "global_counter"},
+            {"$inc": {"count": 1}},
+            upsert=True,
+            return_document=True
+        )
+        new_count = stats.get("count", 1)
         return f"{prefix}{new_count}"
     except Exception as e:
+        console_out(f"X-Code Error: {e}")
         return f"{prefix}{random.randint(1000, 9999)}"
-        
+
 REWARD_POOL = [
     "GitHub Student Pack ($200k in Premium Infrastructure)",
     "Top 7 AI Tools that make ChatGPT look like a Toy",
-    "Google's Hidden Professional Cybersecurity Certification",
-    
-
+    "Google's Hidden Professional Cybersecurity Certification"
 ]
 
 async def safe_send_message(chat_id, text, reply_markup=None):
@@ -420,10 +444,10 @@ async def safe_send_message(chat_id, text, reply_markup=None):
         await asyncio.sleep(2)
         try: return await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
         except: return None
-# ==========================================
-# [!] FSM STATES (MUST BE AT THE TOP)
-# ==========================================
 
+# ==========================================
+# [!] FSM STATES (CORE PERSISTENCE)
+# ==========================================
 class ScheduleState(StatesGroup):
     waiting_time = State()
     waiting_month = State()
@@ -461,38 +485,42 @@ class BroadcastState(StatesGroup):
 async def engagement_init(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
     
-    # Critical: Flush previous states
+    # Critical: Flush previous states to prevent logic loops
     await state.clear()
     
     await message.answer(
         "🎯 <b>ENGAGEMENT GATING ACTIVATED</b>\n"
-        "Enter the <b>M-Code</b> to update reaction targets:", 
+        "Enter the <b>Unique Code</b> (e.g., X1) to update reaction targets:", 
         parse_mode=ParseMode.HTML
     )
     await state.set_state(EngagementState.waiting_code)
 
 @dp.message(EngagementState.waiting_code)
 async def engagement_id_received(message: types.Message, state: FSMContext):
+    # Standardize input to match database X-Series codes
     m_code = message.text.upper().strip()
 
     try:
-        # Verify the M-Code exists in our Vault
+        # Verify the Code exists in our Vault
         entry = col_vault.find_one({"m_code": m_code})
 
         if entry:
             await state.update_data(target_code=m_code, msg_id=entry.get("msg_id"))
+            current_lock = entry.get('reaction_lock', 0)
+            
             await message.answer(
                 f"✅ <b>ENTRY FOUND:</b> <code>{m_code}</code>\n"
-                f"Current Lock: <code>{entry.get('reaction_lock', 0)}x</code> 🔥 reactions.\n\n"
+                f"Current Lock: <code>{current_lock}x</code> 🔥 reactions.\n\n"
                 "📥 <b>Enter the NEW target reaction count (0 to remove lock):</b>",
                 parse_mode=ParseMode.HTML
             )
             await state.set_state(EngagementState.waiting_count)
         else:
-            await message.answer(f"❌ <b>ERROR:</b> M-Code <code>{m_code}</code> not found.")
+            await message.answer(f"❌ <b>ERROR:</b> Code <code>{m_code}</code> not found in Vault.")
+            await state.clear()
     except Exception as e:
-        logging.error(f"Error verifying M-code: {e}")
-        await message.answer("❌ <b>DATABASE ERROR:</b> Could not verify M-code.")
+        logging.error(f"Error verifying code: {e}")
+        await message.answer("❌ <b>DATABASE ERROR:</b> Connection interrupt.")
         await state.clear()
 
 @dp.message(EngagementState.waiting_count)
@@ -507,18 +535,17 @@ async def engagement_exec(message: types.Message, state: FSMContext):
     msg_id = data['msg_id']
 
     try:
-        # 1. Update Database
+        # 1. Update Database with IST timestamp
         col_vault.update_one(
             {"m_code": m_code},
             {"$set": {
                 "reaction_lock": new_count,
                 "is_unlocked": (new_count == 0),
-                "last_verified": datetime.now()
+                "last_verified": datetime.now(IST)
             }}
         )
 
-        # 2. Synchronize Telegram UI
-        # We refresh the buttons on the actual channel post immediately
+        # 2. Synchronize Telegram UI (Live Update)
         await bot.edit_message_reply_markup(
             chat_id=CHANNEL_ID,
             message_id=msg_id,
@@ -536,71 +563,77 @@ async def engagement_exec(message: types.Message, state: FSMContext):
         await message.answer(f"❌ <b>SYNC FAILED:</b> {html.escape(str(e))}")
 
     await state.clear()
-    # ==========================================
-# 📡 UI HELPERS (MUST BE DEFINED EARLY)
+
+# ==========================================
+# 📡 UI HELPERS (DYNAMIC MARKUP)
 # ==========================================
 
 def get_engagement_markup(m_code, lock=0, unlocked=False):
     """
     Generates the reaction gating buttons.
-    This function must be defined BEFORE any handlers call it.
+    Logic: If lock > 0 and not yet unlocked, show the 'Lock' button.
+    Otherwise, show the 'Reveal' button for the intelligence asset.
     """
     if lock > 0 and not unlocked:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"🔒 UNLOCK AT {lock}x 🔥 REACTIONS", callback_data=f"lockmsg_{m_code}")]
         ])
     
-    # Default state if lock is 0 or already unlocked
+    # Reveal state once threshold is bypassed
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔓 UNLOCK SECRET BONUS HACK", callback_data=f"reveal_{m_code}")]
     ])
 # ==========================================
-# 🕹️ FSM STATES
+# 🕹️ FSM STATES (CLEANED & DE-DUPLICATED)
 # ==========================================
 
 class ScheduleState(StatesGroup):
-    waiting_time = State(); waiting_month = State(); waiting_year = State(); selecting_days = State()
+    waiting_time = State()
+    waiting_month = State()
+    waiting_year = State()
+    selecting_days = State()
+
 class BreachState(StatesGroup):
-    selecting_mode = State(); waiting_topic = State(); waiting_reaction_count = State()
+    selecting_mode = State()
+    waiting_topic = State()
+    waiting_reaction_count = State()
+
 class EditState(StatesGroup):
-    waiting_id = State(); waiting_text = State()
+    waiting_id = State()
+    waiting_text = State()
+
 class UnsendState(StatesGroup):
     waiting_id = State()
+
 class HurryState(StatesGroup):
-    waiting_code = State(); waiting_duration = State()
+    waiting_code = State()
+    waiting_duration = State()
+
 class EngagementState(StatesGroup):
-    waiting_code = State(); waiting_count = State()
+    waiting_code = State()
+    waiting_count = State()
+
 class BroadcastState(StatesGroup):
     waiting_msg = State()
 
-# ==========================================
-# 🛡️ SYSTEM TASKS & ACTIVE LISTENER
-# ==========================================
 # ==========================================
 # 🪤 REACTION LOCK INTERFACE HANDLERS
 # ==========================================
 
 @dp.callback_query(F.data.startswith("reveal_"))
 async def reveal_secret(cb: types.CallbackQuery):
-    """
-    Triggers when the 'UNLOCK SECRET BONUS HACK' button is clicked.
-    Provides verified engineering/AI resources.
-    """
+    """Provides verified engineering/AI resources upon unlock."""
     hacks = [
         "◈ VPN Bypass: Protocol Verified.", 
         "◈ EDU Email: Access Granted.", 
         "◈ Archive Script: Script mirror active.",
         "◈ Premium Repo: Branch decrypted."
     ]
-    # Sends a private alert to the user who clicked
     await cb.answer(random.choice(hacks), show_alert=True)
 
 @dp.callback_query(F.data.startswith("lockmsg_"))
 async def lock_alert(cb: types.CallbackQuery):
-    """
-    Triggers when the locked button is clicked.
-    Informs the user about the remaining requirement.
-    """
+    """Informs the user about the remaining requirement."""
     await cb.answer(
         "◈ ACCESS RESTRICTED ◈\n"
         "Requirement: Reach the 🔥 reaction target to unlock this intelligence.", 
@@ -608,33 +641,23 @@ async def lock_alert(cb: types.CallbackQuery):
     )
 
 # ==========================================
-# 📊 UNIVERSAL REACTION LISTENER (COUNT-ONLY)
+# 📊 UNIVERSAL REACTION LISTENER (FIXED)
 # ==========================================
 
 @dp.message_reaction()
 async def reaction_listener(reaction: types.MessageReactionUpdated):
-    """
-    Counts ANY reaction emoji. Once the total count across
-    all emojis hits the target, the Vault unlocks.
-    """
+    """Counts reactions and unlocks the Vault when target is reached."""
     try:
-        # Search the Vault for this message ID
+        # Search the Vault using dict.get() to prevent AttributeErrors
         entry = col_vault.find_one({
             "msg_id": reaction.message_id,
             "is_unlocked": False
         })
 
-        # If entry is found and a lock exists
         if entry and entry.get("reaction_lock", 0) > 0:
-            # Calculate Total Count across all emoji types
-            total_reactions = 0
-            for r in reaction.new_reaction:
-                # This counts the total number of people who reacted
-                # Telegram provides a list of reaction types and their counts
-                # For channels, we sum the totals provided in the update
-                total_reactions += 1 # Standard count per reactor
+            # logic to tally reaction count
+            total_reactions = len(reaction.new_reaction) 
 
-            # Check if we hit the goal
             if total_reactions >= entry.get("reaction_lock", 0):
                 # 1. Update Database Status
                 col_vault.update_one(
@@ -642,30 +665,37 @@ async def reaction_listener(reaction: types.MessageReactionUpdated):
                     {"$set": {"is_unlocked": True}}
                 )
 
-                # 2. Update Channel UI
+                # 2. Update Channel UI (Fixed Markup Call)
                 await bot.edit_message_reply_markup(
                     chat_id=CHANNEL_ID,
                     message_id=entry.get("msg_id"),
-                    reply_markup=get_engagement_markup(entry.m_code, unlocked=True)
+                    reply_markup=get_engagement_markup(entry.get("m_code"), unlocked=True)
                 )
                 
-                # 3. Notification of Breach
+                # 3. Notification to Audit Channel
                 await bot.send_message(
                     LOG_CHANNEL_ID,
                     f"🔓 <b>VAULT UNLOCKED:</b> <code>{entry.get('m_code')}</code>\n"
-                    f"Threshold of <code>{entry.get('reaction_lock', 0)}</code> reactions reached."
+                    f"Threshold of <code>{entry.get('reaction_lock', 0)}</code> reactions reached.",
+                    parse_mode=ParseMode.HTML
                 )
     except Exception as e:
         logging.error(f"Error in reaction listener: {e}")
-    """
-    Asynchronous link validation to ensure intelligence assets are live.
-    """
+
+# ==========================================
+# 🛡️ SYSTEM TASKS & AUDIT ENGINE
+# ==========================================
+
+async def validate_links(text):
+    """Asynchronous link validation for live assets."""
     urls = re.findall(r'(https?://[^\s)]+)', text)
     invalid = []
-    async with aiohttp.ClientSession() as session:
+    # Added timeout to prevent hanging
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         for url in urls:
             try:
-                async with session.get(url, timeout=5) as resp:
+                async with session.get(url) as resp:
                     if resp.status >= 400: 
                         invalid.append(url)
             except Exception:
@@ -673,11 +703,8 @@ async def reaction_listener(reaction: types.MessageReactionUpdated):
     return invalid
 
 async def self_healing_audit():
-    """
-    Periodic deep-scan of vault integrity.
-    """
+    """Periodic deep-scan of vault integrity."""
     try:
-        # Get recent vault entries from MongoDB
         recent_entries = list(col_vault.find().sort("created_at", -1).limit(50))
         report = "🛡️ <b>DAILY HEALING REPORT:</b>\n"
         found = False
@@ -694,14 +721,12 @@ async def self_healing_audit():
         logging.error(f"Self-healing audit error: {e}")
 
 async def hourly_heartbeat():
-    """
-    Ensures the bot and database connection remain persistent.
-    """
+    """Ensures bot and database connection remain persistent."""
     try:
         # Test MongoDB connection
         col_vault.find_one({}, limit=1)
 
-        # Pull model engine info if available
+        # Pull model engine info safely
         curr_eng = MODEL_POOL[CURRENT_MODEL_INDEX] if 'MODEL_POOL' in globals() else "Active"
 
         await bot.send_message(
@@ -710,6 +735,7 @@ async def hourly_heartbeat():
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
+        # Fallback to Owner if Log Channel fails
         await bot.send_message(
             OWNER_ID,
             f"🚨 <b>SYSTEM ERROR:</b> {html.escape(str(e))}",
@@ -717,16 +743,17 @@ async def hourly_heartbeat():
         )
 
 # ==========================================
-# 🗑 UNSEND PROTOCOL (DELETION)
+# 🗑 SURGICAL DELETE PROTOCOL (DOUBLE-WIPE)
 # ==========================================
 
-@dp.message(F.text == "🗑 UNSEND", StateFilter("*"))
-@dp.message(Command("unsend"))
+@dp.message(or_f(F.text == "🗑️ SURGICAL DELETE", Command("unsend")), StateFilter("*"))
 async def unsend_init(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
     await state.clear()
     await message.answer(
-        "🗑 <b>UNSEND INITIATED</b>\nEnter the M-Code to scrub from existence:", 
+        "🗑️ <b>SURGICAL PURGE INITIATED</b>\n"
+        "────────────────────\n"
+        "Enter the <b>Unique Code</b> (e.g., X1) to wipe from Channel and Database:", 
         parse_mode=ParseMode.HTML
     )
     await state.set_state(UnsendState.waiting_id)
@@ -734,210 +761,147 @@ async def unsend_init(message: types.Message, state: FSMContext):
 @dp.message(UnsendState.waiting_id)
 async def unsend_exec(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
-    m_code = message.text.upper()
+    target_code = message.text.upper().strip()
     
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(VaultEntry).where(VaultEntry.m_code == m_code))
-        entry = res.scalar_one_or_none()
+    try:
+        # Search the MongoDB Vault
+        entry = col_vault.find_one({"m_code": target_code})
         
         if entry:
+            # 1. Surgical removal from Public Channel
             try:
-                await bot.delete_message(CHANNEL_ID, entry.msg_id)
-                telegram_status = "Scrubbed from Channel"
+                await bot.delete_message(CHANNEL_ID, entry.get("msg_id"))
+                t_status = "✅ Scrubbed from Channel"
             except Exception:
-                telegram_status = "Channel deletion failed (too old)"
+                t_status = "⚠️ Channel wipe failed (Post too old)"
             
-            await session.execute(delete(VaultEntry).where(VaultEntry.m_code == m_code))
-            await session.commit()
+            # 2. Permanent removal from MongoDB
+            col_vault.delete_one({"m_code": target_code})
+            
+            # 3. Mirror to Private Log Channel
+            await bot.send_message(
+                LOG_CHANNEL_ID,
+                f"🗑️ <b>EMPIRE WIPE COMPLETE</b>\n"
+                f"CODE: <code>{target_code}</code>\n"
+                f"STATUS: {t_status} & Database Purged.",
+                parse_mode=ParseMode.HTML
+            )
             
             await message.answer(
-                f"✅ <b>OPERATION COMPLETE</b>\nID: <code>{m_code}</code>\nStatus: {telegram_status} and Database.", 
+                f"🚀 <b>PURGE SUCCESSFUL</b>\n"
+                f"ID: <code>{target_code}</code>\n"
+                f"Status: {t_status} and Database wiped.", 
                 parse_mode=ParseMode.HTML
             )
         else:
-            await message.answer(
-                f"❌ <b>ERROR:</b> M-Code <code>{m_code}</code> not found.", 
-                parse_mode=ParseMode.HTML
-            )
+            await message.answer(f"❌ <b>ERROR:</b> Code <code>{target_code}</code> not found.")
+            
+    except Exception as e:
+        await message.answer(f"💥 <b>CRITICAL ERROR:</b> {html.escape(str(e))}")
+
     await state.clear()
+
 # ==========================================
-# 🔘 COMMANDS & GUIDE
+# 🔘 MAIN COMMANDS & DYNAMIC MENU
 # ==========================================
+
 @dp.message(Command("start"), StateFilter("*"))
 async def start_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
-    
-    # Critical: Reset any stuck states from previous errors
     await state.clear()
-# Reorganized Keyboard: Tactical Command v15.0
+
+    # Reorganized Keyboard: Tactical Command v16.0 (Surgical Upgrade)
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🔥 BREACH"), KeyboardButton(text="🗓 SCHEDULE")], 
-        [KeyboardButton(text="✏️ EDIT"), KeyboardButton(text="🗑 UNSEND")],
+        [KeyboardButton(text="✏️ EDIT"), KeyboardButton(text="🗑️ SURGICAL DELETE")], 
         [KeyboardButton(text="📋 LIST"), KeyboardButton(text="🎯 ENGAGEMENT")],
-        [KeyboardButton(text="📢 BROADCAST"), KeyboardButton(text="🔑 API")], # Added API Hot-Swap
+        [KeyboardButton(text="📢 BROADCAST"), KeyboardButton(text="🔑 API")], 
         [KeyboardButton(text="⚙️ MODEL"), KeyboardButton(text="📊 AUDIT")], 
         [KeyboardButton(text="📟 TERMINAL"), KeyboardButton(text="❓ GUIDE")],
         [KeyboardButton(text="🛑 PANIC")]
     ], resize_keyboard=True)
     
-    # Log the access to the internal terminal
-    if 'console_out' in globals():
-        console_out("Master Sadiq initialized Command Center")
+    console_out("Master Sadiq accessed Command Center")
 
     await message.answer(
         "💎 <b>APEX SINGULARITY v5.0</b>\n"
         "────────────────────\n"
         "Master Sadiq, the system is fully synchronized.\n"
-        "All nodes active. Awaiting your directive.", 
+        "Surgical Purge & 2025 AI Engine: <b>ACTIVE</b>.", 
         reply_markup=kb,
         parse_mode=ParseMode.HTML
     )
 
-@dp.message(F.text == "❓ GUIDE" or Command("guide"))
+@dp.message(or_f(F.text == "❓ GUIDE", Command("guide")))
 async def help_guide(message: types.Message):
     if message.from_user.id != OWNER_ID: return
     
     guide = (
-        "💎 <b>APEX OVERLORD SINGULARITY: TECHNICAL MANUAL</b>\n"
+        "💎 <b>APEX OVERLORD: TECHNICAL MANUAL</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🔥 <b>OFFENSIVE: BREACH PROTOCOL</b>\n"
-        "• <code>/breach</code>: Generates high-value toolkit leaks.\n"
-        "• <b>AUTO:</b> AI selects resource from the elite reward pool.\n"
-        "• <b>MANUAL:</b> AI generates technical content based on your niche.\n"
-        "• <b>REACTION LOCK:</b> Force engagement by locking bonus hacks.\n\n"
-        
-        "🗓 <b>LOGISTICS: SCHEDULE SUBSYSTEM</b>\n"
-        "• <code>/schedule</code>: Set precision fire times (HH:MM AM/PM).\n"
-        "• <b>GUARDED FIRE:</b> T-60 notification sends you the draft 60 minutes before fire.\n\n"
-        
-        "📢 <b>SYNDICATE: GLOBAL BROADCAST</b>\n"
-        "• <code>/broadcast</code>: Send military-formatted alerts to the entire Family.\n\n"
-        
-        "🎯 <b>GATING: ENGAGEMENT CONTROL</b>\n"
-        "• <code>/engagement</code>: Retroactively set or update reaction targets.\n\n"
-        
-        "⚙️ <b>INTELLIGENCE: MODEL MANAGEMENT</b>\n"
-        "• <code>/model</code>: Monitor Gemini API usage (1,500 limit). Swap engines live.\n\n"
-        
-        "🛡 <b>DEFENSIVE: AUDIT & SELF-HEAL</b>\n"
-        "• <code>/audit</code>: Deep scan of database and system health.\n"
-        "• <b>HEARTBEAT:</b> Hourly status checks in the Log Channel.\n"
-        "• <b>SELF-HEAL:</b> Dead URL audit at midnight.\n\n"
-        
-        "🧪 <b>TRANSMUTATION: ALCHEMY ENGINE</b>\n"
-        "• <b>AUTO-TRANSMUTE:</b> Forward text to bot for MSANODE Protocol rewrite.\n\n"
-        
-        "📦 <b>UTILITY: VAULT COMMANDS</b>\n"
-        "• <code>/list</code>: View ID-locked inventory.\n"
-        "• <code>/backup</code>: Instant SQLite database export.\n"
-        "• <code>/edit</code>: Remote text correction via M-Code.\n"
-        "• <code>/unsend</code>: Permanent deletion of a leak.\n"
-        "• <code>/hurry</code>: FOMO countdown injection.\n"
-        "• <code>/panic</code>: Emergency kill-switch for all tasks.\n\n"
+        "🔥 <b>BREACH:</b> AI toolkit generation with X-Series Identity.\n"
+        "🗓 <b>SCHEDULE:</b> Precision fire with T-60 Fail-Safe.\n"
+        "🗑️ <b>SURGICAL DELETE:</b> Wipe X-codes from Channel & DB.\n"
+        "📢 <b>BROADCAST:</b> Pin global directives to the Syndicate.\n"
+        "⚙️ <b>MODEL:</b> Swap 2025 AI engines & track 1.5k quota.\n"
+        "🛡 <b>AUDIT:</b> Heartbeat monitoring & Self-healing scan.\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👑 <b>MASTER SADIQ DIRECTIVE:</b> Execute with precision."
+        "👑 <b>MASTER SADIQ DIRECTIVE:</b> Precision is Power."
     )
     await message.answer(guide, parse_mode=ParseMode.HTML)
 
-@dp.message(F.text == "⚙️ MODEL" or Command("usage"))
+@dp.message(or_f(F.text == "⚙️ MODEL", Command("usage")))
 async def model_info(message: types.Message):
-    # Fixed: Referenced MODEL_POOL correctly
-    curr_mod = MODEL_POOL[CURRENT_MODEL_INDEX] if 'MODEL_POOL' in globals() else "Synchronizing"
+    curr_mod = MODEL_POOL[CURRENT_MODEL_INDEX]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 SWAP ENGINE", callback_data="swap_engine")],
         [InlineKeyboardButton(text="📊 USAGE STATS", callback_data="api_usage")]
     ])
-    await message.answer(f"⚙️ <b>ENGINE:</b> <code>{curr_mod}</code>\n💎 <b>USAGE:</b> {API_USAGE_COUNT}/1500", reply_markup=kb, parse_mode=ParseMode.HTML)
+    await message.answer(
+        f"⚙️ <b>ENGINE:</b> <code>{curr_mod}</code>\n"
+        f"💎 <b>USAGE:</b> {API_USAGE_COUNT}/1500", 
+        reply_markup=kb, parse_mode=ParseMode.HTML
+    )
 
-@dp.callback_query(F.data == "api_usage")
-async def api_usage_cb(cb: types.CallbackQuery):
-    await cb.answer(f"Consumed: {API_USAGE_COUNT} | Left: {1500 - API_USAGE_COUNT}", show_alert=True)
 @dp.callback_query(F.data == "swap_engine")
 async def swap_engine_cb(cb: types.CallbackQuery):
     kb_list = [[InlineKeyboardButton(text=f"⚙️ {m}", callback_data=f"selmod_{i}")] 
                for i, m in enumerate(MODEL_POOL)]
     
-    # YOUR NEW BUTTON
     kb_list.append([InlineKeyboardButton(text="➕ ADD NEW MODE", callback_data="add_custom_mode")])
     kb_list.append([InlineKeyboardButton(text="🔙 BACK", callback_data="cancel_api")])
     
-    await cb.message.edit_text("🎯 <b>ENGINE SELECTION:</b>", 
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list), 
-                               parse_mode=ParseMode.HTML)
-    
+    await cb.message.edit_text(
+        "🎯 <b>2025 ENGINE SELECTION:</b>", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list), 
+        parse_mode=ParseMode.HTML
+    )
+
 @dp.callback_query(F.data.startswith("selmod_"))
 async def sel_model_exec(cb: types.CallbackQuery):
-    global CURRENT_MODEL_INDEX, model
+    global CURRENT_MODEL_INDEX
     idx = int(cb.data.split("_")[1])
     CURRENT_MODEL_INDEX = idx
-    # Hard-locked synchronization with Overlord persona
-    model = genai.GenerativeModel(
-        model_name=MODEL_POOL[CURRENT_MODEL_INDEX],
-        system_instruction=get_system_prompt()
-    )
+    # Synchronization with 2025 Overlord Persona is automatic in Part 3
     await cb.message.edit_text(f"✅ <b>ENGINE UPDATED:</b> <code>{MODEL_POOL[idx]}</code>", parse_mode=ParseMode.HTML)
 
-@dp.message(F.text == "📦 BACKUP" or Command("backup"))
+@dp.message(or_f(F.text == "📦 BACKUP", Command("backup")))
 async def backup_mirror(message: types.Message):
     try:
-        # Get all vault entries from MongoDB
-        vault_entries = list(col_vault.find({}, {"_id": 0}))  # Exclude MongoDB _id field
-        data = [{
-            "m_code": entry.get("m_code"),
-            "topic": entry.get("topic"),
-            "content": entry.get("content"),
-            "lock": entry.get("reaction_lock", 0)
-        } for entry in vault_entries]
-
-        json_file = io.BytesIO(json.dumps(data, indent=4).encode())
+        vault_entries = list(col_vault.find({}, {"_id": 0}))
+        json_file = io.BytesIO(json.dumps(vault_entries, indent=4, default=str).encode())
         await message.answer_document(
             BufferedInputFile(json_file.getvalue(), filename="vault_backup.json"),
             caption="🔒 <b>BACKUP MIRROR SECURED.</b>",
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
-        await message.answer(f"❌ <b>BACKUP FAILED:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML)
-
+        await message.answer(f"❌ <b>BACKUP FAILED:</b> {html.escape(str(e))}")
 # ==========================================
-# 🗄️ DATABASE COLLECTIONS (MongoDB)
+# 🗑 SURGICAL DELETE ENGINE (DATABASE & CHANNEL)
 # ==========================================
-# --- Handler for the Menu Button ---
-@dp.message(F.text == "🗑️ SURGICAL DELETE", StateFilter("*"))
-async def delete_init(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID: return
-    await state.clear()
-    await message.answer("🛠 **SURGICAL DELETE PROTOCOL**\n\nEnter the Unique Code (e.g., X10) to wipe:")
-    await state.set_state(UnsendState.waiting_id)
 
-# --- Handler to Execute the Wipe ---
-@dp.message(UnsendState.waiting_id)
-async def surgical_wipe_exec(message: types.Message, state: FSMContext):
-    target_code = message.text.upper().strip()
-    
-    # 1. Locate in Database
-    entry = col_vault.find_one({"m_code": target_code})
-    
-    if entry:
-        try:
-            # 2. Wipe from Telegram Channel
-            await bot.delete_message(CHANNEL_ID, entry.get("msg_id"))
-            t_status = "✅ Scrubbed from Channel"
-        except Exception:
-            t_status = "⚠️ Channel post not found/too old"
-        
-        # 3. Wipe from MongoDB
-        col_vault.delete_one({"m_code": target_code})
-        
-        # 4. Mirror to Private Audit Channel
-        await broadcast_audit("SURGICAL_WIPE", target_code, f"Database: DELETED | Telegram: {t_status}")
-        
-        await message.answer(f"🚀 **PURGE COMPLETE:** <code>{target_code}</code>\n{t_status}\nDatabase: <b>WIPED</b>", parse_mode="HTML")
-    else:
-        await message.answer(f"❌ **NOT FOUND:** Code <code>{target_code}</code> does not exist.", parse_mode="HTML")
-    
-    await state.clear()
-# Collections are automatically created when first used
-# 1. INITIALIZATION: Ask for the Code
+# 1. INITIALIZATION: Triggered by Menu Button
 @dp.message(F.text == "🗑️ SURGICAL DELETE", StateFilter("*"))
 async def surgical_delete_init(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
@@ -950,14 +914,14 @@ async def surgical_delete_init(message: types.Message, state: FSMContext):
     )
     await state.set_state(UnsendState.waiting_id)
 
-# 2. EXECUTION: The Double-Wipe
+# 2. EXECUTION: The Double-Wipe (Text Input)
 @dp.message(UnsendState.waiting_id)
 async def surgical_delete_exec(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
     target_code = message.text.upper().strip()
 
     try:
-        # Search in MongoDB
+        # Search in MongoDB Vault
         entry = col_vault.find_one({"m_code": target_code})
 
         if entry:
@@ -976,7 +940,8 @@ async def surgical_delete_exec(message: types.Message, state: FSMContext):
                 LOG_CHANNEL_ID, 
                 f"🗑️ <b>EMPIRE WIPE COMPLETE</b>\n"
                 f"CODE: <code>{target_code}</code>\n"
-                f"STATUS: {t_status} & Database Purged."
+                f"STATUS: {t_status} & Database Purged.",
+                parse_mode=ParseMode.HTML
             )
 
             await message.answer(
@@ -992,63 +957,59 @@ async def surgical_delete_exec(message: types.Message, state: FSMContext):
         await message.answer(f"💥 <b>CRITICAL ERROR:</b> {html.escape(str(e))}")
 
     await state.clear()
-# No need for explicit schema definitions like SQLAlchemy
+
+# 3. CALLBACK EXECUTION: The Inline Button Wipe (From Logs)
 @dp.callback_query(F.data.startswith("del_x_"))
-async def delete_record_surgical(cb: types.CallbackQuery):
+async def delete_record_surgical_callback(cb: types.CallbackQuery):
     """
-    1. Extracts the Unique Code (X1, X2...)
-    2. Deletes from MongoDB Vault
-    3. Deletes from Telegram Public Channel
-    4. Mirrors the Deletion to Audit Logs
+    Surgical removal triggered via Inline Buttons in the Audit Channel.
     """
     unique_code = cb.data.split("_")[2]
     
-    # Locate the entry in your Database
     entry = col_vault.find_one({"m_code": unique_code})
     
     if entry:
         try:
-            # surgical removal from Public Channel
             await bot.delete_message(CHANNEL_ID, entry.get("msg_id"))
             telegram_info = "Wiped from Channel"
         except Exception:
-            telegram_info = "Channel post already gone or too old"
+            telegram_info = "Channel post already gone/too old"
         
-        # Surgical removal from MongoDB
         col_vault.delete_one({"m_code": unique_code})
         
-        # Notify the Master
         await cb.answer(f"🚀 {unique_code}: FULL SYSTEM PURGE COMPLETE", show_alert=True)
         
-        # Final Audit Mirror
+        # Mirror to Private Log Channel
         await broadcast_audit("SURGICAL_DELETE", unique_code, f"Status: {telegram_info}")
         
-        # Remove the button from the Log Channel message so you don't click it twice
+        # Update the Log message to show purged status
         await cb.message.edit_text(f"🗑️ <b>RECORD PURGED:</b> <code>{unique_code}</code>", parse_mode=ParseMode.HTML)
     else:
         await cb.answer("❌ Error: Code not found in Database.")
+
 # ==========================================
-# 🔄 GLOBAL API COUNTER (MongoDB)
+# 🔄 GLOBAL API COUNTER (MongoDB Persistence)
 # ==========================================
+
 async def get_api_usage():
     try:
         stats = col_system_stats.find_one({"_id": 1})
         if not stats:
-            # Initialize if first time
             col_system_stats.insert_one({
                 "_id": 1,
                 "api_total": 0,
-                "last_reset": datetime.now()
+                "last_reset": datetime.now(IST)
             })
             return 0
         return stats.get("api_total", 0)
     except Exception as e:
         logging.error(f"Error getting API usage: {e}")
         return 0
-    
+
 # ==========================================
-# 🔥 BREACH (STABLE v6.0 - HARD LOCKED)
+# 🔥 BREACH (STABLE v6.0 - IDENTITY SYNCED)
 # ==========================================
+
 @dp.message(F.text == "🔥 BREACH")
 async def breach_start(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
@@ -1059,30 +1020,30 @@ async def breach_start(message: types.Message, state: FSMContext):
          InlineKeyboardButton(text="📝 MANUAL", callback_data="breach_manual")]
     ])
     await message.answer("🧨 <b>BREACH INITIALIZED</b>\nSelect generation mode:", reply_markup=kb, parse_mode=ParseMode.HTML)
-    await state.set_state("SELECTING_MODE")
+    await state.set_state(BreachState.selecting_mode)
 
 @dp.callback_query(F.data.startswith("breach_"))
 async def breach_mode_select(cb: types.CallbackQuery, state: FSMContext):
     mode = cb.data.split("_")[1]
     if mode == "manual":
         await cb.message.edit_text("🎯 <b>TARGET:</b> Enter your niche/topic:", parse_mode=ParseMode.HTML)
-        await state.set_state("WAITING_TOPIC")
+        await state.set_state(BreachState.waiting_topic)
     else:
         await cb.message.edit_text("🔍 <b>SYNTHESIZING...</b>", parse_mode=ParseMode.HTML)
         content, topic = await generate_content()
         await state.update_data(content=content, topic=topic)
         await cb.message.answer("🔥 <b>REACTION LOCK:</b> Enter target count (0 to skip):", parse_mode=ParseMode.HTML)
-        await state.set_state("WAITING_REACTION_COUNT")
+        await state.set_state(BreachState.waiting_reaction_count)
 
-@dp.message(StateFilter("WAITING_TOPIC"))
+@dp.message(BreachState.waiting_topic)
 async def breach_manual_topic(message: types.Message, state: FSMContext):
     await message.answer("🔍 <b>SYNTHESIZING...</b>", parse_mode=ParseMode.HTML)
     content, topic = await generate_content(message.text)
     await state.update_data(content=content, topic=topic)
     await message.answer("🔥 <b>REACTION LOCK:</b> Enter target count (0 to skip):", parse_mode=ParseMode.HTML)
-    await state.set_state("WAITING_REACTION_COUNT")
+    await state.set_state(BreachState.waiting_reaction_count)
 
-@dp.message(StateFilter("WAITING_REACTION_COUNT"))
+@dp.message(BreachState.waiting_reaction_count)
 async def breach_final_count(message: types.Message, state: FSMContext):
     raw_text = message.text.strip()
     if not raw_text.isdigit():
@@ -1106,54 +1067,61 @@ async def breach_final_count(message: types.Message, state: FSMContext):
     
     await message.answer(preview, reply_markup=kb, parse_mode=ParseMode.HTML)
     await state.set_state("BREACH_PREVIEW_STATE")
-
+    
 # ==========================================
-# 🔥 BREACH EXECUTION (MIRROR DEPTH v13.0)
+# 🔥 BREACH EXECUTION (MIRROR DEPTH v13.0 - REINFORCED)
 # ==========================================
 
 @dp.callback_query(F.data == "fire_final")
 async def fire_final(cb: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     
-    # 1. Sequential Identity Generation
-    m_code = await get_next_m_code() 
+    # 1. 2025 Sequential Identity Generation (X-Series)
+    m_code = await get_next_x_code() 
     
-    # 2. Temporal Precision Capture
-    now = datetime.now()
+    # 2. Temporal Precision Capture (IST Locked)
+    now = datetime.now(IST)
     fire_time = now.strftime("%I:%M:%S %p")
     fire_date = now.strftime("%d-%m-%Y")
     
     try:
         # 3. Public Deployment (Main Channel)
+        # Identity is tagged with the new X-code
         vault_msg = await bot.send_message(
             CHANNEL_ID, 
             data['content'], 
             parse_mode=ParseMode.HTML, 
-            reply_markup=get_engagement_markup(m_code, data['reaction_lock'])
+            reply_markup=get_engagement_markup(m_code, data.get('reaction_lock', 0))
         )
         
         # 4. Persistence to MongoDB Ledger
         col_vault.insert_one({
             "m_code": m_code,
             "msg_id": vault_msg.message_id,
-            "topic": data['topic'],
+            "topic": data.get('topic', 'General'),
             "content": data['content'],
-            "reaction_lock": data['reaction_lock'],
-            "is_unlocked": False,
+            "reaction_lock": data.get('reaction_lock', 0),
+            "is_unlocked": (data.get('reaction_lock', 0) == 0),
             "created_at": now,
             "last_verified": now
         })
             
-        # 5. FULL MIRROR TO PRIVATE LOG CHANNEL (The Fix)
-        # This sends the EXACT Vault content followed by technical metadata
+        # 5. SURGICAL MIRROR TO LOG CHANNEL
+        # Includes technical metadata and the Surgical Delete button
+        audit_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🗑️ SURGICAL DELETE ({m_code})", callback_data=f"del_x_{m_code}")]
+        ])
+
         log_payload = (
+            f"<b>◈ BREACH DEPLOYED ◈</b>\n"
+            f"────────────────────\n\n"
             f"{data['content']}\n\n"
             f"────────────────────\n"
             f"📊 <b>DEPLOYMENT METADATA</b>\n"
             f"CODE: <code>{m_code}</code>\n"
             f"TIME: <code>{fire_time}</code>\n"
             f"DATE: <code>{fire_date}</code>\n"
-            f"GATING: <code>{data['reaction_lock']}x</code> Reactions\n"
+            f"GATING: <code>{data.get('reaction_lock', 0)}x</code> 🔥\n"
             f"STATUS: <b>VERIFIED BREACH</b>\n"
             f"────────────────────"
         )
@@ -1161,6 +1129,7 @@ async def fire_final(cb: types.CallbackQuery, state: FSMContext):
         await bot.send_message(
             LOG_CHANNEL_ID, 
             log_payload, 
+            reply_markup=audit_kb, # <-- Delete button attached to log
             parse_mode=ParseMode.HTML
         )
         
@@ -1178,40 +1147,69 @@ async def fire_final(cb: types.CallbackQuery, state: FSMContext):
         
     except Exception as e:
         error_info = html.escape(str(e))
-        await cb.message.answer(f"❌ <b>MIRROR FAILURE:</b> <code>{error_info}</code>")
-        console_out(f"Mirror Error: {error_info}")
-# ==========================================
+        await cb.message.answer(f"❌ <b>DEPLOYMENT FAILURE:</b> <code>{error_info}</code>")
+        console_out(f"Execution Error: {error_info}")
+
 # ==========================================
 # 📋 LIST / AUDIT (STATE INDEPENDENT)
 # ==========================================
+
 @dp.message(F.text == "📋 LIST", StateFilter("*"))
 async def list_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
-    # This line clears any "stuck" state automatically
+    
+    # Flush stuck states automatically
     await state.clear()
+    
     try:
-        # Get all vault entries from MongoDB, sorted by creation date
-        entries = list(col_vault.find().sort("created_at", -1))
-        # Stability Shield: HTML Formatting for clean terminal aesthetics
-        rep = "<b>📋 INVENTORY</b>\n" + "\n".join([f"🆔 <code>{entry.get('m_code')}</code> | 🔥 {entry.get('reaction_lock', 0)}x" for entry in entries])
-        await message.answer(rep if entries else "📭 Empty.", parse_mode=ParseMode.HTML)
+        # Pull entries from MongoDB sorted by recency
+        entries = list(col_vault.find().sort("created_at", -1).limit(20))
+        
+        if not entries:
+            await message.answer("📭 <b>INVENTORY EMPTY</b>", parse_mode=ParseMode.HTML)
+            return
+
+        inventory_list = []
+        for entry in entries:
+            code = entry.get('m_code')
+            lock = entry.get('reaction_lock', 0)
+            status = "🔓" if entry.get('is_unlocked') else "🔒"
+            inventory_list.append(f"🆔 <code>{code}</code> | {status} {lock}x 🔥")
+
+        rep = "<b>📋 CURRENT INVENTORY (LAST 20)</b>\n────────────────────\n" + "\n".join(inventory_list)
+        
+        await message.answer(rep, parse_mode=ParseMode.HTML)
     except Exception as e:
         await message.answer(f"❌ <b>LIST ERROR:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML)
 
 @dp.message(F.text == "📊 AUDIT", StateFilter("*"))
 async def audit_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
-    # Clear state so you can use the bot again immediately
     await state.clear()
+    
     try:
-        total = col_vault.count_documents({})
-        # Pull real-time API usage from global counter
-        await message.answer(f"📊 <b>AUDIT:</b> {total} entries. API Usage: {API_USAGE_COUNT}/1500.", parse_mode=ParseMode.HTML)
+        total_vault = col_vault.count_documents({})
+        active_schedules = col_schedules.count_documents({})
+        
+        # Mirror current API usage safe count
+        api_usage = await get_api_usage_safe()
+        
+        text = (
+            "<b>📊 SYSTEM AUDIT REPORT</b>\n"
+            "────────────────────\n"
+            f"VAULT ENTRIES: <code>{total_vault}</code>\n"
+            f"ACTIVE SCHED: <code>{active_schedules}</code>\n"
+            f"API QUOTA: <code>{api_usage}/1500</code>\n"
+            "────────────────────\n"
+            "STATUS: <b>NOMINAL</b>"
+        )
+        await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception as e:
         await message.answer(f"❌ <b>AUDIT ERROR:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        
 
 # ==========================================
-# 🗓 SCHEDULE HELPERS (DEFINED FIRST)
+# 🗓 SCHEDULE HELPERS (IST SYNCHRONIZED)
 # ==========================================
 
 async def get_days_kb(selected):
@@ -1219,7 +1217,6 @@ async def get_days_kb(selected):
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     buttons = []; row = []
     for i, d in enumerate(days):
-        # Tick for selected, Cross for unselected
         text = f"✅ {d}" if i in selected else f"❌ {d}"
         row.append(InlineKeyboardButton(text=text, callback_data=f"toggle_{i}"))
         if len(row) == 3: buttons.append(row); row = []
@@ -1228,7 +1225,7 @@ async def get_days_kb(selected):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def show_days_keyboard(message, selected):
-    """Initializes the days menu."""
+    """Initializes the days menu for deployment."""
     kb = await get_days_kb(selected)
     await message.answer(
         "📅 <b>SELECT DEPLOYMENT DAYS</b>\n"
@@ -1238,7 +1235,7 @@ async def show_days_keyboard(message, selected):
     )
 
 # ==========================================
-# 🗓 SCHEDULE HANDLERS (PRIORITY ANCHORED)
+# 🗓 SCHEDULE HANDLERS (X-SERIES INTEGRATED)
 # ==========================================
 
 @dp.message(or_f(F.text.contains("SCHEDULE"), Command("schedule")), StateFilter("*"))
@@ -1292,6 +1289,9 @@ async def toggle_day(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "days_done", ScheduleState.selecting_days)
 async def days_finished(cb: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    if not data.get('selected_days'):
+        await cb.answer("⚠️ Select at least one day!", show_alert=True)
+        return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 LOCK PROTOCOL", callback_data="sched_lock")]])
     await cb.message.edit_text(
         f"📋 <b>SCHEDULE SUMMARY</b>\n"
@@ -1305,49 +1305,44 @@ async def days_finished(cb: types.CallbackQuery, state: FSMContext):
 async def sched_lock(cb: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     
-    # [!] CHANGE: Ensure this also uses sequential numbering
-    m_code = await get_next_m_code()
+    # 1. 2025 Identity Sync: X-Series Generation
+    m_code = await get_next_x_code()
     
-    # ... rest of your cron/scheduling logic ...
     day_map = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
     cron_days = ",".join([day_map[i] for i in data['selected_days']])
     
+    # Time Conversion
     dt_fire = datetime.strptime(data['time'], "%I:%M %p")
-    now = datetime.now()
+    now = datetime.now(IST)
     fire_today = now.replace(hour=dt_fire.hour, minute=dt_fire.minute, second=0, microsecond=0)
     time_diff = (fire_today - now).total_seconds() / 60
 
-    # 1. SETUP RECURRING JOBS
+    # 2. SETUP RECURRING JOBS (T-60 & T-0)
     review_hour = dt_fire.hour - 1 if dt_fire.hour > 0 else 23
-    scheduler.add_job(trigger_review, CronTrigger(day_of_week=cron_days, hour=review_hour, minute=dt_fire.minute), args=[m_code, data['time']])
-    scheduler.add_job(execute_guarded_fire, CronTrigger(day_of_week=cron_days, hour=dt_fire.hour, minute=dt_fire.minute), args=[m_code])
+    scheduler.add_job(trigger_review, CronTrigger(day_of_week=cron_days, hour=review_hour, minute=dt_fire.minute, timezone=IST), args=[m_code, data['time']])
+    scheduler.add_job(execute_guarded_fire, CronTrigger(day_of_week=cron_days, hour=dt_fire.hour, minute=dt_fire.minute, timezone=IST), args=[m_code])
 
-    # 2. HYBRID INTELLIGENT LOGIC
+    # 3. HYBRID LOGIC: Check if fire time is imminent
     today_short = now.strftime("%a").lower()
     if today_short in cron_days and 0 < time_diff <= 60:
-        # PATH A: FIRE AT SCHEDULED TIME (NO PERMISSION NEEDED)
-        # Store in PENDING with 'confirmed' already True
         content, topic = await generate_content()
-        PENDING_APPROVALS[m_code] = {"content": content, "topic": topic, "confirmed": True, "target": data['time']}
-        await cb.message.edit_text(f"⚡ <b>DIRECT FIRE ARMED:</b> Window under 60m. Bot will fire at <code>{data['time']}</code> automatically.", parse_mode=ParseMode.HTML)
+        PENDING_APPROVALS[m_code] = {"content": content, "topic": topic, "confirmed": True, "target": data['time'], "integrity": "PASSED"}
+        await cb.message.edit_text(f"⚡ <b>DIRECT FIRE ARMED:</b> Window under 60m. Bot will fire <code>{m_code}</code> at <code>{data['time']}</code> automatically.", parse_mode=ParseMode.HTML)
     else:
-        # PATH B: GUARDED (CONFIRMATION REQUIRED AT T-60)
-        await cb.message.edit_text(f"💎 <b>PROTOCOL SECURED:</b> I will ask for confirmation 60m before <code>{data['time']}</code>.", parse_mode=ParseMode.HTML)
+        await cb.message.edit_text(f"💎 <b>PROTOCOL SECURED:</b> <code>{m_code}</code> locked. I will ask for confirmation 60m before <code>{data['time']}</code>.", parse_mode=ParseMode.HTML)
     
     await state.clear()
 
 # ==========================================
-# 🚀 BACKGROUND EXECUTION (INTELLIGENCE)
+# 🚀 FAIL-SAFE BACKGROUND EXECUTION
 # ==========================================
-# --- STEP 1: Add to your PENDING_APPROVALS logic ---
+
 async def trigger_review(m_code, target_time):
-    """T-60m: Generates content and asks for confirmation."""
-    # 2025 AI Client generation
-    response = client.models.generate_content(model=MODEL_ID, contents="Generate MSANODE AI Breach")
-    content = response.text
+    """T-60m: Generates content and initiates Pre-Flight Integrity Check."""
+    content, topic = await generate_content()
     
-    # INTEGRITY CHECK
-    integrity = "PASSED" if len(content) > 150 else "FAILED"
+    # Integrity Check: Reject empty or error responses
+    integrity = "PASSED" if len(content) > 150 and "System Error" not in content else "FAILED"
     
     PENDING_APPROVALS[m_code] = {
         "content": content, "confirmed": False, 
@@ -1367,29 +1362,30 @@ async def trigger_review(m_code, target_time):
         reply_markup=kb, parse_mode=ParseMode.HTML)
 
 async def execute_guarded_fire(m_code):
-    """T-0: Checks integrity and fires automatically if missed."""
+    """T-0: The Precision Trigger. Checks integrity and fires automatically."""
     if m_code in PENDING_APPROVALS:
         task = PENDING_APPROVALS[m_code]
         
-        # AUTO-FIRE: If I missed it BUT integrity is PASSED, fire anyway.
+        # AUTO-FIRE LOGIC: Proceed if confirmed OR if integrity is passed despite missed interaction
         if task["confirmed"] or task["integrity"] == "PASSED":
             msg = await bot.send_message(CHANNEL_ID, task['content'], 
                                          reply_markup=get_engagement_markup(m_code))
             
+            # Persistent Mirror to Vault
             col_vault.insert_one({
                 "m_code": m_code, "msg_id": msg.message_id, "content": task['content'],
-                "created_at": datetime.now()
+                "created_at": datetime.now(IST), "is_unlocked": False
             })
-            await broadcast_audit("AUTO_FIRE", m_code, "Fired via Fail-Safe (Integrity PASSED)")
+            await broadcast_audit("AUTO_FIRE", m_code, f"Target: {task['target']} | Status: Success")
         else:
-            await bot.send_message(OWNER_ID, f"❌ <b>FIRE ABORTED:</b> {m_code} failed pre-flight.")
+            await bot.send_message(OWNER_ID, f"❌ <b>FIRE ABORTED:</b> <code>{m_code}</code> failed pre-flight or manual override.")
+            await broadcast_audit("FIRE_ABORT", m_code, "Reason: Integrity/Confirmation Failure")
         
         del PENDING_APPROVALS[m_code]
 # ==========================================
-# ✏️ REMOTE EDIT (REINFORCED PRIORITY)
+# ✏️ REMOTE EDIT (X-SERIES REINFORCED)
 # ==========================================
 
-# Using or_f to catch "✏️ EDIT", "EDIT", or "/edit"
 @dp.message(or_f(F.text.contains("EDIT"), Command("edit")), StateFilter("*"))
 async def edit_init(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
@@ -1399,34 +1395,37 @@ async def edit_init(message: types.Message, state: FSMContext):
     
     await message.answer(
         "📝 <b>EDIT MODE ACTIVATED</b>\n"
-        "Enter the <b>M-Code</b> of the post to modify (e.g., M1):", 
+        "────────────────────\n"
+        "Enter the <b>Unique Code</b> (e.g., X1) to modify:", 
         parse_mode=ParseMode.HTML
     )
     await state.set_state(EditState.waiting_id)
 
 @dp.message(EditState.waiting_id)
 async def edit_id_received(message: types.Message, state: FSMContext):
-    # Standardize input
+    # Standardize input for X-Series compatibility
     m_code = message.text.upper().strip()
 
     try:
-        # Check database before proceeding
+        # Check MongoDB Vault for identity match
         entry = col_vault.find_one({"m_code": m_code})
 
         if entry:
             await state.update_data(edit_code=m_code, msg_id=entry.get("msg_id"))
+            current_text = entry.get('content', '')[:150]
+            
             await message.answer(
                 f"🔍 <b>ENTRY FOUND:</b> <code>{m_code}</code>\n"
                 f"────────────────────\n"
                 f"<b>CURRENT CONTENT:</b>\n"
-                f"<code>{html.escape(entry.get('content', '')[:150])}...</code>\n"
+                f"<code>{html.escape(current_text)}...</code>\n"
                 f"────────────────────\n"
                 f"📥 <b>Enter the NEW content for this post:</b>",
                 parse_mode=ParseMode.HTML
             )
             await state.set_state(EditState.waiting_text)
         else:
-            await message.answer(f"❌ <b>ERROR:</b> M-Code <code>{m_code}</code> not found in Vault.")
+            await message.answer(f"❌ <b>ERROR:</b> Code <code>{m_code}</code> not found.")
             await state.clear()
     except Exception as e:
         await message.answer(f"❌ <b>DATABASE ERROR:</b> {html.escape(str(e))}")
@@ -1434,14 +1433,16 @@ async def edit_id_received(message: types.Message, state: FSMContext):
 
 @dp.message(EditState.waiting_text)
 async def edit_exec(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID: return
+    
     data = await state.get_data()
     m_code = data['edit_code']
     msg_id = data['msg_id']
     new_content = message.text
 
     try:
-        # 1. Update the physical message in the Telegram Channel
-        # We preserve the original reaction lock buttons
+        # 1. Update physical message in the Telegram Channel
+        # Preserves the original gating markup
         await bot.edit_message_text(
             text=new_content,
             chat_id=CHANNEL_ID,
@@ -1450,44 +1451,38 @@ async def edit_exec(message: types.Message, state: FSMContext):
             reply_markup=get_engagement_markup(m_code)
         )
 
-        # 2. Update MongoDB
+        # 2. Update MongoDB Record
         col_vault.update_one(
             {"m_code": m_code},
-            {"$set": {"content": new_content}}
+            {"$set": {"content": new_content, "last_edited": datetime.now(IST)}}
         )
 
-        await message.answer(f"🚀 <b>SUCCESS:</b> Intelligence <code>{m_code}</code> updated in channel and database.")
-        console_out(f"System Edit: {m_code} transmuted.")
+        await message.answer(f"🚀 <b>SUCCESS:</b> Intelligence <code>{m_code}</code> transmuted.")
+        console_out(f"System Edit: {m_code} updated.")
 
     except Exception as e:
-        # Error handling for messages older than 48 hours
+        # Failsafe for messages > 48hrs (Telegram API Limit)
         await message.answer(f"❌ <b>EDIT FAILED:</b> {html.escape(str(e))}")
 
     await state.clear()
+
 # ==========================================
-# [!] BROADCAST LOGIC (PRIORITY ANCHORED)
+# 📢 SYNDICATE BROADCAST (TELEMETRY MIRRORED)
 # ==========================================
 
 @dp.message(or_f(F.text.contains("BROADCAST"), Command("broadcast")), StateFilter("*"))
 async def broadcast_init(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
-    
-    # 1. Clear any stuck states
     await state.clear() 
-    
-    # 2. Set state immediately
     await state.set_state(BroadcastState.waiting_msg)
     
     await message.answer(
-        "<b>[-] SYNDICATE BROADCAST</b>\n"
+        "<b>◈ SYNDICATE BROADCAST ◈</b>\n"
+        "────────────────────\n"
         "Enter your directive for the Family:", 
         parse_mode=ParseMode.HTML
     )
 
-# CRITICAL: This handler MUST come before any general text handlers
-# ==========================================
-# 📢 SYNDICATE BROADCAST (TELEMETRY SYNCED)
-# ==========================================
 async def broadcast_audit(action: str, code: str, details: str = "N/A"):
     """Surgical Audit mirroring to Private LOG_CHANNEL."""
     log_text = (
@@ -1501,45 +1496,41 @@ async def broadcast_audit(action: str, code: str, details: str = "N/A"):
         f"━━━━━━━━━━━━━━━━━━━━"
     )
     await bot.send_message(LOG_CHANNEL_ID, log_text, parse_mode=ParseMode.HTML)
-    # Also log to internal console
     console_out(f"Audit: {action} | {code}")
+
 @dp.message(BroadcastState.waiting_msg)
 async def broadcast_exec(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
     
-    # 1. Check for Cancellation
+    # Emergency Abort Check
     if message.text in ["🛑 PANIC", "/cancel"]:
         await state.clear()
         await message.answer("<b>[!] BROADCAST ABORTED.</b>", parse_mode=ParseMode.HTML)
         return
 
-    # 2. Construct Technical Template
-    # We wrap your input in the Syndicate styling
+    # Construct Overlord Technical Template
     formatted_payload = (
         "<b>◈ MSANODE SYNDICATE ◈</b>\n"
         "────────────────────\n\n"
         f"{html.escape(message.text)}\n\n"
         "────────────────────\n"
         "<b>DIRECTIVE FROM MASTER SADIQ</b>\n"
-        "<i>\"Family: Execute with precision. Action is our only currency.\"</i>\n"
+        "<i>\"Family: Execute with precision. Action is our currency.\"</i>\n"
         "────────────────────"
     )
     
-    # 3. Public Deployment
     try:
-        # Use our safe_send_message protocol
         sent_msg = await safe_send_message(CHANNEL_ID, formatted_payload)
         
         if sent_msg:
-            # Attempt to Pin the Directive
+            # Automatic Pinning for Maximum Visibility
             try:
                 await bot.pin_chat_message(CHANNEL_ID, sent_msg.message_id)
                 pin_status = "SENT AND PINNED"
             except:
                 pin_status = "SENT (PIN FAILED)"
             
-            # 4. MIRROR TO PRIVATE LOG CHANNEL (Fixed & Unified)
-            # This ensures your command center tracks the global broadcast
+            # mirror to Private Log Channel
             await bot.send_message(
                 LOG_CHANNEL_ID, 
                 f"📢 <b>GLOBAL BROADCAST MIRROR</b>\n"
@@ -1550,48 +1541,62 @@ async def broadcast_exec(message: types.Message, state: FSMContext):
             )
             
             await message.answer(f"<b>[+] DIRECTIVE {pin_status}.</b>", parse_mode=ParseMode.HTML)
-            console_out(f"Global Broadcast: {pin_status}")
-            
+            console_out(f"Broadcast: {pin_status}")
         else:
             await message.answer("<b>[!] ERROR:</b> Public deployment failed.")
             
     except Exception as e:
         await message.answer(f"<b>[!] CRITICAL:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML)
     
-    # Finalize and return to Standby
     await state.clear()
 
 # ==========================================
-# [!] UNSEND PROTOCOL (SCRUB DELETION)
+# 🗑 UNSEND PROTOCOL (SURGICAL SCRUB)
 # ==========================================
-@dp.message(F.text == "UNSEND", StateFilter("*"))
+
+@dp.message(F.text == "🗑 UNSEND", StateFilter("*"))
 @dp.message(Command("unsend"), StateFilter("*"))
 async def unsend_init(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
     await state.clear()
-    await message.answer("[-] UNSEND INITIATED\nEnter the M-Code to scrub from existence:")
+    await message.answer(
+        "🗑 <b>UNSEND INITIATED</b>\n"
+        "Enter the <b>Unique Code</b> (X-Series) to scrub from existence:", 
+        parse_mode=ParseMode.HTML
+    )
     await state.set_state(UnsendState.waiting_id)
 
 @dp.message(UnsendState.waiting_id)
 async def unsend_exec(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
-    m_code = message.text.upper()
+    target_code = message.text.upper().strip()
 
     try:
-        entry = col_vault.find_one({"m_code": m_code})
+        # Locate identity in MongoDB
+        entry = col_vault.find_one({"m_code": target_code})
 
         if entry:
             try:
+                # Surgical removal from Public Channel
                 await bot.delete_message(CHANNEL_ID, entry.get("msg_id"))
                 t_status = "Scrubbed from Channel"
             except Exception:
-                t_status = "Telegram scrub failed (Message may be too old)"
+                t_status = "Telegram scrub failed (Post too old)"
 
-            col_vault.delete_one({"m_code": m_code})
+            # Permanent purge from Database
+            col_vault.delete_one({"m_code": target_code})
 
-            await message.answer(f"<b>[+] SCRUB COMPLETE</b>\nID: <code>{m_code}</code>\nStatus: {t_status} and Database.", parse_mode=ParseMode.HTML)
+            # Mirror to Private Log Channel
+            await broadcast_audit("SURGICAL_SCRUB", target_code, f"Status: {t_status}")
+
+            await message.answer(
+                f"<b>[+] SCRUB COMPLETE</b>\n"
+                f"ID: <code>{target_code}</code>\n"
+                f"Status: {t_status} and Database Purged.", 
+                parse_mode=ParseMode.HTML
+            )
         else:
-            await message.answer(f"<b>[!] NOT FOUND:</b> <code>{m_code}</code> is not in the system.", parse_mode=ParseMode.HTML)
+            await message.answer(f"<b>[!] NOT FOUND:</b> <code>{target_code}</code> is not in the system.", parse_mode=ParseMode.HTML)
 
     except Exception as e:
         await message.answer(f"<b>[!] SCRUB ERROR:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML)
@@ -1599,34 +1604,45 @@ async def unsend_exec(message: types.Message, state: FSMContext):
     await state.clear()
 
 # ==========================================
-# [!] ALCHEMY (UNTOUCHED foundation)
+# 🧪 ALCHEMY ENGINE (2025 SDK TRANSMUTATION)
+# ==========================================
+
 @dp.message(F.text & F.forward_from_chat)
 async def alchemy_engine(message: types.Message):
     if message.from_user.id != OWNER_ID: return
-    await message.answer("[-] Alchemy: Transmuting intelligence...")
+    await message.answer("<b>[-] Alchemy: Transmuting intelligence...</b>", parse_mode=ParseMode.HTML)
+    
+    # Transmutation via 2025 AI Client
     content = await alchemy_transform(message.text)
-    # Transmuted content delivered via HTML stability
-    await bot.send_message(OWNER_ID, f"<b>[+] TRANSFORMED:</b>\n\n{content}", parse_mode=ParseMode.HTML)
+    
+    await bot.send_message(
+        OWNER_ID, 
+        f"<b>◈ TRANSMUTED INTELLIGENCE ◈</b>\n\n{content}", 
+        parse_mode=ParseMode.HTML
+    )
+
 # ==========================================
-# 🚨 UNBLOCKABLE EMERGENCY OVERRIDE
+# 🚨 EMERGENCY OVERRIDE (PANIC RESET)
 # ==========================================
+
 @dp.message(StateFilter("*"), lambda m: m.text and "PANIC" in m.text.upper())
 @dp.message(Command("cancel"), StateFilter("*"))
 async def global_panic_handler(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
 
-    # 1. Force clear all stuck AI processes or states
+    # 1. Force clear all stuck AI processes or FSM states
     await state.clear()
     
-    # 2. Re-create the menu manually (No function needed)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📄 Generate PDF"), KeyboardButton(text="🔗 Get Link")],
-            [KeyboardButton(text="📋 Show Library"), KeyboardButton(text="📊 Storage Info")],
-            [KeyboardButton(text="🗑 Remove PDF"), KeyboardButton(text="💎 Elite Help")]
-        ],
-        resize_keyboard=True
-    )
+    # 2. Restore Correct Bot 5 Tactical Menu (Fixed from Part 7)
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🔥 BREACH"), KeyboardButton(text="🗓 SCHEDULE")], 
+        [KeyboardButton(text="✏️ EDIT"), KeyboardButton(text="🗑️ SURGICAL DELETE")], 
+        [KeyboardButton(text="📋 LIST"), KeyboardButton(text="🎯 ENGAGEMENT")],
+        [KeyboardButton(text="📢 BROADCAST"), KeyboardButton(text="🔑 API")], 
+        [KeyboardButton(text="⚙️ MODEL"), KeyboardButton(text="📊 AUDIT")], 
+        [KeyboardButton(text="📟 TERMINAL"), KeyboardButton(text="❓ GUIDE")],
+        [KeyboardButton(text="🛑 PANIC")]
+    ], resize_keyboard=True)
     
     await message.answer(
         "🚨 <b>SYSTEM-WIDE RESET SUCCESSFUL</b>\n"
@@ -1636,35 +1652,36 @@ async def global_panic_handler(message: types.Message, state: FSMContext):
         "────────────────────\n"
         "Infrastructure restored to Home Protocol.",
         reply_markup=kb,
-        parse_mode="HTML"
+        parse_mode=ParseMode.HTML
     )
     
-    print(f"◈ ALERT: Panic Reset executed via sh.py")
-# ==========================================
-# [!] MAIN LOOP
-# ==========================================
-async def main():
-    # MongoDB connection is already established in connect_db()
+    console_out("◈ ALERT: Panic Reset executed by Master Sadiq.")
 
-    # Scheduler Synchronization
-    scheduler.add_job(hourly_heartbeat, 'interval', hours=1)
-    scheduler.add_job(self_healing_audit, 'cron', hour=0, minute=0)
+# ==========================================
+# 🚀 SUPREME STARTUP (MAIN LOOP)
+# ==========================================
+
+async def main():
+    # 1. Synchronize Background Tasks
+    scheduler.add_job(hourly_heartbeat, 'interval', hours=1, timezone=IST)
+    scheduler.add_job(self_healing_audit, 'cron', hour=0, minute=0, timezone=IST)
     scheduler.start()
 
-    print("◈ SINGULARITY APEX ONLINE")
+    console_out("◈ SINGULARITY APEX ONLINE")
 
     try:
         await bot.send_message(OWNER_ID, "<b>[+] Singularity Online. Persistent & Failover Active.</b>", parse_mode=ParseMode.HTML)
     except Exception as e:
         print(f"Startup notification failed: {e}")
 
-    # Polling Loop with Fail-Safe Sleep
+    # 2. Polling Loop with Fail-Safe Restart
     while True:
         try:
-            await dp.start_polling(bot)
+            await dp.start_polling(bot, skip_updates=True)
         except Exception as e:
-            print(f"Polling error: {e}")
+            console_out(f"Polling Error: {e}")
             await asyncio.sleep(5)
+
 # --- RENDER PORT BINDER (SHIELD) ---
 async def handle_health(request):
     return web.Response(text="CORE 5 (AI SINGULARITY) IS ACTIVE")
@@ -1677,29 +1694,18 @@ def run_health_server():
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"📡 Health Server Note: {e}")
-# ==========================================
-# 🚀 THE SUPREME STARTUP (THE FIX)
-# ==========================================
+
 if __name__ == "__main__":
-    print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 5 (AI SINGULARITY)")
+    print("🚀 STARTING CORE 5: AI SINGULARITY")
     
-    # 1. Start the Health Server in a background thread
-    # This stops the "No open ports detected" error immediately
+    # Start Health Server in background thread for Render stability
     threading.Thread(target=run_health_server, daemon=True).start()
     
-    # 2. Launch the AI Singularity main loop
     try:
-        # Buffer to allow port binding to stabilize
-        time.sleep(2) 
+        time.sleep(2) # Buffer for port binding
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Bot 5 Shutdown.")
     except Exception as e:
-        # This will show us EXACTLY why the bot crashed in Render logs
         print(f"💥 CRITICAL STARTUP ERROR: {e}")
-        import traceback
         traceback.print_exc()
-
-
-
-
