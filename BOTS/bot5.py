@@ -901,25 +901,132 @@ async def backup_mirror(message: types.Message):
 # ==========================================
 # 🗄️ DATABASE COLLECTIONS (MongoDB)
 # ==========================================
-# Collections are automatically created when first used
-# No need for explicit schema definitions like SQLAlchemy
-@dp.callback_query(F.data.startswith("del_x_"))
-async def delete_record_surgical(cb: types.CallbackQuery):
-    """Deletes record from DB and Channel using the Unique Code."""
-    code = cb.data.split("_")[2]
-    entry = col_vault.find_one({"m_code": code})
+# --- Handler for the Menu Button ---
+@dp.message(F.text == "🗑️ SURGICAL DELETE", StateFilter("*"))
+async def delete_init(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID: return
+    await state.clear()
+    await message.answer("🛠 **SURGICAL DELETE PROTOCOL**\n\nEnter the Unique Code (e.g., X10) to wipe:")
+    await state.set_state(UnsendState.waiting_id)
+
+# --- Handler to Execute the Wipe ---
+@dp.message(UnsendState.waiting_id)
+async def surgical_wipe_exec(message: types.Message, state: FSMContext):
+    target_code = message.text.upper().strip()
+    
+    # 1. Locate in Database
+    entry = col_vault.find_one({"m_code": target_code})
     
     if entry:
         try:
+            # 2. Wipe from Telegram Channel
             await bot.delete_message(CHANNEL_ID, entry.get("msg_id"))
-        except: pass # Message too old or already gone
+            t_status = "✅ Scrubbed from Channel"
+        except Exception:
+            t_status = "⚠️ Channel post not found/too old"
         
-        col_vault.delete_one({"m_code": code})
-        await broadcast_audit("SURGICAL_DELETE", code, "Record purged from Vault and Channel.")
-        await cb.answer(f"🗑️ Purged: {code}", show_alert=True)
-        await cb.message.delete()
+        # 3. Wipe from MongoDB
+        col_vault.delete_one({"m_code": target_code})
+        
+        # 4. Mirror to Private Audit Channel
+        await broadcast_audit("SURGICAL_WIPE", target_code, f"Database: DELETED | Telegram: {t_status}")
+        
+        await message.answer(f"🚀 **PURGE COMPLETE:** <code>{target_code}</code>\n{t_status}\nDatabase: <b>WIPED</b>", parse_mode="HTML")
     else:
-        await cb.answer("❌ Record not found in Vault.")
+        await message.answer(f"❌ **NOT FOUND:** Code <code>{target_code}</code> does not exist.", parse_mode="HTML")
+    
+    await state.clear()
+# Collections are automatically created when first used
+# 1. INITIALIZATION: Ask for the Code
+@dp.message(F.text == "🗑️ SURGICAL DELETE", StateFilter("*"))
+async def surgical_delete_init(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID: return
+    await state.clear()
+    await message.answer(
+        "🗑️ <b>SURGICAL DELETE ACTIVATED</b>\n"
+        "────────────────────\n"
+        "Enter the <b>Unique Code</b> (e.g., X1, X5) to wipe from existence:", 
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(UnsendState.waiting_id)
+
+# 2. EXECUTION: The Double-Wipe
+@dp.message(UnsendState.waiting_id)
+async def surgical_delete_exec(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID: return
+    target_code = message.text.upper().strip()
+
+    try:
+        # Search in MongoDB
+        entry = col_vault.find_one({"m_code": target_code})
+
+        if entry:
+            # surgical removal from Telegram Channel
+            try:
+                await bot.delete_message(CHANNEL_ID, entry.get("msg_id"))
+                t_status = "✅ Scrubbed from Channel"
+            except Exception:
+                t_status = "⚠️ Channel Deletion Failed (Too old)"
+
+            # Surgical removal from MongoDB
+            col_vault.delete_one({"m_code": target_code})
+
+            # Mirror to Private Log Channel
+            await bot.send_message(
+                LOG_CHANNEL_ID, 
+                f"🗑️ <b>EMPIRE WIPE COMPLETE</b>\n"
+                f"CODE: <code>{target_code}</code>\n"
+                f"STATUS: {t_status} & Database Purged."
+            )
+
+            await message.answer(
+                f"🚀 <b>PURGE SUCCESSFUL</b>\n"
+                f"ID: <code>{target_code}</code>\n"
+                f"Status: {t_status} and Database.", 
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await message.answer(f"❌ <b>ERROR:</b> Code <code>{target_code}</code> not found in Vault.")
+
+    except Exception as e:
+        await message.answer(f"💥 <b>CRITICAL ERROR:</b> {html.escape(str(e))}")
+
+    await state.clear()
+# No need for explicit schema definitions like SQLAlchemy
+@dp.callback_query(F.data.startswith("del_x_"))
+async def delete_record_surgical(cb: types.CallbackQuery):
+    """
+    1. Extracts the Unique Code (X1, X2...)
+    2. Deletes from MongoDB Vault
+    3. Deletes from Telegram Public Channel
+    4. Mirrors the Deletion to Audit Logs
+    """
+    unique_code = cb.data.split("_")[2]
+    
+    # Locate the entry in your Database
+    entry = col_vault.find_one({"m_code": unique_code})
+    
+    if entry:
+        try:
+            # surgical removal from Public Channel
+            await bot.delete_message(CHANNEL_ID, entry.get("msg_id"))
+            telegram_info = "Wiped from Channel"
+        except Exception:
+            telegram_info = "Channel post already gone or too old"
+        
+        # Surgical removal from MongoDB
+        col_vault.delete_one({"m_code": unique_code})
+        
+        # Notify the Master
+        await cb.answer(f"🚀 {unique_code}: FULL SYSTEM PURGE COMPLETE", show_alert=True)
+        
+        # Final Audit Mirror
+        await broadcast_audit("SURGICAL_DELETE", unique_code, f"Status: {telegram_info}")
+        
+        # Remove the button from the Log Channel message so you don't click it twice
+        await cb.message.edit_text(f"🗑️ <b>RECORD PURGED:</b> <code>{unique_code}</code>", parse_mode=ParseMode.HTML)
+    else:
+        await cb.answer("❌ Error: Code not found in Database.")
 # ==========================================
 # 🔄 GLOBAL API COUNTER (MongoDB)
 # ==========================================
@@ -1592,6 +1699,7 @@ if __name__ == "__main__":
         print(f"💥 CRITICAL STARTUP ERROR: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
