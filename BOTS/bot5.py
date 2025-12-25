@@ -1,7 +1,6 @@
 import asyncio, logging, random, html, threading, os, sys, time, re, pytz, json, io, psutil
 import pandas as pd
 from datetime import datetime, timedelta
-from aiohttp import web
 from google import genai
 from google.genai import types as ai_types
 from aiogram import Bot, Dispatcher, types, F
@@ -14,7 +13,6 @@ from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pymongo
-from aiohttp import web
 import threading
 # ==========================================
 # ⚡ SECURE CONFIGURATION (ENV DRIVEN)
@@ -551,26 +549,6 @@ async def hourly_heartbeat():
     except Exception as e:
         await bot.send_message(OWNER_ID, f"🚨 <b>ALERT:</b> Heartbeat fail. Error: {e}")
 
-async def main():
-    # 1. Schedule automation
-    try:
-        scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
-    except RuntimeError:
-        # Event loop not ready, skip for now
-        pass
-    
-    # 2. Start Health Server (Render Shield) - Disabled for Background Worker
-    # threading.Thread(target=run_health_server, daemon=True).start()
-    
-    console_out("◈ SINGULARITY APEX ONLINE")
-    try:
-        await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>\nSystem memory: 100% | Logic: Nominal.", parse_mode=ParseMode.HTML)
-        # Start scheduler after message sent
-        scheduler.start()
-        await dp.start_polling(bot, skip_updates=True)
-    except Exception as e:
-        logging.error(f"FATAL: {e}")
-
 # ==========================================
 # 📟 TERMINAL & TELEMETRY ENGINE
 # ==========================================
@@ -845,59 +823,8 @@ def get_engagement_markup(code, lock_count=0):
     ])
 
 # ==========================================
-# 📡 RENDER HEALTH CHECK (PORT BINDER)
+#  THE SUPREME STARTUP
 # ==========================================
-async def handle_render_health(request):
-    return web.Response(text="APEX SINGULARITY V5.0: OPERATIONAL")
-
-def start_health_server():
-    """Binds to Render's PORT to prevent deployment failure."""
-    app = web.Application()
-    app.router.add_get('/', handle_render_health)
-    port = int(os.environ.get("PORT", 10000))
-    # Run in a separate thread to not block the bot
-    runner = web.AppRunner(app)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(runner.setup())
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    loop.run_until_complete(site.start())
-    loop.run_forever()
-
-# ==========================================
-# 🚀 THE SUPREME STARTUP
-# ==========================================
-async def main():
-    # 1. Initialize Heartbeat & Sentinel
-    scheduler.add_job(check_system_integrity, 'interval', minutes=60)
-    scheduler.start()
-    
-    # 2. Start Health Server in background
-    threading.Thread(target=start_health_server, daemon=True).start()
-    
-    console_out("◈ SYSTEM BOOT COMPLETE")
-    
-    # 3. Notify Master Sadiq
-    try:
-        await bot.send_message(
-            OWNER_ID, 
-            "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>\n"
-            "────────────────────\n"
-            "• Core: Python 3.13\n"
-            "• Engine: Gemini 2.0 Flash\n"
-            "• Sentinel: ACTIVE\n"
-            "────────────────────",
-            parse_mode=ParseMode.HTML
-        )
-    except: pass
-
-    # 4. Begin Global Polling
-    try:
-        await dp.start_polling(bot, skip_updates=True)
-    except Exception as e:
-        logging.error(f"POLLING ERROR: {e}")
-        await asyncio.sleep(5)
-
 # ==========================================
 # 🪤 INTERACTION HANDLERS (CALLBACKS)
 # ==========================================
@@ -966,16 +893,6 @@ async def get_api_usage_stats():
 # 🚀 THE SUPREME INITIALIZATION
 # ==========================================
 
-def run_health_server():
-    """Final Render Bind to ensure no 502 Bad Gateway errors."""
-    try:
-        app = web.Application()
-        app.router.add_get('/', lambda r: web.Response(text="SINGULARITY_ACTIVE"))
-        port = int(os.environ.get("PORT", 10000))
-        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
-    except Exception as e:
-        print(f"Health Bind Note: {e}")
-
 async def startup_sequence():
     """Logic to run exactly once when the bot boots up."""
     # Ensure system counters exist in DB
@@ -998,19 +915,6 @@ async def startup_sequence():
 # ==========================================
 # 📡 RENDER HEALTH SHIELD (THE FIX)
 # ==========================================
-async def handle_health_check(request):
-    """Signals to Render that the Singularity is alive."""
-    return web.Response(text="SINGULARITY_V5_ONLINE", status=200)
-
-def run_health_server():
-    """Binds the mandatory port for Render."""
-    try:
-        app = web.Application()
-        app.router.add_get('/', handle_health_check)
-        port = int(os.environ.get("PORT", 10000))
-        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
-    except Exception as e:
-        print(f"📡 Health Server Note: {e}")
 
 # ==========================================
 # 🚀 THE SUPREME STARTUP
@@ -1018,20 +922,6 @@ def run_health_server():
 # ==========================================
 # 📡 RENDER HEALTH SHIELD (IMMEDIATE BIND)
 # ==========================================
-def run_health_server():
-    """Satisfies Render's port requirement immediately in a separate thread."""
-    async def handle_ping(request):
-        return web.Response(text="SINGULARITY_V5_LIVE")
-
-    try:
-        app = web.Application()
-        app.router.add_get('/', handle_ping)
-        port = int(os.environ.get("PORT", 10000))
-        # Use a simplified runner for the thread
-        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
-    except Exception as e:
-        print(f"Health Server Note: {e}")
-
 # ==========================================
 # 🚀 THE SUPREME STARTUP (REPAIRED)
 # ==========================================
