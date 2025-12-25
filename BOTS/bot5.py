@@ -1,6 +1,7 @@
 import asyncio, logging, random, html, threading, os, sys, time, re, pytz, json, io, psutil
 import pandas as pd
 from datetime import datetime, timedelta
+from aiohttp import web
 from google import genai
 from google.genai import types as ai_types
 from aiogram import Bot, Dispatcher, types, F
@@ -917,27 +918,37 @@ async def startup_sequence():
 # ==========================================
 
 # ==========================================
-# 🚀 THE SUPREME STARTUP
+# � RENDER HEALTH CHECK
 # ==========================================
-# ==========================================
-# 📡 RENDER HEALTH SHIELD (IMMEDIATE BIND)
-# ==========================================
+async def health_check(request):
+    return web.Response(text="Bot is running")
+
 # ==========================================
 # 🚀 THE SUPREME STARTUP (REPAIRED)
 # ==========================================
 async def main():
     """Handles the async startup of all Singularity subsystems."""
     try:
-        # 1. Send Startup Signal first
+        # 1. Start health check server in background
+        port = int(os.environ.get("PORT", 10000))
+        app = web.Application()
+        app.router.add_get('/', health_check)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        print(f"Health check server started on port {port}")
+
+        # 2. Send Startup Signal first
         await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>", parse_mode=ParseMode.HTML)
         
-        # 2. Initialize Scheduler after loop is running
+        # 3. Initialize Scheduler after loop is running
         scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
         scheduler.start()
         
         console_out("◈ SUBSYSTEMS ARMED")
         
-        # 3. Start Polling
+        # 4. Start Polling
         await dp.start_polling(bot, skip_updates=True)
         
     except Exception as e:
