@@ -14,7 +14,8 @@ from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pymongo
-
+from aiohttp import web
+import threading
 # ==========================================
 # ⚡ SECURE CONFIGURATION (ENV DRIVEN)
 # ==========================================
@@ -66,7 +67,12 @@ def console_out(text):
 # ==========================================
 # 🧠 ORACLE PROMPT ENGINE
 # ==========================================
+# ==========================================
+# 🧠 ORACLE PROMPT ENGINE (CHIMERA PROTOCOL)
+# ==========================================
+
 def get_system_prompt():
+    """Returns the strict Overlord persona instructions."""
     return """
     ACT AS: 'MSANODE OVERLORD'. 
     GOAL: Deliver an 'Unfair Advantage' resource (AI side hustles/Arbitrage/Tactical Tech).
@@ -75,10 +81,78 @@ def get_system_prompt():
     STRICT CONSTRAINTS:
     - COLD START: Begin IMMEDIATELY with '━━━━━━━━━━━━━━━━━━━━' followed by the '🚨 OPERATION' header.
     - NO PRE-TEXT: Never explain your mandate or use disclaimers.
-    - DIRECT LINKS: Provide REAL, EXTERNAL HTTPS LINKS to tools.
+    - DIRECT LINKS: Provide REAL, EXTERNAL HTTPS LINKS to tools (e.g., chain.link, openai.com).
+    - NO BRANDING: Do not create fake links.
     - FORMATTING: NO EMOJIS in body text. Emojis allowed ONLY in headers.
     - NO AI FILLER.
+
+    STRUCTURE:
+    ━━━━━━━━━━━━━━━━━━━━
+    🚨 OPERATION: [CAPITALIZED TITLE] 🚨
+    ━━━━━━━━━━━━━━━━━━━━
+    🧠 THE ADVANTAGE: [Explain arbitrage/logic/side-hustle]
+    ⚠️ RESTRICTED TOOLKIT:
+    • 1. [Real Tool Name]: [Specific Benefit] (Link: [Direct URL])
+    • 2. [Real Tool Name]: [Specific Benefit] (Link: [Direct URL])
+    • 3. [Real Tool Name]: [Specific Benefit] (Link: [Direct URL])
+    ⚡ EXECUTION PROTOCOL: [Direct technical steps to earn/deploy]
+    👑 MSA NODE DIRECTIVE: "Family: Execute. Action is currency. Hurry Up !!! .Claim Free Rewards Now"
+    ━━━━━━━━━━━━━━━━━━━━
     """
+
+async def generate_content(prompt="Generate a viral AI side hustle reel script"):
+    """Main generation engine for Breaches and Schedules."""
+    global API_USAGE_COUNT
+    
+    # 1. API Quota Guard
+    if API_USAGE_COUNT >= 1500:
+        return "⚠️ <b>CRITICAL:</b> Gemini API Monthly Limit Reached (1,500/1,500).", "Limit"
+
+    try:
+        # 2. 2025 SDK Execution
+        # We run this in a thread to keep the bot responsive
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=MODEL_POOL[CURRENT_MODEL_INDEX],
+            contents=prompt[:500],
+            config=ai_types.GenerateContentConfig(
+                system_instruction=get_system_prompt()
+            )
+        )
+        
+        raw_text = response.text if response else "No response from Oracle."
+        
+        # 3. HTML Scrubbing (Ensuring Telegram doesn't crash on special characters)
+        clean_content = html.escape(raw_text)[:3500] 
+        
+        # 4. Telemetry Update
+        API_USAGE_COUNT += 1
+        # Synchronize with MongoDB Ledger (Function defined in Block 1)
+        await increment_api_count_in_db() 
+        
+        return clean_content, "AI Directive"
+
+    except Exception as e:
+        err = str(e)
+        console_out(f"CRITICAL GEN ERROR: {err}")
+        return f"<b>System Error:</b> {html.escape(err)[:100]}", "Error"
+
+async def alchemy_transform(raw_text):
+    """Transmutes forwarded intelligence into the Overlord Protocol."""
+    try:
+        resp = await asyncio.to_thread(
+            client.models.generate_content,
+            model=MODEL_POOL[CURRENT_MODEL_INDEX],
+            contents=f"INPUT DATA:\n{raw_text}\n\nINSTRUCTION: Rewrite into MSANODE Protocol.",
+            config=ai_types.GenerateContentConfig(
+                system_instruction=get_system_prompt()
+            )
+        )
+        # Clean the response to remove AI chatter ("Here is your rewrite...")
+        return re.sub(r"^(Here is|Sure).*?\n", "", resp.text, flags=re.IGNORECASE).strip()
+    except Exception as e: 
+        console_out(f"Alchemy Error: {e}")
+        return "⚠️ <b>Alchemy Failed:</b> AI Engine timeout."
 
 async def ai_generate(prompt):
     try:
@@ -938,21 +1012,41 @@ async def startup_sequence():
         "────────────────────",
         parse_mode=ParseMode.HTML
     )
+# ==========================================
+# 📡 RENDER HEALTH SHIELD (PORT BINDER)
+# ==========================================
+
+async def handle_health_check(request):
+    """Responds to Render's pings to keep the service alive."""
+    return web.Response(text="SINGULARITY_CORE_5_ONLINE", status=200)
+
+def run_health_server():
+    """Starts a lightweight web server on the port Render expects."""
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    
+    # Render provides the port in the environment variable 'PORT'
+    port = int(os.environ.get("PORT", 10000))
+    
+    # Start the server
+    web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+
+# ==========================================
+# 🚀 MODIFIED STARTUP EXECUTION
+# ==========================================
 
 if __name__ == "__main__":
-    # 1. Start Render Port Bind
+    # 1. Start the Health Server in a separate thread immediately
+    # This satisfies Render's port check while the bot is connecting to DB/AI
     threading.Thread(target=run_health_server, daemon=True).start()
     
-    # 2. Launch Global Logic
-    loop = asyncio.get_event_loop()
-    loop.create_task(startup_sequence())
+    console_out("Health Shield: Active. Port Binding Engaged.")
     
-    console_out("APEX SINGULARITY v5.0: FULL SYSTEM START")
-    
+    # 2. Launch the main bot loop
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("◈ Manual Shutdown Executed.")
+        pass
     except Exception as e:
         print(f"💥 CRITICAL BOOT ERROR: {e}")
 
