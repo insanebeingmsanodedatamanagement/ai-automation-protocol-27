@@ -1013,40 +1013,46 @@ async def startup_sequence():
         parse_mode=ParseMode.HTML
     )
 # ==========================================
-# 📡 RENDER HEALTH SHIELD (PORT BINDER)
+# 📡 RENDER HEALTH SHIELD (THE FIX)
 # ==========================================
-
 async def handle_health_check(request):
-    """Responds to Render's pings to keep the service alive."""
-    return web.Response(text="SINGULARITY_CORE_5_ONLINE", status=200)
+    """Signals to Render that the Singularity is alive."""
+    return web.Response(text="SINGULARITY_V5_ONLINE", status=200)
 
 def run_health_server():
-    """Starts a lightweight web server on the port Render expects."""
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    
-    # Render provides the port in the environment variable 'PORT'
-    port = int(os.environ.get("PORT", 10000))
-    
-    # Start the server
-    web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    """Binds the mandatory port for Render."""
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health_check)
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Note: {e}")
 
 # ==========================================
-# 🚀 MODIFIED STARTUP EXECUTION
+# 🚀 THE SUPREME STARTUP
 # ==========================================
+async def main():
+    # Start the 60-min Heartbeat & Auditor
+    scheduler.add_job(check_system_integrity, 'interval', minutes=60)
+    scheduler.start()
+
+    console_out("◈ SINGULARITY APEX: CONNECTING TO TELEGRAM...")
+    
+    try:
+        # Send Startup Signal to you
+        await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>", parse_mode=ParseMode.HTML)
+        # Start Polling
+        await dp.start_polling(bot, skip_updates=True)
+    except Exception as e:
+        console_out(f"FATAL POLLING ERROR: {e}")
 
 if __name__ == "__main__":
-    # 1. Start the Health Server in a separate thread immediately
-    # This satisfies Render's port check while the bot is connecting to DB/AI
+    # 1. Start Port Binding immediately in a background thread
     threading.Thread(target=run_health_server, daemon=True).start()
     
-    console_out("Health Shield: Active. Port Binding Engaged.")
-    
-    # 2. Launch the main bot loop
+    # 2. Run the Bot Logic
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass
-    except Exception as e:
-        print(f"💥 CRITICAL BOOT ERROR: {e}")
-
+        print("◈ System Shutdown.")
