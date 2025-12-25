@@ -564,7 +564,6 @@ async def main():
     # 1. Schedule automation
     try:
         scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
-        scheduler.start()
     except RuntimeError:
         # Event loop not ready, skip for now
         pass
@@ -575,6 +574,8 @@ async def main():
     console_out("◈ SINGULARITY APEX ONLINE")
     try:
         await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>\nSystem memory: 100% | Logic: Nominal.", parse_mode=ParseMode.HTML)
+        # Start scheduler after message sent
+        scheduler.start()
         await dp.start_polling(bot, skip_updates=True)
     except Exception as e:
         logging.error(f"FATAL: {e}")
@@ -1076,12 +1077,7 @@ async def main():
         print(f"FATAL STARTUP ERROR: {e}")
 
 if __name__ == "__main__":
-    # STEP 1: Start the Health Server thread BEFORE starting the loop
-    # This ensures Render sees an open port instantly.
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
-    
-    # STEP 2: Start the Async Loop properly
+    # STEP 1: Start the Async Loop properly
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
