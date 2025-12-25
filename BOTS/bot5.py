@@ -21,6 +21,7 @@ import sys
 # 2025 AI SDK REPLACEMENT (Deprecation Fix)
 from google import genai 
 from google.genai import types as ai_types
+import pymongo
 
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import Command, StateFilter
