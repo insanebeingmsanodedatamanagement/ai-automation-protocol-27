@@ -385,7 +385,7 @@ async def terminal_view(message: types.Message):
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(F.text == "🔑 API")
-async def api_view(message: types.Message):
+async def api_view(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
     masked = f"{GEMINI_KEY[:8]}****{GEMINI_KEY[-4:]}"
     await message.answer(f"🔑 <b>API:</b> <code>{masked}</code>\n\nSend NEW key to replace or press /cancel", parse_mode=ParseMode.HTML)
