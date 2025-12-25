@@ -562,11 +562,15 @@ async def hourly_heartbeat():
 
 async def main():
     # 1. Schedule automation
-    scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
-    scheduler.start()
+    try:
+        scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
+        scheduler.start()
+    except RuntimeError:
+        # Event loop not ready, skip for now
+        pass
     
-    # 2. Start Health Server (Render Shield)
-    threading.Thread(target=run_health_server, daemon=True).start()
+    # 2. Start Health Server (Render Shield) - Disabled for Background Worker
+    # threading.Thread(target=run_health_server, daemon=True).start()
     
     console_out("◈ SINGULARITY APEX ONLINE")
     try:
