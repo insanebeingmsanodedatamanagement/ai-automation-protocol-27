@@ -932,48 +932,61 @@ def run_health_server():
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"Health Server Note: {e}")
+async def increment_api_count_in_db():
+    try:
+        col_api.update_one({"_id": "global_ledger"}, {"$inc": {"usage": 1}}, upsert=True)
+    except Exception as e:
+        console_out(f"Ledger Sync Error: {e}")
 
-# ==========================================
-# 🚀 THE SUPREME STARTUP (REPAIRED)
-# ==========================================
+
+@dp.callback_query(F.data == "brauto")
+async def breach_auto_exec(cb: types.CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("🛰 <b>SYNTHESIZING...</b>", parse_mode=ParseMode.HTML)
+    content, topic = await ai_generate("Generate a viral AI arbitrage operation.")
+    await state.update_data(content=content, topic=topic)
+    await cb.message.answer(f"📑 <b>PREVIEW:</b>\n\n{content}\n\n<b>FIRE YES?</b>", 
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔥 FIRE", callback_data="brfire")]]))
+
+@dp.callback_query(F.data == "brfire")
+async def breach_fire_final(cb: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    content = data.get("content")
+    if not content: return await cb.answer("❌ Intelligence Lost.")
+    
+    code = await get_next_id("BR")
+    msg = await bot.send_message(CHANNEL_ID, content, parse_mode=ParseMode.HTML)
+    col_vault.insert_one({"m_code": code, "msg_id": msg.message_id, "content": content, "created_at": datetime.now(IST)})
+    
+    await bot.send_message(LOG_CHANNEL_ID, f"🚀 <b>BREACH DEPLOYED: {code}</b>\n\n{content}", parse_mode=ParseMode.HTML)
+    await cb.message.edit_text(f"🚀 <b>DEPLOYED:</b> <code>{code}</code>")
+    await state.clear()
 async def main():
     """Handles the async startup of all Singularity subsystems."""
     try:
-        # 1. Initialize Global Counters (Important!)
+        # --- CRITICAL: Initialize Database Counters ---
+        await startup_sequence() 
+        
         global API_USAGE_COUNT
         API_USAGE_COUNT = 0 
         
-        # 2. Start Scheduler inside the running loop
+        # Start Scheduler inside the running loop
         scheduler.start()
         scheduler.add_job(hourly_heartbeat, 'interval', minutes=60)
         scheduler.add_job(check_system_integrity, 'interval', minutes=60)
         
         console_out("◈ SUBSYSTEMS ARMED")
         
-        # 3. Verify Database (Optional check to prevent silent hangs)
+        # Verify Database Connection
         db_client.admin.command('ping')
         
-        # 4. Send Startup Signal to Master Sadiq
+        # Send Startup Signal to Master Sadiq
         await bot.send_message(OWNER_ID, "💎 <b>APEX SINGULARITY v5.0 ONLINE</b>", parse_mode=ParseMode.HTML)
         
-        # 5. Start Polling
+        # Start Polling
         print("◈ Bot is now polling...")
         await dp.start_polling(bot, skip_updates=True)
         
     except Exception as e:
         print(f"FATAL STARTUP ERROR: {e}")
-        # Log to your channel if possible
-        try: await bot.send_message(LOG_CHANNEL_ID, f"🚨 FATAL: {e}")
+        try: await bot.send_message(LOG_CHANNEL_ID, f"🚨 FATAL BOOT ERROR: {e}")
         except: pass
-
-if __name__ == "__main__":
-    # STEP 1: Launch the Health Server in a DAEMON thread.
-    # This satisfies Render's port scan immediately.
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
-    
-    # STEP 2: Run the Bot Loop
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("◈ Manual Shutdown.")
