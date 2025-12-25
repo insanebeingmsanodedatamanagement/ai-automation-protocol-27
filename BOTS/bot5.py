@@ -78,11 +78,11 @@ col_settings = None
 
 # 2025 Model Configuration
 MODEL_POOL = [
-    "gemini-2.0-flash", 
-    "gemini-2.0-pro",
-    "gemini-2.0-flash-preview-09-2025",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash-lite-preview-09-2025"
+    "gemini-1.5-flash", 
+    "gemini-1.5-pro",
+    "gemini-1.5-flash-8b",
+    "gemini-1.0-pro",
+    "gemini-pro-vision"
 ]
 API_USAGE_COUNT = 0
 CONSOLE_LOGS = [] # Required for your terminal_viewer
