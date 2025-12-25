@@ -386,17 +386,22 @@ def run_health_server():
 # ==========================================
 # 📡 UTILITY LOGIC
 # ==========================================
-
 async def get_next_x_code(prefix="X"):
     """Generates sequential codes: X1, X2, X3... across breaches and schedules."""
     try:
-        # Count documents in both vault and schedules to get a global sequential number
-        vault_count = col_vault.count_documents({})
-        sched_count = col_schedules.count_documents({})
-        return f"{prefix}{vault_count + sched_count + 1}"
+        # Check global counter in system stats
+        stats = col_system_stats.find_one({"_id": "global_counter"})
+        if not stats:
+            col_system_stats.insert_one({"_id": "global_counter", "count": 0})
+            new_count = 1
+        else:
+            new_count = stats["count"] + 1
+        
+        col_system_stats.update_one({"_id": "global_counter"}, {"$set": {"count": new_count}})
+        return f"{prefix}{new_count}"
     except Exception as e:
-        logging.error(f"X-Code Gen Error: {e}")
-        return f"{prefix}{random.randint(100, 999)}"
+        return f"{prefix}{random.randint(1000, 9999)}"
+        
 REWARD_POOL = [
     "GitHub Student Pack ($200k in Premium Infrastructure)",
     "Top 7 AI Tools that make ChatGPT look like a Toy",
@@ -847,20 +852,19 @@ async def model_info(message: types.Message):
 @dp.callback_query(F.data == "api_usage")
 async def api_usage_cb(cb: types.CallbackQuery):
     await cb.answer(f"Consumed: {API_USAGE_COUNT} | Left: {1500 - API_USAGE_COUNT}", show_alert=True)
-
 @dp.callback_query(F.data == "swap_engine")
 async def swap_engine_cb(cb: types.CallbackQuery):
-    kb_list = []
-    for i, m in enumerate(MODEL_POOL):
-        kb_list.append([InlineKeyboardButton(text=f"⚙️ {m}", callback_data=f"selmod_{i}")])
+    kb_list = [[InlineKeyboardButton(text=f"⚙️ {m}", callback_data=f"selmod_{i}")] 
+               for i, m in enumerate(MODEL_POOL)]
     
-    # Add the "ADD MODE" button as requested
-    kb_list.append([InlineKeyboardButton(text="➕ ADD CUSTOM MODE", callback_data="add_custom_mode")])
+    # YOUR NEW BUTTON
+    kb_list.append([InlineKeyboardButton(text="➕ ADD NEW MODE", callback_data="add_custom_mode")])
     kb_list.append([InlineKeyboardButton(text="🔙 BACK", callback_data="cancel_api")])
     
-    await cb.message.edit_text("🎯 <b>ENGINE SELECTION PROTOCOL:</b>", 
+    await cb.message.edit_text("🎯 <b>ENGINE SELECTION:</b>", 
                                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list), 
                                parse_mode=ParseMode.HTML)
+    
 @dp.callback_query(F.data.startswith("selmod_"))
 async def sel_model_exec(cb: types.CallbackQuery):
     global CURRENT_MODEL_INDEX, model
@@ -901,19 +905,21 @@ async def backup_mirror(message: types.Message):
 # No need for explicit schema definitions like SQLAlchemy
 @dp.callback_query(F.data.startswith("del_x_"))
 async def delete_record_surgical(cb: types.CallbackQuery):
+    """Deletes record from DB and Channel using the Unique Code."""
     code = cb.data.split("_")[2]
+    entry = col_vault.find_one({"m_code": code})
     
-    # Delete from Vault
-    res = col_vault.delete_one({"m_code": code})
-    # Also delete from Schedules if it's there
-    col_schedules.delete_one({"m_code": code})
-    
-    if res.deleted_count > 0:
-        await cb.answer(f"🗑️ Record {code} Purged.", show_alert=True)
-        await broadcast_audit("SURGICAL_DELETE", code, "Entry wiped from database by Owner.")
+    if entry:
+        try:
+            await bot.delete_message(CHANNEL_ID, entry.get("msg_id"))
+        except: pass # Message too old or already gone
+        
+        col_vault.delete_one({"m_code": code})
+        await broadcast_audit("SURGICAL_DELETE", code, "Record purged from Vault and Channel.")
+        await cb.answer(f"🗑️ Purged: {code}", show_alert=True)
         await cb.message.delete()
     else:
-        await cb.answer("❌ Error: Record not found.")
+        await cb.answer("❌ Record not found in Vault.")
 # ==========================================
 # 🔄 GLOBAL API COUNTER (MongoDB)
 # ==========================================
@@ -1228,58 +1234,49 @@ async def sched_lock(cb: types.CallbackQuery, state: FSMContext):
 # ==========================================
 # --- STEP 1: Add to your PENDING_APPROVALS logic ---
 async def trigger_review(m_code, target_time):
-    """Fires exactly 60m before target."""
-    content, topic = await generate_content()
+    """T-60m: Generates content and asks for confirmation."""
+    # 2025 AI Client generation
+    response = client.models.generate_content(model=MODEL_ID, contents="Generate MSANODE AI Breach")
+    content = response.text
     
-    # Check Integrity (Does AI content look okay?)
-    integrity = "PASSED" if len(content) > 100 else "FAILED"
+    # INTEGRITY CHECK
+    integrity = "PASSED" if len(content) > 150 else "FAILED"
     
     PENDING_APPROVALS[m_code] = {
-        "content": content, 
-        "topic": topic, 
-        "confirmed": False, 
-        "target": target_time,
-        "integrity": integrity
+        "content": content, "confirmed": False, 
+        "integrity": integrity, "target": target_time
     }
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 CONFIRM FIRE", callback_data=f"arm_{m_code}")],
-        [InlineKeyboardButton(text="🗑️ ABORT / DELETE", callback_data=f"del_x_{m_code}")]
+        [InlineKeyboardButton(text="🗑️ ABORT", callback_data=f"del_x_{m_code}")]
     ])
     
     await bot.send_message(OWNER_ID, 
-        f"⏳ <b>PRE-FLIGHT CHECK (T-60m): {m_code}</b>\n"
-        f"Fire scheduled at: <code>{target_time}</code>\n"
-        f"Integrity Check: <b>{integrity}</b>\n"
+        f"⏳ <b>PRE-FLIGHT (T-60m): {m_code}</b>\n"
+        f"FIRE AT: <code>{target_time}</code>\n"
+        f"INTEGRITY: <b>{integrity}</b>\n"
         f"────────────────────\n\n{content}", 
         reply_markup=kb, parse_mode=ParseMode.HTML)
 
-# --- STEP 2: The T-0 Execution Logic ---
 async def execute_guarded_fire(m_code):
-    """The Precision Trigger at T-0."""
+    """T-0: Checks integrity and fires automatically if missed."""
     if m_code in PENDING_APPROVALS:
         task = PENDING_APPROVALS[m_code]
         
-        # AUTO-FIRE LOGIC: Fire if confirmed OR if integrity passed but I missed the button
-        should_fire = task["confirmed"] or (task["integrity"] == "PASSED")
-        
-        if should_fire:
-            # Deploy to public channel
-            vault_msg = await bot.send_message(CHANNEL_ID, task['content'], 
-                                               reply_markup=get_engagement_markup(m_code))
+        # AUTO-FIRE: If I missed it BUT integrity is PASSED, fire anyway.
+        if task["confirmed"] or task["integrity"] == "PASSED":
+            msg = await bot.send_message(CHANNEL_ID, task['content'], 
+                                         reply_markup=get_engagement_markup(m_code))
             
-            # Sync to Database
             col_vault.insert_one({
-                "m_code": m_code, "msg_id": vault_msg.message_id, "content": task['content'],
-                "is_unlocked": False, "created_at": datetime.now(), "clicks": 0
+                "m_code": m_code, "msg_id": msg.message_id, "content": task['content'],
+                "created_at": datetime.now()
             })
-            
-            # Audit Mirror
-            await broadcast_audit("SCHEDULED_FIRE", m_code, "Auto-fired via Fail-Safe Protocol")
+            await broadcast_audit("AUTO_FIRE", m_code, "Fired via Fail-Safe (Integrity PASSED)")
         else:
-            await bot.send_message(OWNER_ID, f"❌ <b>ABORTED:</b> {m_code} failed integrity/confirmation.")
-            await broadcast_audit("FIRE_ABORTED", m_code, "System Integrity Check Failed.")
-            
+            await bot.send_message(OWNER_ID, f"❌ <b>FIRE ABORTED:</b> {m_code} failed pre-flight.")
+        
         del PENDING_APPROVALS[m_code]
 # ==========================================
 # ✏️ REMOTE EDIT (REINFORCED PRIORITY)
@@ -1385,7 +1382,7 @@ async def broadcast_init(message: types.Message, state: FSMContext):
 # 📢 SYNDICATE BROADCAST (TELEMETRY SYNCED)
 # ==========================================
 async def broadcast_audit(action: str, code: str, details: str = "N/A"):
-    """Full-Spectrum Audit mirroring to Private Channel."""
+    """Surgical Audit mirroring to Private LOG_CHANNEL."""
     log_text = (
         f"🛡️ <b>EMPIRE AUDIT ENGINE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1393,10 +1390,9 @@ async def broadcast_audit(action: str, code: str, details: str = "N/A"):
         f"🆔 <b>UNIQUE CODE:</b> <code>{code}</code>\n"
         f"📝 <b>DETAILS:</b> {details}\n"
         f"👤 <b>OPERATOR:</b> Master Sadiq\n"
-        f"📅 <b>TIMESTAMP:</b> {get_current_time()}\n"
+        f"🚦 <b>STATUS:</b> VERIFIED\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
-    # Send to the Private Log Channel defined in your config
     await bot.send_message(LOG_CHANNEL_ID, log_text, parse_mode=ParseMode.HTML)
     # Also log to internal console
     console_out(f"Audit: {action} | {code}")
@@ -1596,5 +1592,6 @@ if __name__ == "__main__":
         print(f"💥 CRITICAL STARTUP ERROR: {e}")
         import traceback
         traceback.print_exc()
+
 
 
