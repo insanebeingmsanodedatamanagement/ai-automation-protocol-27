@@ -4,7 +4,6 @@ import os
 import csv
 import time
 import threading
-from dotenv import load_dotenv
 from aiohttp import web
 
 
@@ -5312,3 +5311,4 @@ if __name__ == "__main__":
         asyncio.run(startup())
     except (KeyboardInterrupt, SystemExit):
         print("🛑 Command Hub Stopped Safely")
+
