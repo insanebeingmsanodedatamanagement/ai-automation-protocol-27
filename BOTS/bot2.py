@@ -4,9 +4,11 @@ import os
 import csv
 import time
 import threading
+from dotenv import load_dotenv
 from aiohttp import web
 
-
+# Load environment variables
+load_dotenv()
 import functools
 import traceback
 from datetime import datetime, timedelta
@@ -38,6 +40,10 @@ except (TypeError, ValueError):
 
 if not all([MANAGER_BOT_TOKEN, MAIN_BOT_TOKEN, MONGO_URI, OWNER_ID]):
     print("❌ CRITICAL ERROR: Environment variables missing in Render! Check OWNER_ID, Tokens, and URI.")
+
+# Channel IDs
+BAN_CHANNEL_ID = -1003575487367  # Ban notifications channel
+APPEAL_CHANNEL_ID = int(os.getenv("APPEAL_CHANNEL_ID", -1003354981499))  # Ban appeal channel
 
 # Timezone for Intelligence Reports
 IST = pytz.timezone('Asia/Kolkata')
@@ -93,6 +99,10 @@ class AdminState(StatesGroup):
 class ReviewState(StatesGroup):
     viewing_all = State()  # For paginated view
     viewing_pending = State()  # For pending reviews pagination
+
+class AppealState(StatesGroup):
+    waiting_for_template_message = State()  # For custom warning messages
+    viewing_appeals = State()  # For viewing appeals list
     waiting_cooldown_days = State()  # For changing cooldown period
 
 class ShootState(StatesGroup):
@@ -103,6 +113,7 @@ class ShootState(StatesGroup):
     waiting_for_suspend_id = State()
     waiting_for_reset_id = State()
     waiting_for_unban_features_id = State()
+    waiting_for_ban_history_id = State()
 
 class SniperState(StatesGroup):
     waiting_for_target_id = State()
@@ -126,12 +137,13 @@ col_broadcast_logs = None
 col_templates = None
 col_recycle_bin = None
 col_reviews = None
+col_appeals = None
 
 async def initialize_database():
     """Initialize database connections asynchronously after bot starts"""
     global client, db, col_users, col_admins, col_settings, col_active
     global col_viral, col_reels, col_banned, col_broadcast_logs
-    global col_templates, col_recycle_bin, col_reviews
+    global col_templates, col_recycle_bin, col_reviews, col_appeals, col_ban_history
     
     try:
         client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -143,10 +155,12 @@ async def initialize_database():
         col_viral = db["viral_videos"]
         col_reels = db["viral_reels"]
         col_banned = db["banned_users"]
+        col_ban_history = db["ban_history"]
         col_broadcast_logs = db["broadcast_logs"]
         col_templates = db["broadcast_templates"]
         col_recycle_bin = db["recycle_bin"]
         col_reviews = db["reviews"]
+        col_appeals = db["ban_appeals"]
         
         # Create indexes for optimized queries (handles millions of users)
         # Wrap each index creation separately to avoid conflicts with existing indexes
@@ -258,6 +272,169 @@ def is_admin(user_id):
     try:
         return col_admins.find_one({"user_id": str(user_id)}) is not None
     except: return False
+
+async def log_ban_action(action_type: str, user_id: str, user_name: str, admin_name: str, 
+                        reason: str = None, ban_type: str = None, ban_until = None, 
+                        banned_features: list = None, violation_type: str = None):
+    """
+    Log ban/unban/suspend actions to database and send notification to ban channel.
+    
+    Args:
+        action_type: 'ban', 'unban', 'suspend', 'unsuspend', 'ban_features', 'unban_features', 'auto_ban'
+        user_id: Telegram user ID
+        user_name: User's display name
+        admin_name: Admin who performed action (or 'System' for auto-bans)
+        reason: Custom reason message
+        ban_type: 'permanent', 'temporary', or None
+        ban_until: DateTime for temporary bans
+        banned_features: List of banned features
+        violation_type: Type of violation for auto-bans
+    """
+    try:
+        # Get user's MSA ID
+        user_doc = col_users.find_one({"user_id": user_id})
+        msa_id = user_doc.get("msa_id", "UNKNOWN") if user_doc else "UNKNOWN"
+        username = user_doc.get("username", "No Username") if user_doc else "No Username"
+        
+        # Create history record
+        history_record = {
+            "user_id": user_id,
+            "msa_id": msa_id,
+            "username": username,
+            "user_name": user_name,
+            "action_type": action_type,
+            "admin_name": admin_name,
+            "reason": reason,
+            "ban_type": ban_type,
+            "ban_until": ban_until,
+            "banned_features": banned_features,
+            "violation_type": violation_type,
+            "timestamp": datetime.now(IST)
+        }
+        
+        # Save to database
+        col_ban_history.insert_one(history_record)
+        
+        # Build channel notification message
+        now_str = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+        
+        if action_type == "ban":
+            status_emoji = "🚫"
+            action_text = "USER BANNED"
+            duration_text = ""
+            if ban_type == "temporary" and ban_until:
+                unban_date = ban_until.strftime("%d %b %Y, %I:%M %p")
+                duration_text = f"\n⏰ Duration: 7 Days (Until {unban_date} IST)"
+            elif ban_type == "permanent":
+                duration_text = "\n⏰ Duration: PERMANENT"
+            
+            channel_msg = (
+                f"{status_emoji} **{action_text}**\n"
+                f"═══════════════════════\n\n"
+                f"👤 User: {user_name}\n"
+                f"🆔 Telegram ID: {user_id}\n"
+                f"🏷️ MSA ID: {msa_id}\n"
+                f"👤 Username: @{username}\n"
+                f"👮 Banned By: {admin_name}\n"
+                f"📅 Date: {now_str}{duration_text}\n\n"
+            )
+            if reason:
+                channel_msg += f"📝 Reason:\n{reason}\n\n"
+            else:
+                channel_msg += "📝 Reason: Policy Violation (Default)\n\n"
+            
+            if banned_features:
+                features_list = ", ".join([f.title() for f in banned_features])
+                channel_msg += f"🚫 Banned Features:\n{features_list}\n\n"
+            
+            channel_msg += "═══════════════════════\n"
+            channel_msg += f"Status: {'⏳ TEMPORARY' if ban_type == 'temporary' else '🔒 PERMANENT'}"
+            
+        elif action_type == "unban":
+            channel_msg = (
+                f"✅ **USER UNBANNED**\n"
+                f"═══════════════════════\n\n"
+                f"👤 User: {user_name}\n"
+                f"🆔 Telegram ID: {user_id}\n"
+                f"🏷️ MSA ID: {msa_id}\n"
+                f"👤 Username: @{username}\n"
+                f"👮 Processed By: MSA NODE AGENT\n"
+                f"📅 Date: {now_str}\n\n"
+            )
+            if reason:
+                channel_msg += f"📝 Note: {reason}\n\n"
+            channel_msg += "═══════════════════════\n"
+            channel_msg += "Status: 🟢 ACTIVE"
+            
+        elif action_type == "suspend" or action_type == "ban_features":
+            if banned_features:
+                features_list = ", ".join([f.title() for f in banned_features])
+                channel_msg = (
+                    f"⏸️ **FEATURES SUSPENDED**\n"
+                    f"═══════════════════════\n\n"
+                    f"👤 User: {user_name}\n"
+                    f"🆔 Telegram ID: {user_id}\n"
+                    f"🏷️ MSA ID: {msa_id}\n"
+                    f"👤 Username: @{username}\n"
+                    f"👮 Suspended By: {admin_name}\n"
+                    f"📅 Date: {now_str}\n\n"
+                    f"🚫 Suspended Features:\n{features_list}\n\n"
+                )
+                if reason:
+                    channel_msg += f"📝 Reason: {reason}\n\n"
+                channel_msg += "═══════════════════════"
+        
+        elif action_type == "unsuspend" or action_type == "unban_features":
+            if banned_features:
+                features_list = ", ".join([f.title() for f in banned_features])
+                channel_msg = (
+                    f"✅ **FEATURES RESTORED**\n"
+                    f"═══════════════════════\n\n"
+                    f"👤 User: {user_name}\n"
+                    f"🆔 Telegram ID: {user_id}\n"
+                    f"🏷️ MSA ID: {msa_id}\n"
+                    f"👤 Username: @{username}\n"
+                    f"👮 Restored By: {admin_name}\n"
+                    f"📅 Date: {now_str}\n\n"
+                    f"✅ Restored Features:\n{features_list}\n\n"
+                )
+                if reason:
+                    channel_msg += f"📝 Note: {reason}\n\n"
+                channel_msg += "═══════════════════════"
+        
+        elif action_type == "auto_ban":
+            channel_msg = (
+                f"🚨 **AUTO-BAN TRIGGERED**\n"
+                f"═══════════════════════\n\n"
+                f"👤 User: {user_name}\n"
+                f"🆔 Telegram ID: {user_id}\n"
+                f"🏷️ MSA ID: {msa_id}\n"
+                f"👤 Username: @{username}\n"
+                f"🤖 Banned By: System (Auto)\n"
+                f"📅 Date: {now_str}\n\n"
+            )
+            if violation_type:
+                channel_msg += f"⚠️ Violation Type: {violation_type}\n"
+            if reason:
+                channel_msg += f"📝 Reason: {reason}\n\n"
+            else:
+                channel_msg += "📝 Reason: Multiple Security Violations\n\n"
+            channel_msg += "═══════════════════════\n"
+            channel_msg += "Status: 🔒 PERMANENT (AUTO)"
+        
+        # Send to ban channel
+        if BAN_CHANNEL_ID:
+            try:
+                await manager_bot.send_message(
+                    chat_id=BAN_CHANNEL_ID,
+                    text=channel_msg,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send ban notification to channel: {e}")
+        
+    except Exception as e:
+        logger.error(f"Error logging ban action: {e}")
 
 def resolve_user_id(input_str):
     """Resolves MSA ID or regular user ID to actual user ID - MSA ID prioritized for millions of users"""
@@ -398,10 +575,12 @@ async def show_dashboard_ui(message_obj, user_id, is_edit=False):
     # Row 5: Bot Features Control
     kb.row(InlineKeyboardButton(text="⭐ Reviews", callback_data="btn_reviews"),
         InlineKeyboardButton(text="💬 Support", callback_data="btn_support"))
-    # Row 6: Systems
-    kb.row(InlineKeyboardButton(text="💾 Backup", callback_data="btn_backup"), 
-        InlineKeyboardButton(text="🩺 Diagnosis", callback_data="btn_diagnosis"))
-    # Row 7: Configuration
+    # Row 6: Appeals & Backup
+    kb.row(InlineKeyboardButton(text="🔔 Appeals", callback_data="btn_appeals"),
+        InlineKeyboardButton(text="💾 Backup", callback_data="btn_backup"))
+    # Row 7: Systems
+    kb.row(InlineKeyboardButton(text="🩺 Diagnosis", callback_data="btn_diagnosis"))
+    # Row 8: Configuration
     kb.row(InlineKeyboardButton(text="👤 Admins", callback_data="btn_add_admin"),
         InlineKeyboardButton(text="🔐 Lockdown", callback_data="btn_maint_toggle"))
     
@@ -439,7 +618,7 @@ async def hub_list_all(callback: types.CallbackQuery, state: FSMContext):
     await show_user_list(callback, page=0, filter_status="all", filter_source="all")
 
 async def show_user_list(callback: types.CallbackQuery, page: int = 0, filter_status: str = "all", filter_source: str = "all"):
-    """Display paginated user list with filters"""
+    """Display paginated user list with filters - 20 users per page"""
     
     # Build query - exclude flagged/spam/bot banned users
     query = {
@@ -462,8 +641,8 @@ async def show_user_list(callback: types.CallbackQuery, page: int = 0, filter_st
     elif filter_source == "instagram":
         query["source"] = "Instagram"
     
-    # Pagination settings
-    per_page = 10
+    # Pagination settings - 20 per page
+    per_page = 20
     skip = page * per_page
     
     # Get users with pagination
@@ -471,7 +650,7 @@ async def show_user_list(callback: types.CallbackQuery, page: int = 0, filter_st
         "username": 1, 
         "user_id": 1, 
         "msa_id": 1, 
-        "source": 1,
+        "first_name": 1,
         "status": 1,
         "_id": 1
     }).sort("_id", -1).skip(skip).limit(per_page))
@@ -485,82 +664,71 @@ async def show_user_list(callback: types.CallbackQuery, page: int = 0, filter_st
     # Build header with filter info
     filter_text = []
     if filter_status != "all":
-        filter_text.append(f"Status: {filter_status.title()}")
+        filter_text.append(f"{filter_status.title()}")
     if filter_source != "all":
-        filter_text.append(f"Source: {filter_source.title()}")
+        filter_text.append(f"{filter_source.title()}")
     
-    text = " **OPERATIVES DIRECTORY**\n"
+    text = "📋 **USER LIST**\n"
+    text += "━━━━━━━━━━━━━━━━━\n\n"
+    
     if filter_text:
-        text += f" Filters: {', '.join(filter_text)}\n"
-    text += f" Page {current_page}/{total_pages}\n"
-    text += " \n\n"
+        text += f"🔍 Filter: {' | '.join(filter_text)}\n"
+    
+    text += f"📄 Page {current_page}/{total_pages} | Total: {total_count}\n\n"
     
     if users:
         for idx, u in enumerate(users, skip + 1):
-            username = u.get('username', 'Anonymous')
+            first_name = u.get('first_name', 'Unknown')
+            username = u.get('username', 'N/A')
             user_id = u.get('user_id', 'N/A')
             msa_id = u.get('msa_id', 'N/A')
-            source = u.get('source', 'Unknown')
             status = u.get('status', 'Active')
             
-            # Get join date from ObjectId
-            try:
-                from bson import ObjectId
-                obj_id = u.get('_id')
-                if isinstance(obj_id, ObjectId):
-                    join_date = obj_id.generation_time.astimezone(IST).strftime("%d %b %Y")
-                else:
-                    join_date = "Unknown"
-            except:
-                join_date = "Unknown"
+            # Status indicator
+            status_icon = "✅" if status == "Active" else "🚫"
             
-            # Status emoji
-            status_emoji = " " if status == "Active" else " " if status == "BLOCKED" else " "
-            
-            # Source emoji
-            source_emoji = " " if source == "YouTube" else " " if source == "Instagram" else " "
-            
-            text += f"{idx}. {status_emoji} **{username}**\n"
-            text += f"    ID: `{user_id}`\n"
-            text += f"    MSA: `{msa_id}`\n"
-            text += f"   {source_emoji} Path: {source}\n"
-            text += f"    Joined: {join_date}\n\n"
+            text += f"{idx}. {status_icon} {first_name}\n"
+            text += f"   🆔 TG: `{user_id}` | MSA: `{msa_id}`\n"
+            if username != 'N/A':
+                text += f"   👤 @{username}\n"
+            text += "\n"
     else:
-        text += " **No users found with current filters**\n\n"
+        text += "❌ No users found\n\n"
     
-    text += f"━━━━━━━━━━━━━━━━━\n"
-    text += f" **Total:** `{total_count}` operatives\n"
-    text += f" **Clean:** No spam/bot/flagged users"
+    text += "━━━━━━━━━━━━━━━━━"
     
     # Build keyboard with filters and pagination
     kb = InlineKeyboardBuilder()
     
     # Status filters
     kb.row(
-        InlineKeyboardButton(text="📊 All" if filter_status == "all" else "All", callback_data=f"list_filter_status_all_{page}_{filter_source}"),
-        InlineKeyboardButton(text="✅✅✅ Active" if filter_status == "active" else " Active", callback_data=f"list_filter_status_active_{page}_{filter_source}"),
-        InlineKeyboardButton(text="🚫🚫🚫 Blocked" if filter_status == "blocked" else " Blocked", callback_data=f"list_filter_status_blocked_{page}_{filter_source}")
+        InlineKeyboardButton(text="✅ All" if filter_status == "all" else "All", callback_data=f"list_filter_status_all_{page}_{filter_source}"),
+        InlineKeyboardButton(text="✅ Active" if filter_status == "active" else "Active", callback_data=f"list_filter_status_active_{page}_{filter_source}"),
+        InlineKeyboardButton(text="✅ Blocked" if filter_status == "blocked" else "Blocked", callback_data=f"list_filter_status_blocked_{page}_{filter_source}")
     )
     
     # Source filters
     kb.row(
-        InlineKeyboardButton(text="📊 All" if filter_source == "all" else "All", callback_data=f"list_filter_source_all_{page}_{filter_status}"),
-        InlineKeyboardButton(text="▶️▶️▶️ YT" if filter_source == "youtube" else " YT", callback_data=f"list_filter_source_youtube_{page}_{filter_status}"),
-        InlineKeyboardButton(text="📷📷📷 IG" if filter_source == "instagram" else " IG", callback_data=f"list_filter_source_instagram_{page}_{filter_status}")
+        InlineKeyboardButton(text="✅ All" if filter_source == "all" else "All", callback_data=f"list_filter_source_all_{page}_{filter_status}"),
+        InlineKeyboardButton(text="✅ YT" if filter_source == "youtube" else "YT", callback_data=f"list_filter_source_youtube_{page}_{filter_status}"),
+        InlineKeyboardButton(text="✅ IG" if filter_source == "instagram" else "IG", callback_data=f"list_filter_source_instagram_{page}_{filter_status}")
     )
     
-    # Pagination
+    # Pagination with arrows
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"list_page_{page-1}_{filter_status}_{filter_source}"))
-    if current_page < total_pages:
-        nav_buttons.append(InlineKeyboardButton(text="Next  ", callback_data=f"list_page_{page+1}_{filter_status}_{filter_source}"))
+        nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"list_page_{page-1}_{filter_status}_{filter_source}"))
     
-    if nav_buttons:
-        kb.row(*nav_buttons)
+    # Page indicator
+    nav_buttons.append(InlineKeyboardButton(text=f"· {current_page}/{total_pages} ·", callback_data="noop"))
+    
+    if current_page < total_pages:
+        nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"list_page_{page+1}_{filter_status}_{filter_source}"))
+    
+    kb.row(*nav_buttons)
     
     # Back button
-    kb.row(InlineKeyboardButton(text="🔙 Back to Hub", callback_data="btn_refresh"))
+    kb.row(InlineKeyboardButton(text="🔙 Back", callback_data="btn_refresh"))
     
     try:
         await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
@@ -1683,6 +1851,18 @@ async def execute_ban_no_reason(callback: types.CallbackQuery, state: FSMContext
     )
     col_users.update_one({"user_id": target_id}, {"$set": {"status": "blocked"}})
     
+    # Log ban action to history and channel
+    await log_ban_action(
+        action_type="ban",
+        user_id=target_id,
+        user_name=name,
+        admin_name=callback.from_user.first_name,
+        reason=None,
+        ban_type=ban_type,
+        ban_until=ban_until,
+        banned_features=["downloads", "reviews", "support", "search"]
+    )
+    
     if ban_type == "temporary":
         unban_date = ban_until.strftime("%d %b %Y, %I:%M %p")
         await callback.message.edit_text(
@@ -1724,6 +1904,18 @@ async def execute_ban_with_reason(message: types.Message, state: FSMContext):
         upsert=True
     )
     col_users.update_one({"user_id": target_id}, {"$set": {"status": "blocked"}})
+    
+    # Log ban action to history and channel
+    await log_ban_action(
+        action_type="ban",
+        user_id=target_id,
+        user_name=name,
+        admin_name=message.from_user.first_name,
+        reason=custom_reason,
+        ban_type=ban_type,
+        ban_until=ban_until,
+        banned_features=["downloads", "reviews", "support", "search"]
+    )
     
     if ban_type == "temporary":
         unban_date = ban_until.strftime("%d %b %Y, %I:%M %p")
@@ -1824,6 +2016,16 @@ async def save_suspend_changes(callback: types.CallbackQuery, state: FSMContext)
     
     user = col_users.find_one({"user_id": target_id})
     suspended = user.get("suspended_features", []) if user else []
+    
+    # Log suspend action to history and channel
+    if suspended:
+        await log_ban_action(
+            action_type="suspend",
+            user_id=target_id,
+            user_name=name,
+            admin_name=callback.from_user.first_name,
+            banned_features=suspended
+        )
     
     if suspended:
         features_list = ", ".join([f.title() for f in suspended])
@@ -1927,9 +2129,140 @@ async def show_ban_history(callback: types.CallbackQuery):
         history_text += f"  {reason[:50]}...\n \n"
     
     kb = InlineKeyboardBuilder()
+    kb.button(text="� Check User History", callback_data="check_user_ban_history")
     kb.button(text="🔙 Back", callback_data="btn_shoot_menu")
+    kb.adjust(1)
     
     await callback.message.edit_text(history_text, reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "check_user_ban_history")
+async def start_user_ban_history(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await callback.answer()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Back", callback_data="shoot_ban_history")
+    await callback.message.edit_text(
+        "📜 **USER BAN HISTORY**\n\nEnter User ID or MSA ID to view complete ban history:",
+        reply_markup=kb.as_markup()
+    )
+    await state.set_state(ShootState.waiting_for_ban_history_id)
+
+@dp.message(ShootState.waiting_for_ban_history_id)
+async def display_user_ban_history(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    target_id, name = resolve_user_id(message.text)
+    if not target_id:
+        return await message.answer("❌ User not found. Check ID/MSA ID.", reply_markup=back_kb())
+    
+    # Get user info
+    user_doc = col_users.find_one({"user_id": target_id})
+    msa_id = user_doc.get("msa_id", "UNKNOWN") if user_doc else "UNKNOWN"
+    username = user_doc.get("username", "No Username") if user_doc else "No Username"
+    
+    # Get complete ban history from database (sorted by most recent first)
+    history_records = list(col_ban_history.find({"user_id": target_id}).sort("timestamp", -1))
+    
+    if not history_records:
+        await message.answer(
+            f"📜 **BAN HISTORY FOR**\n"
+            f"👤 {name}\n"
+            f"🆔 Telegram ID: {target_id}\n"
+            f"🏷️ MSA ID: {msa_id}\n"
+            f"👤 Username: @{username}\n\n"
+            f"════════════════════\n\n"
+            f"✅ Clean Record - No ban history found.",
+            reply_markup=back_kb()
+        )
+        await state.clear()
+        return
+    
+    # Build detailed history report
+    history_msg = (
+        f"📜 **COMPLETE BAN HISTORY**\n"
+        f"════════════════════\n\n"
+        f"👤 User: {name}\n"
+        f"🆔 Telegram ID: {target_id}\n"
+        f"🏷️ MSA ID: {msa_id}\n"
+        f"👤 Username: @{username}\n\n"
+        f"📊 Total Records: {len(history_records)}\n"
+        f"════════════════════\n\n"
+    )
+    
+    for idx, record in enumerate(history_records, 1):
+        action_type = record.get("action_type", "unknown")
+        admin_name = record.get("admin_name", "Unknown")
+        reason = record.get("reason")
+        ban_type = record.get("ban_type")
+        ban_until = record.get("ban_until")
+        banned_features = record.get("banned_features", [])
+        violation_type = record.get("violation_type")
+        timestamp = record.get("timestamp")
+        
+        # Format timestamp
+        if isinstance(timestamp, datetime):
+            date_str = timestamp.strftime("%d %b %Y, %I:%M %p")
+        else:
+            date_str = "Unknown Date"
+        
+        # Action emoji and text
+        if action_type == "ban":
+            emoji = "🚫"
+            action_text = "BANNED"
+        elif action_type == "unban":
+            emoji = "✅"
+            action_text = "UNBANNED"
+        elif action_type == "suspend" or action_type == "ban_features":
+            emoji = "⏸️"
+            action_text = "FEATURES SUSPENDED"
+        elif action_type == "unsuspend" or action_type == "unban_features":
+            emoji = "🔄"
+            action_text = "FEATURES RESTORED"
+        elif action_type == "auto_ban":
+            emoji = "🚨"
+            action_text = "AUTO-BANNED"
+        else:
+            emoji = "📝"
+            action_text = action_type.upper()
+        
+        history_msg += f"**{idx}. {emoji} {action_text}**\n"
+        history_msg += f"📅 Date: {date_str}\n"
+        history_msg += f"👮 By: {admin_name}\n"
+        
+        if ban_type:
+            if ban_type == "temporary" and ban_until:
+                if isinstance(ban_until, datetime):
+                    unban_str = ban_until.strftime("%d %b %Y, %I:%M %p")
+                    history_msg += f"⏰ Type: Temporary (Until {unban_str})\n"
+                else:
+                    history_msg += f"⏰ Type: Temporary\n"
+            else:
+                history_msg += f"⏰ Type: Permanent\n"
+        
+        if reason:
+            history_msg += f"📝 Reason: {reason[:100]}\n"
+        
+        if violation_type:
+            history_msg += f"⚠️ Violation: {violation_type}\n"
+        
+        if banned_features:
+            features_str = ", ".join([f.title() for f in banned_features])
+            history_msg += f"🚫 Features: {features_str}\n"
+        
+        history_msg += "─────────────────\n"
+        
+        # Limit to 10 records to avoid message too long
+        if idx >= 10:
+            remaining = len(history_records) - 10
+            if remaining > 0:
+                history_msg += f"\n... and {remaining} more record(s)\n"
+            break
+    
+    history_msg += "\n════════════════════"
+    
+    await message.answer(history_msg, reply_markup=back_kb(), parse_mode="Markdown")
+    await state.clear()
+    await asyncio.sleep(2)
+    await show_dashboard_ui(message, message.from_user.id)
 
 @dp.callback_query(F.data == "shoot_unban")
 async def start_unban(callback: types.CallbackQuery, state: FSMContext):
@@ -1947,9 +2280,41 @@ async def execute_unban(message: types.Message, state: FSMContext):
     if not target_id:
         return await message.answer("❌ User not found. Check ID/MSA ID.", reply_markup=back_kb())
     
+    # Get ban record before deleting to store reason
+    ban_record = col_banned.find_one({"user_id": target_id})
+    previous_ban_reason = ban_record.get("reason", "Violation of bot rules") if ban_record else "Unknown reason"
+    
+    # Delete from banned list
     col_banned.delete_one({"user_id": target_id})
-    col_users.update_one({"user_id": target_id}, {"$set": {"status": "active"}})
-    await message.answer(f" **{name} ({target_id}) UNBANNED.**", reply_markup=back_kb())
+    
+    # Update user status and set unban flags for warning message
+    col_users.update_one(
+        {"user_id": target_id}, 
+        {
+            "$set": {
+                "status": "active",
+                "was_unbanned": True,
+                "previous_ban_reason": previous_ban_reason,
+                "unbanned_at": datetime.now(IST),
+                "unbanned_by": message.from_user.first_name
+            }
+        }
+    )
+    
+    # Log unban action to history and channel
+    await log_ban_action(
+        action_type="unban",
+        user_id=target_id,
+        user_name=name,
+        admin_name=message.from_user.first_name
+    )
+    
+    await message.answer(
+        f"✅ **{name} ({target_id}) UNBANNED.**\n\n"
+        f"⚠️ User will see a warning message on next /start.\n"
+        f"💡 Previous ban reason saved for reference.",
+        reply_markup=back_kb()
+    )
     await state.clear()
     await asyncio.sleep(2)
     await show_dashboard_ui(message, message.from_user.id)
@@ -2045,6 +2410,20 @@ async def save_unban_features_changes(callback: types.CallbackQuery, state: FSMC
     
     ban_record = col_banned.find_one({"user_id": target_id})
     banned_features = ban_record.get("banned_features", []) if ban_record else []
+    
+    # Get all features to find which were unbanned
+    all_features = ["downloads", "reviews", "support", "search"]
+    unbanned_features = [f for f in all_features if f not in banned_features]
+    
+    # Log unban features action if any features were unbanned
+    if unbanned_features:
+        await log_ban_action(
+            action_type="unban_features",
+            user_id=target_id,
+            user_name=name,
+            admin_name=callback.from_user.first_name,
+            banned_features=unbanned_features
+        )
     
     if banned_features:
         features_list = ", ".join([f.title() for f in banned_features])
@@ -3586,9 +3965,9 @@ async def change_cooldown_prompt(callback: types.CallbackQuery, state: FSMContex
             InlineKeyboardButton(text="🔙 Cancel", callback_data="review_settings")
         ]])
     )
-    await state.set_state(ReviewState.waiting_cooldown_days)
+    await state.set_state(AppealState.waiting_cooldown_days)
 
-@dp.message(ReviewState.waiting_cooldown_days)
+@dp.message(AppealState.waiting_cooldown_days)
 async def handle_cooldown_input(message: types.Message, state: FSMContext):
     """Handle cooldown days input"""
     if message.from_user.id != OWNER_ID:
@@ -5260,6 +5639,1070 @@ async def enhanced_real_time_monitoring(message: types.Message):
         reply_markup=keyboard
     )
 
+
+# ==========================================
+# 🔔 BAN APPEALS MANAGEMENT SYSTEM
+# ==========================================
+
+@dp.callback_query(F.data == "btn_appeals")
+async def appeals_dashboard(callback: types.CallbackQuery):
+    """Show appeals management dashboard"""
+    if not is_admin(callback.from_user.id): return
+    
+    # Count appeals by status
+    total_appeals = col_appeals.count_documents({})
+    pending_appeals = col_appeals.count_documents({"status": "pending"})
+    approved_appeals = col_appeals.count_documents({"status": "approved"})
+    rejected_appeals = col_appeals.count_documents({"status": "rejected"})
+    
+    text = (
+        f"🔔 **BAN APPEALS MANAGEMENT**\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 **Statistics:**\n"
+        f"• Total Appeals: `{total_appeals}`\n"
+        f"• ⏳ Pending: `{pending_appeals}`\n"
+        f"• ✅ Approved: `{approved_appeals}`\n"
+        f"• ❌ Rejected: `{rejected_appeals}`\n\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"**Available Actions:**\n"
+        f"• View all pending appeals\n"
+        f"• Review appeal history\n"
+        f"• Manage warning templates\n\n"
+        f"Select an option below:"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text=f"⏳ Pending Appeals ({pending_appeals})", callback_data="appeals_view_pending"))
+    kb.row(InlineKeyboardButton(text="📋 All Appeals", callback_data="appeals_view_all"))
+    kb.row(
+        InlineKeyboardButton(text="🔍 Search User", callback_data="appeals_search_user"),
+        InlineKeyboardButton(text="📊 Templates", callback_data="appeals_templates")
+    )
+    kb.row(InlineKeyboardButton(text="🔙 Back to Hub", callback_data="btn_refresh"))
+    
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "appeals_view_pending")
+@dp.callback_query(F.data.startswith("appeals_page_"))
+async def view_pending_appeals(callback: types.CallbackQuery):
+    """Show all pending appeals with pagination"""
+    if not is_admin(callback.from_user.id): return
+    
+    # Get page number
+    page = 0
+    if callback.data.startswith("appeals_page_"):
+        try:
+            page = int(callback.data.split("_")[-1])
+        except:
+            page = 0
+    
+    # Pagination settings
+    per_page = 20
+    skip = page * per_page
+    
+    # Get total count
+    total_pending = col_appeals.count_documents({"status": "pending"})
+    total_pages = (total_pending + per_page - 1) // per_page
+    
+    pending = list(col_appeals.find({"status": "pending"}).sort("appeal_date", -1).skip(skip).limit(per_page))
+    
+    if not pending:
+        text = (
+            f"⏳ **PENDING APPEALS**\n"
+            f"━━━━━━━━━━━━━━━━━\n\n"
+            f"✨ No pending appeals!\n\n"
+            f"All appeals have been reviewed."
+        )
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="🔙 Back to Appeals", callback_data="btn_appeals"))
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        return
+    
+    text = (
+        f"⏳ **PENDING APPEALS ({len(pending)})**\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+    )
+    
+    for idx, appeal in enumerate(pending, 1):
+        user_id = appeal.get("user_id", "Unknown")
+        msa_id = appeal.get("msa_id", "UNKNOWN")
+        username = appeal.get("username", "No Username")
+        appeal_text = appeal.get("appeal_text", "No message")
+        ban_reason = appeal.get("ban_reason", "Unknown")
+        appeal_date = appeal.get("appeal_date")
+        appeal_date_str = appeal_date.strftime("%d-%m-%Y %I:%M %p") if appeal_date else "Unknown"
+        
+        # Truncate long appeals
+        if len(appeal_text) > 100:
+            appeal_text = appeal_text[:100] + "..."
+        
+        text += (
+            f"**{idx}. User: @{username}**\n"
+            f"   • MSA ID: `{msa_id}`\n"
+            f"   • User ID: `{user_id}`\n"
+            f"   • Ban Reason: {ban_reason}\n"
+            f"   • Appeal: _{appeal_text}_\n"
+            f"   • Date: {appeal_date_str}\n\n"
+        )
+    
+    text += f"━━━━━━━━━━━━━━━━━\n"
+    text += f"\n� Page {page + 1} of {total_pages} | Total: {total_pending}\n"
+    text += f"\n💡 **Click a user to review their appeal**"
+    
+    kb = InlineKeyboardBuilder()
+    # Add button for each pending appeal
+    for appeal in pending:
+        user_id = appeal.get("user_id", "Unknown")
+        username = appeal.get("username", "Unknown")[:15]
+        kb.row(InlineKeyboardButton(
+            text=f"👤 {username} ({user_id})",
+            callback_data=f"appeal_review_{user_id}"
+        ))
+    
+    # Pagination buttons
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"appeals_page_{page-1}"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton(text="➡️ Next", callback_data=f"appeals_page_{page+1}"))
+        if nav_buttons:
+            kb.row(*nav_buttons)
+    
+    kb.row(InlineKeyboardButton(text="🔄 Refresh", callback_data="appeals_view_pending"))
+    kb.row(InlineKeyboardButton(text="🔙 Back to Appeals", callback_data="btn_appeals"))
+    
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "appeals_view_all")
+async def view_all_appeals(callback: types.CallbackQuery):
+    """Show all appeals (recent 20)"""
+    if not is_admin(callback.from_user.id): return
+    
+    appeals = list(col_appeals.find({}).sort("appeal_date", -1).limit(20))
+    
+    if not appeals:
+        text = (
+            f"📋 **ALL APPEALS**\n"
+            f"━━━━━━━━━━━━━━━━━\n\n"
+            f"❌ No appeals found in database."
+        )
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="🔙 Back to Appeals", callback_data="btn_appeals"))
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        return
+    
+    text = (
+        f"📋 **ALL APPEALS (Recent {len(appeals)})**\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+    )
+    
+    for idx, appeal in enumerate(appeals, 1):
+        user_id = appeal.get("user_id", "Unknown")
+        msa_id = appeal.get("msa_id", "UNKNOWN")
+        status = appeal.get("status", "unknown")
+        appeal_date = appeal.get("appeal_date")
+        appeal_date_str = appeal_date.strftime("%d-%m-%Y") if appeal_date else "Unknown"
+        
+        status_emoji = {
+            "pending": "⏳",
+            "approved": "✅",
+            "rejected": "❌"
+        }.get(status, "❓")
+        
+        text += f"{idx}. {status_emoji} MSA: `{msa_id}` | ID: `{user_id}` | {appeal_date_str}\n"
+    
+    text += f"\n━━━━━━━━━━━━━━━━━"
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔄 Refresh", callback_data="appeals_view_all"))
+    kb.row(InlineKeyboardButton(text="🔙 Back to Appeals", callback_data="btn_appeals"))
+    
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "appeals_templates")
+async def show_appeal_templates(callback: types.CallbackQuery):
+    """Show pre-defined warning templates"""
+    if not is_admin(callback.from_user.id): return
+    
+    templates = {
+        "warning": "⚠️ **FINAL WARNING**\n\nYour appeal has been reviewed. You are being given ONE more chance.\n\n**DO NOT REPEAT YOUR VIOLATION.**\n\nAny future violations will result in permanent ban with no appeal option.\n\nPlease respect bot usage guidelines.",
+        "rejected_spam": "❌ **APPEAL REJECTED**\n\n**Reason:** Spam behavior detected\n\nYour appeal has been reviewed and rejected. The ban remains in effect.\n\nSpamming the bot is not tolerated. This decision is final.",
+        "rejected_abuse": "❌ **APPEAL REJECTED**\n\n**Reason:** Abuse of bot features\n\nYour appeal has been denied. The ban will remain permanent.\n\nAbusing bot features violates our terms of service. No further appeals will be considered.",
+        "approved": "✅ **APPEAL APPROVED**\n\nYour ban has been lifted. You now have full access to the bot.\n\n**This is your second chance - use it wisely.**\n\n⚠️ Any future violations will result in immediate permanent ban with no appeal option.\n\nWelcome back!",
+        "under_review": "⏳ **APPEAL UNDER REVIEW**\n\nThank you for your appeal. Our team is currently reviewing your case.\n\nYou will receive a response within 24 hours.\n\nPlease do not submit multiple appeals - this will not speed up the process."
+    }
+    
+    text = (
+        f"📝 **WARNING TEMPLATES**\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"**Available Templates:**\n\n"
+    )
+    
+    for idx, (key, template) in enumerate(templates.items(), 1):
+        template_preview = template.split('\n')[0]  # First line only
+        text += f"{idx}. **{key.replace('_', ' ').title()}**\n   _{template_preview}_\n\n"
+    
+    text += (
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"💡 **Usage:**\n"
+        f"Templates are used when approving/rejecting appeals."
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔙 Back to Appeals", callback_data="btn_appeals"))
+    
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+
+
+# ==========================================
+# 🔍 SEARCH USER & REVIEW APPEAL HANDLERS
+# ==========================================
+
+@dp.callback_query(F.data == "appeals_search_user")
+async def prompt_search_user(callback: types.CallbackQuery):
+    """Prompt admin to enter user ID for search"""
+    if not is_admin(callback.from_user.id): return
+    
+    await callback.message.edit_text(
+        "🔍 **SEARCH USER BY ID**\n\n"
+        "Enter User ID or MSA ID to:\n"
+        "• View complete ban history\n"
+        "• See appeal history\n"
+        "• Review or approve/reject appeals\n\n"
+        "💡 **Type the ID in chat** (not here)",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔙 Back to Appeals", callback_data="btn_appeals")
+        ]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@dp.message(F.text)
+async def search_user_history(message: types.Message):
+    """Search and display complete user history when admin types ID"""
+    if not is_admin(message.from_user.id): return
+    
+    # Only process if it looks like an ID (numeric or starts with MSA)
+    search_id = message.text.strip()
+    if not (search_id.isdigit() or search_id.upper().startswith("MSA")):
+        return  # Not an ID, ignore
+    
+    # Try to resolve user ID
+    target_id, name = resolve_user_id(search_id)
+    if not target_id:
+        await message.answer("❌ User not found. Try another ID.")
+        return
+    
+    # Get user details
+    user_doc = col_users.find_one({"user_id": target_id})
+    ban_record = col_banned.find_one({"user_id": target_id})
+    
+    if not user_doc and not ban_record:
+        await message.answer(f"❌ No records found for ID: {search_id}")
+        await state.clear()
+        return
+    
+    msa_id = (user_doc.get("msa_id") if user_doc else ban_record.get("msa_id", "UNKNOWN")) if (user_doc or ban_record) else "UNKNOWN"
+    username = (user_doc.get("username") if user_doc else ban_record.get("username", "Unknown")) if (user_doc or ban_record) else "Unknown"
+    
+    # Get complete ban history
+    ban_history = list(col_ban_history.find({"user_id": target_id}).sort("timestamp", -1))
+    ban_count = len([h for h in ban_history if h.get("action_type") in ["ban", "auto_ban"]])
+    
+    # Get appeal history
+    appeal_history = list(col_appeals.find({"user_id": target_id}).sort("appeal_date", -1))
+    
+    # Build detailed report
+    report = (
+        f"👤 **USER DETAILED REPORT**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 **User Info:**\n"
+        f"• MSA ID: `{msa_id}`\n"
+        f"• Telegram ID: `{target_id}`\n"
+        f"• Username: @{username}\n"
+        f"• Name: {name}\n\n"
+        f"📊 **Statistics:**\n"
+        f"• 🚫 Total Bans: `{ban_count}`\n"
+        f"• 📜 History Records: `{len(ban_history)}`\n"
+        f"• 🔔 Appeals: `{len(appeal_history)}`\n\n"
+    )
+    
+    # Current ban status
+    if ban_record:
+        report += (
+            f"⚠️ **CURRENTLY BANNED**\n"
+            f"• Reason: {ban_record.get('reason', 'Unknown')}\n"
+            f"• By: {ban_record.get('banned_by', 'System')}\n\n"
+        )
+    else:
+        report += f"✅ **NOT BANNED** (Currently Active)\n\n"
+    
+    report += f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    # Show recent ban history (last 5)
+    if ban_history:
+        report += f"📋 **Recent Ban History (Last 5):**\n\n"
+        for idx, record in enumerate(ban_history[:5], 1):
+            action = record.get("action_type", "unknown")
+            reason = record.get("reason", "N/A")
+            timestamp = record.get("timestamp")
+            date_str = timestamp.strftime("%d-%m-%Y") if timestamp else "Unknown"
+            
+            emoji = "🚫" if action in ["ban", "auto_ban"] else "✅" if action in ["unban", "appeal_approved"] else "⏸️"
+            report += f"{idx}. {emoji} {action.upper()} - {date_str}\n   Reason: {reason}\n\n"
+    
+    # Show pending appeals
+    pending_appeal = col_appeals.find_one({"user_id": target_id, "status": "pending"})
+    
+    await message.answer(report, parse_mode="Markdown")
+    
+    # If has pending appeal, show action buttons
+    if pending_appeal:
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="✅ Approve Options", callback_data=f"quick_approve_menu_{target_id}"))
+        kb.row(InlineKeyboardButton(text="❌ Reject Options", callback_data=f"quick_reject_menu_{target_id}"))
+        kb.row(InlineKeyboardButton(text="📝 Full Review", callback_data=f"appeal_review_{target_id}"))
+        kb.row(InlineKeyboardButton(text="🔙 Back to Appeals", callback_data="btn_appeals"))
+        await message.answer(
+            "⏳ **This user has a PENDING appeal**\n\n"
+            "Quick Actions:",
+            reply_markup=kb.as_markup(),
+            parse_mode="Markdown"
+        )
+
+
+@dp.callback_query(F.data.startswith("appeal_review_"))
+async def review_specific_appeal(callback: types.CallbackQuery):
+    """Review a specific user's appeal with full details and action buttons"""
+    if not is_admin(callback.from_user.id): return
+    
+    user_id = callback.data.split("_")[-1]
+    
+    # Get appeal details
+    appeal = col_appeals.find_one({"user_id": user_id, "status": "pending"})
+    if not appeal:
+        await callback.answer("❌ No pending appeal found for this user!", show_alert=True)
+        return
+    
+    # Get ban history count
+    ban_history = list(col_ban_history.find({"user_id": user_id}))
+    ban_count = len([h for h in ban_history if h.get("action_type") in ["ban", "auto_ban"]])
+    
+    msa_id = appeal.get("msa_id", "UNKNOWN")
+    username = appeal.get("username", "No Username")
+    user_name = appeal.get("user_name", "Unknown")
+    appeal_text = appeal.get("appeal_text", "No message")
+    ban_reason = appeal.get("ban_reason", "Unknown")
+    banned_by = appeal.get("banned_by", "System")
+    appeal_date = appeal.get("appeal_date")
+    appeal_date_str = appeal_date.strftime("%d-%m-%Y %I:%M %p") if appeal_date else "Unknown"
+    
+    # Build detailed appeal view
+    text = (
+        f"📝 **APPEAL REVIEW**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 **User Information:**\n"
+        f"• MSA ID: `{msa_id}`\n"
+        f"• User ID: `{user_id}`\n"
+        f"• Username: @{username}\n"
+        f"• Name: {user_name}\n\n"
+        f"🚫 **Ban Details:**\n"
+        f"• Reason: {ban_reason}\n"
+        f"• Banned By: {banned_by}\n"
+        f"• 🔢 Previous Ban Count: **{ban_count}**\n\n"
+        f"📝 **Appeal Message:**\n"
+        f"_{appeal_text}_\n\n"
+        f"🕐 Appeal Date: {appeal_date_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**Choose an action:**"
+    )
+    
+    # Action buttons
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Approve (Default)", callback_data=f"approve_default_{user_id}"),
+        InlineKeyboardButton(text="❌ Reject (Default)", callback_data=f"reject_default_{user_id}")
+    )
+    kb.row(InlineKeyboardButton(text="✅ Approve with Template", callback_data=f"approve_template_{user_id}"))
+    kb.row(InlineKeyboardButton(text="❌ Reject with Template", callback_data=f"reject_template_{user_id}"))
+    kb.row(InlineKeyboardButton(text="✍️ Custom Message", callback_data=f"custom_message_{user_id}"))
+    kb.row(InlineKeyboardButton(text="📊 View Full History", callback_data=f"appeals_search_user"))
+    kb.row(InlineKeyboardButton(text="🔙 Back", callback_data="appeals_view_pending"))
+    
+    await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+# Template selection handlers
+@dp.callback_query(F.data.startswith("approve_template_"))
+@dp.callback_query(F.data.startswith("quick_approve_menu_"))
+async def show_approve_templates(callback: types.CallbackQuery):
+    """Show approval message templates as buttons"""
+    if not is_admin(callback.from_user.id): return
+    
+    user_id = callback.data.split("_")[-1]
+    
+    text = (
+        "✅ **APPROVAL TEMPLATES**\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "Select a template to send with approval:\n\n"
+        "📋 **Standard:** Ban lifted, full features restored\n"
+        "⚠️ **Final Warning:** Strict warning included\n"
+        "📅 **Probation:** 30-day monitoring period"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📋 Standard Approval", callback_data=f"approve_tmpl_1_{user_id}"))
+    kb.row(InlineKeyboardButton(text="⚠️ Final Warning Approval", callback_data=f"approve_tmpl_2_{user_id}"))
+    kb.row(InlineKeyboardButton(text="📅 Probation Approval", callback_data=f"approve_tmpl_3_{user_id}"))
+    kb.row(InlineKeyboardButton(text="🔙 Back", callback_data=f"appeal_review_{user_id}"))
+    
+    await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("reject_template_"))
+@dp.callback_query(F.data.startswith("quick_reject_menu_"))
+async def show_reject_templates(callback: types.CallbackQuery):
+    """Show rejection message templates as buttons"""
+    if not is_admin(callback.from_user.id): return
+    
+    user_id = callback.data.split("_")[-1]
+    
+    text = (
+        "❌ **REJECTION TEMPLATES**\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "Select a template to send with rejection:\n\n"
+        "🚫 **Spam:** Spam behavior violation\n"
+        "⛔ **Abuse:** Bot feature abuse\n"
+        "📝 **Insufficient:** Appeal doesn't meet criteria"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🚫 Spam Violation", callback_data=f"reject_tmpl_1_{user_id}"))
+    kb.row(InlineKeyboardButton(text="⛔ Abuse Violation", callback_data=f"reject_tmpl_2_{user_id}"))
+    kb.row(InlineKeyboardButton(text="📝 Insufficient Appeal", callback_data=f"reject_tmpl_3_{user_id}"))
+    kb.row(InlineKeyboardButton(text="🔙 Back", callback_data=f"appeal_review_{user_id}"))
+    
+    await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+# Template button handlers
+@dp.callback_query(F.data.startswith("approve_tmpl_"))
+async def approve_with_template(callback: types.CallbackQuery):
+    """Handle approval template button click"""
+    if not is_admin(callback.from_user.id): return
+    
+    parts = callback.data.split("_")
+    template_num = parts[2]
+    user_id = parts[3]
+    
+    templates = {
+        "1": (
+            "✅ **APPEAL APPROVED - STANDARD**\n\n"
+            "Your ban has been lifted.\n\n"
+            "**ALL FEATURES RESTORED:**\n"
+            "• Full bot access\n"
+            "• All commands enabled\n"
+            "• Premium features active\n\n"
+            "⚠️ **FINAL WARNING:**\n"
+            "This is your SECOND CHANCE.\n"
+            "DO NOT REPEAT VIOLATIONS!\n\n"
+            "Any future violations = Permanent ban with no appeal option.\n\n"
+            "Welcome back! Please follow all rules."
+        ),
+        "2": (
+            "✅ **APPEAL APPROVED - FINAL WARNING**\n\n"
+            "⚠️ YOUR BAN HAS BEEN LIFTED WITH STRICT CONDITIONS\n\n"
+            "**This is your ABSOLUTE FINAL chance!**\n\n"
+            "✅ All features have been restored.\n\n"
+            "**❌ ZERO TOLERANCE POLICY:**\n"
+            "• ANY future violation = IMMEDIATE PERMANENT BAN\n"
+            "• NO exceptions\n"
+            "• NO further appeals will be accepted\n\n"
+            "You are under strict observation.\n"
+            "Follow ALL bot rules and guidelines.\n\n"
+            "Use this opportunity wisely!"
+        ),
+        "3": (
+            "✅ **APPEAL APPROVED - PROBATION PERIOD**\n\n"
+            "Your ban has been lifted with CONDITIONS:\n\n"
+            "📋 **PROBATION TERMS:**\n"
+            "• 30-day probation period\n"
+            "• Monitored usage\n"
+            "• Limited initial access\n\n"
+            "✅ Full features will be restored after successful probation.\n\n"
+            "⚠️ **Warning:**\n"
+            "Any violation during probation = Immediate permanent ban\n\n"
+            "Follow the rules strictly during this period."
+        )
+    }
+    
+    await execute_appeal_approval(callback, user_id, templates.get(template_num))
+
+
+@dp.callback_query(F.data.startswith("reject_tmpl_"))
+async def reject_with_template(callback: types.CallbackQuery):
+    """Handle rejection template button click"""
+    if not is_admin(callback.from_user.id): return
+    
+    parts = callback.data.split("_")
+    template_num = parts[2]
+    user_id = parts[3]
+    
+    templates = {
+        "1": (
+            "❌ **APPEAL REJECTED - SPAM VIOLATION**\n\n"
+            "Your appeal has been reviewed and REJECTED.\n\n"
+            "**Reason:** Spam behavior detected\n\n"
+            "Your actions violated our anti-spam policy:\n"
+            "• Excessive spam messages\n"
+            "• Automated/bot-like behavior\n"
+            "• Mass operations detected\n\n"
+            "**The ban remains PERMANENT.**\n\n"
+            "⚠️ This decision is FINAL.\n"
+            "No further appeals will be considered.\n\n"
+            "Please respect bot policies."
+        ),
+        "2": (
+            "❌ **APPEAL REJECTED - ABUSE VIOLATION**\n\n"
+            "Your appeal has been DENIED.\n\n"
+            "**Reason:** Abuse of bot features\n\n"
+            "You violated our terms of service by:\n"
+            "• Exploiting bot features\n"
+            "• Attempting to manipulate systems\n"
+            "• Abusive behavior\n\n"
+            "**The ban is PERMANENT.**\n\n"
+            "⚠️ This decision is FINAL and IRREVERSIBLE.\n"
+            "No further appeals will be processed.\n\n"
+            "Thank you for understanding."
+        ),
+        "3": (
+            "❌ **APPEAL REJECTED - INSUFFICIENT APPEAL**\n\n"
+            "Your appeal has been reviewed and REJECTED.\n\n"
+            "**Reason:** Appeal does not meet requirements\n\n"
+            "Your appeal was rejected because:\n"
+            "• Insufficient explanation\n"
+            "• No acknowledgment of violation\n"
+            "• Failed to demonstrate understanding of rules\n\n"
+            "**The ban remains in effect.**\n\n"
+            "⚠️ You may submit ONE more appeal in 7 days.\n"
+            "Make sure to provide a proper explanation next time."
+        )
+    }
+    
+    await execute_appeal_rejection(callback, user_id, templates.get(template_num))
+
+
+@dp.callback_query(F.data.startswith("approve_default_"))
+async def approve_with_default_message(callback: types.CallbackQuery):
+    """Approve appeal with default message"""
+    if not is_admin(callback.from_user.id): return
+    
+    user_id = callback.data.split("_")[-1]
+    await execute_appeal_approval(callback, user_id, None)
+
+
+@dp.callback_query(F.data.startswith("reject_default_"))
+async def reject_with_default_message(callback: types.CallbackQuery):
+    """Reject appeal with default message"""
+    if not is_admin(callback.from_user.id): return
+    
+    user_id = callback.data.split("_")[-1]
+    await execute_appeal_rejection(callback, user_id, None)
+
+
+# Appeal action handlers (from inline buttons in channel)
+@dp.callback_query(F.data.startswith("approve_appeal_"))
+async def approve_appeal_action(callback: types.CallbackQuery):
+    """Approve a ban appeal and unban user"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Admin only!", show_alert=True)
+        return
+    
+    user_id = callback.data.split("_")[-1]
+    
+    # Get appeal details
+    appeal = col_appeals.find_one({"user_id": user_id, "status": "pending"})
+    if not appeal:
+        await callback.answer("❌ Appeal not found or already processed!", show_alert=True)
+        return
+    
+    # Update appeal status
+    col_appeals.update_one(
+        {"user_id": user_id, "status": "pending"},
+        {
+            "$set": {
+                "status": "approved",
+                "reviewed_by": callback.from_user.id,
+                "review_date": datetime.now(IST),
+                "response": "Appeal approved - ban lifted"
+            }
+        }
+    )
+    
+    # Unban user - restore ALL features
+    ban_record = col_banned.find_one({"user_id": user_id})
+    if ban_record:
+        # Remove from banned collection
+        col_banned.delete_one({"user_id": user_id})
+        
+        # Restore all user features and set warning flags
+        col_users.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "was_unbanned": True,
+                    "previous_ban_reason": ban_record.get("reason", "Unknown"),
+                    "unbanned_at": datetime.now(IST),
+                    "unbanned_by": callback.from_user.id,
+                    "has_warning": True,
+                    "warning_message": "⚠️ DO NOT REPEAT VIOLATIONS - This is your final warning!"
+                },
+                "$unset": {
+                    "banned": "",
+                    "ban_reason": "",
+                    "ban_type": ""
+                }
+            },
+            upsert=True
+        )
+        
+        # Log in ban history
+        col_ban_history.insert_one({
+            "user_id": user_id,
+            "msa_id": appeal.get("msa_id", "UNKNOWN"),
+            "username": appeal.get("username", "No Username"),
+            "user_name": appeal.get("user_name", "Unknown"),
+            "action_type": "appeal_approved",
+            "admin_id": callback.from_user.id,
+            "admin_name": callback.from_user.username or str(callback.from_user.id),
+            "reason": "Ban appeal approved",
+            "timestamp": datetime.now(IST),
+            "previous_ban_reason": ban_record.get("reason", "Unknown")
+        })
+    
+    # Notify user with detailed message
+    msa_id = appeal.get("msa_id", "UNKNOWN")
+    username = appeal.get("username", "User")
+    try:
+        await worker_bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "✅ **BAN APPEAL APPROVED**\n\n"
+                f"👤 **MSA ID:** `{msa_id}`\n"
+                f"👤 **Username:** @{username}\n\n"
+                "🎉 **Your ban has been lifted!**\n\n"
+                "✨ **ALL FEATURES RESTORED:**\n"
+                "   • ✅ Full bot access\n"
+                "   • ✅ All commands enabled\n"
+                "   • ✅ Premium features active\n"
+                "   • ✅ MSA submissions allowed\n\n"
+                "⚠️ **FINAL WARNING:**\n"
+                "**This is your SECOND CHANCE - DO NOT REPEAT VIOLATIONS!**\n\n"
+                "❌ Any future violations will result in:\n"
+                "   • Immediate permanent ban\n"
+                "   • No appeal option\n"
+                "   • No exceptions\n\n"
+                "📱 Please follow all bot rules and guidelines.\n\n"
+                "Welcome back! 🎊"
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_id}: {e}")
+    
+    # Update callback message
+    try:
+        await callback.message.edit_text(
+            callback.message.text + f"\n\n✅ **APPROVED** by MSA NODE AGENT",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.answer("✅ Appeal approved and user unbanned!", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("reject_appeal_"))
+async def reject_appeal_action(callback: types.CallbackQuery):
+    """Reject a ban appeal"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Admin only!", show_alert=True)
+        return
+    
+    user_id = callback.data.split("_")[-1]
+    
+    # Get appeal details
+    appeal = col_appeals.find_one({"user_id": user_id, "status": "pending"})
+    if not appeal:
+        await callback.answer("❌ Appeal not found or already processed!", show_alert=True)
+        return
+    
+    # Update appeal status
+    col_appeals.update_one(
+        {"user_id": user_id, "status": "pending"},
+        {
+            "$set": {
+                "status": "rejected",
+                "reviewed_by": callback.from_user.id,
+                "review_date": datetime.now(IST),
+                "response": "Appeal rejected - ban remains"
+            }
+        }
+    )
+    
+    # Log in ban history
+    col_ban_history.insert_one({
+        "user_id": user_id,
+        "msa_id": appeal.get("msa_id", "UNKNOWN"),
+        "username": appeal.get("username", "No Username"),
+        "user_name": appeal.get("user_name", "Unknown"),
+        "action_type": "appeal_rejected",
+        "admin_name": callback.from_user.username or str(callback.from_user.id),
+        "reason": "Ban appeal rejected",
+        "timestamp": datetime.now(IST)
+    })
+    
+    # Notify user with MSA ID
+    msa_id = appeal.get("msa_id", "UNKNOWN")
+    username = appeal.get("username", "User")
+    ban_reason = appeal.get("ban_reason", "Violation of bot rules")
+    try:
+        await worker_bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "❌ **BAN APPEAL REJECTED**\n\n"
+                f"👤 **MSA ID:** `{msa_id}`\n"
+                f"👤 **Username:** @{username}\n\n"
+                "🚫 **Decision:** Your appeal has been reviewed and REJECTED.\n\n"
+                f"**Original Ban Reason:** {ban_reason}\n\n"
+                "❌ **The ban remains in effect.**\n\n"
+                "**Reason for Rejection:**\n"
+                "Your appeal did not meet the criteria for approval.\n\n"
+                "⚠️ **This decision is FINAL.**\n"
+                "No further appeals will be considered.\n\n"
+                "Please respect the bot's terms of service."
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_id}: {e}")
+    
+    # Update callback message
+    try:
+        await callback.message.edit_text(
+            callback.message.text + f"\n\n❌ **REJECTED** by admin {callback.from_user.username or callback.from_user.id}",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.answer("❌ Appeal rejected!", show_alert=True)
+
+
+# ==========================================
+# 🔧 APPEAL EXECUTION FUNCTIONS
+# ==========================================
+
+async def execute_appeal_approval(callback: types.CallbackQuery, user_id: str, custom_message: str = None):
+    """Execute appeal approval with optional custom message"""
+    # Get appeal details
+    appeal = col_appeals.find_one({"user_id": user_id, "status": "pending"})
+    if not appeal:
+        await callback.answer("❌ Appeal not found or already processed!", show_alert=True)
+        return
+    
+    # Update appeal status
+    col_appeals.update_one(
+        {"user_id": user_id, "status": "pending"},
+        {
+            "$set": {
+                "status": "approved",
+                "reviewed_by": callback.from_user.id,
+                "review_date": datetime.now(IST),
+                "response": custom_message or "Appeal approved - ban lifted"
+            }
+        }
+    )
+    
+    # Unban user - restore ALL features
+    ban_record = col_banned.find_one({"user_id": user_id})
+    if ban_record:
+        col_banned.delete_one({"user_id": user_id})
+        
+        col_users.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "was_unbanned": True,
+                    "previous_ban_reason": ban_record.get("reason", "Unknown"),
+                    "unbanned_at": datetime.now(IST),
+                    "unbanned_by": callback.from_user.id,
+                    "has_warning": True,
+                    "warning_message": "⚠️ DO NOT REPEAT VIOLATIONS - This is your final warning!"
+                },
+                "$unset": {"banned": "", "ban_reason": "", "ban_type": ""}
+            },
+            upsert=True
+        )
+        
+        col_ban_history.insert_one({
+            "user_id": user_id,
+            "msa_id": appeal.get("msa_id", "UNKNOWN"),
+            "username": appeal.get("username", "No Username"),
+            "user_name": appeal.get("user_name", "Unknown"),
+            "action_type": "appeal_approved",
+            "admin_id": callback.from_user.id,
+            "admin_name": callback.from_user.username or str(callback.from_user.id),
+            "reason": "Ban appeal approved",
+            "timestamp": datetime.now(IST),
+            "previous_ban_reason": ban_record.get("reason", "Unknown"),
+            "custom_message": custom_message
+        })
+    
+    # Send notification to user
+    msa_id = appeal.get("msa_id", "UNKNOWN")
+    username = appeal.get("username", "User")
+    
+    if custom_message:
+        user_message = custom_message
+    else:
+        user_message = (
+            "✅ **BAN APPEAL APPROVED**\n\n"
+            f"🆔 **MSA ID:** `{msa_id}`\n"
+            f"👤 **Username:** @{username}\n\n"
+            "🎉 **Your ban has been lifted!**\n\n"
+            "✨ **ALL FEATURES RESTORED:**\n"
+            "   • ✅ Full bot access\n"
+            "   • ✅ All commands enabled\n"
+            "   • ✅ Premium features active\n"
+            "   • ✅ MSA submissions allowed\n\n"
+            "⚠️ **FINAL WARNING:**\n"
+            "**This is your SECOND CHANCE - DO NOT REPEAT VIOLATIONS!**\n\n"
+            "❌ Any future violations will result in:\n"
+            "   • Immediate permanent ban\n"
+            "   • No appeal option\n"
+            "   • No exceptions\n\n"
+            "📱 Please follow all bot rules and guidelines.\n\n"
+            "Welcome back! 🎊"
+        )
+    
+    try:
+        await worker_bot.send_message(chat_id=int(user_id), text=user_message, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_id}: {e}")
+    
+    # Update channel message status
+    try:
+        channel_msg_id = appeal.get("channel_message_id")
+        if channel_msg_id:
+            await worker_bot.edit_message_text(
+                chat_id=APPEAL_CHANNEL_ID,
+                message_id=channel_msg_id,
+                text=appeal.get("original_text", "") + f"\n\n✅ **APPROVED** by @{callback.from_user.username or callback.from_user.id}\n🕐 {datetime.now(IST).strftime('%d-%m-%Y %I:%M %p')}",
+                parse_mode="Markdown"
+            )
+    except:
+        pass
+    
+    await callback.answer("✅ Appeal approved! User has been unbanned.", show_alert=True)
+    # Refresh the view
+    try:
+        await callback.message.edit_text(
+            "✅ **Appeal Approved Successfully!**\n\n"
+            "User has been notified and unbanned.\n"
+            "All features have been restored.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back to Pending", callback_data="appeals_view_pending")
+            ]]),
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+
+
+async def execute_appeal_rejection(callback: types.CallbackQuery, user_id: str, custom_message: str = None):
+    """Execute appeal rejection with optional custom message"""
+    appeal = col_appeals.find_one({"user_id": user_id, "status": "pending"})
+    if not appeal:
+        await callback.answer("❌ Appeal not found or already processed!", show_alert=True)
+        return
+    
+    col_appeals.update_one(
+        {"user_id": user_id, "status": "pending"},
+        {
+            "$set": {
+                "status": "rejected",
+                "reviewed_by": callback.from_user.id,
+                "review_date": datetime.now(IST),
+                "response": custom_message or "Appeal rejected - ban remains"
+            }
+        }
+    )
+    
+    col_ban_history.insert_one({
+        "user_id": user_id,
+        "msa_id": appeal.get("msa_id", "UNKNOWN"),
+        "username": appeal.get("username", "No Username"),
+        "user_name": appeal.get("user_name", "Unknown"),
+        "action_type": "appeal_rejected",
+        "admin_id": callback.from_user.id,
+        "admin_name": callback.from_user.username or str(callback.from_user.id),
+        "reason": "Ban appeal rejected",
+        "timestamp": datetime.now(IST),
+        "custom_message": custom_message
+    })
+    
+    msa_id = appeal.get("msa_id", "UNKNOWN")
+    username = appeal.get("username", "User")
+    ban_reason = appeal.get("ban_reason", "Violation of bot rules")
+    
+    if custom_message:
+        user_message = custom_message
+    else:
+        user_message = (
+            "❌ **BAN APPEAL REJECTED**\n\n"
+            f"🆔 **MSA ID:** `{msa_id}`\n"
+            f"👤 **Username:** @{username}\n\n"
+            "🚫 **Decision:** Your appeal has been reviewed and REJECTED.\n\n"
+            f"**Original Ban Reason:** {ban_reason}\n\n"
+            "❌ **The ban remains in effect.**\n\n"
+            "**Reason for Rejection:**\n"
+            "Your appeal did not meet the criteria for approval.\n\n"
+            "⚠️ **This decision is FINAL.**\n"
+            "No further appeals will be considered.\n\n"
+            "Please respect the bot's terms of service."
+        )
+    
+    try:
+        await worker_bot.send_message(chat_id=int(user_id), text=user_message, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_id}: {e}")
+    
+    # Update channel message status
+    try:
+        channel_msg_id = appeal.get("channel_message_id")
+        if channel_msg_id:
+            await worker_bot.edit_message_text(
+                chat_id=APPEAL_CHANNEL_ID,
+                message_id=channel_msg_id,
+                text=appeal.get("original_text", "") + f"\n\n❌ **REJECTED** by @{callback.from_user.username or callback.from_user.id}\n🕐 {datetime.now(IST).strftime('%d-%m-%Y %I:%M %p')}",
+                parse_mode="Markdown"
+            )
+    except:
+        pass
+    
+    await callback.answer("❌ Appeal rejected!", show_alert=True)
+    try:
+        await callback.message.edit_text(
+            "❌ **Appeal Rejected**\n\n"
+            "User has been notified.\n"
+            "Ban remains in effect.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back to Pending", callback_data="appeals_view_pending")
+            ]]),
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+
+
+@dp.callback_query(F.data.startswith("warn_appeal_"))
+async def warn_appeal_action(callback: types.CallbackQuery, state: FSMContext):
+    """Send warning message to user"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Admin only!", show_alert=True)
+        return
+    
+    user_id = callback.data.split("_")[-1]
+    
+    # Get appeal details
+    appeal = col_appeals.find_one({"user_id": user_id, "status": "pending"})
+    if not appeal:
+        await callback.answer("❌ Appeal not found!", show_alert=True)
+        return
+    
+    # Show template selection
+    text = (
+        f"⚠️ **SEND WARNING MESSAGE**\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 User: @{appeal.get('username', 'Unknown')}\n"
+        f"📝 MSA ID: `{appeal.get('msa_id', 'UNKNOWN')}`\n\n"
+        f"**Select a template:**\n"
+        f"1️⃣ Final Warning\n"
+        f"2️⃣ Rejected - Spam\n"
+        f"3️⃣ Rejected - Abuse\n"
+        f"4️⃣ Under Review\n"
+        f"5️⃣ Custom Message\n\n"
+        f"Reply with template number (1-5):"
+    )
+    
+    await callback.message.answer(text, parse_mode="Markdown")
+    await state.update_data(appeal_user_id=user_id)
+    await state.set_state(AppealState.waiting_for_template_message)
+    await callback.answer()
+
+
+@dp.message(AppealState.waiting_for_template_message)
+async def process_template_selection(message: types.Message, state: FSMContext):
+    """Process warning template selection (for warn_appeal only)"""
+    if not is_admin(message.from_user.id): return
+    
+    data = await state.get_data()
+    user_id = data.get("appeal_user_id")
+    selection = message.text.strip()
+    
+    templates = {
+        "1": "⚠️ **FINAL WARNING**\n\nYour appeal has been reviewed. You are being given ONE more chance.\n\n**DO NOT REPEAT YOUR VIOLATION.**\n\nAny future violations will result in permanent ban with no appeal option.\n\nPlease respect bot usage guidelines.",
+        "2": "❌ **APPEAL REJECTED**\n\n**Reason:** Spam behavior detected\n\nYour appeal has been reviewed and rejected. The ban remains in effect.\n\nSpamming the bot is not tolerated. This decision is final.",
+        "3": "❌ **APPEAL REJECTED**\n\n**Reason:** Abuse of bot features\n\nYour appeal has been denied. The ban will remain permanent.\n\nAbusing bot features violates our terms of service. No further appeals will be considered.",
+        "4": "⏳ **APPEAL UNDER REVIEW**\n\nThank you for your appeal. Our team is currently reviewing your case.\n\nYou will receive a response within 24 hours.\n\nPlease do not submit multiple appeals - this will not speed up the process."
+    }
+    
+    if selection == "5":
+        await message.answer("✍️ **Type your custom warning message:**")
+        return
+    
+    if selection not in templates:
+        await message.answer("❌ Invalid selection. Please choose 1-5.")
+        return
+    
+    warning_text = templates[selection]
+    
+    # Send warning to user
+    try:
+        await worker_bot.send_message(
+            chat_id=int(user_id),
+            text=warning_text,
+            parse_mode="Markdown"
+        )
+        await message.answer("✅ Warning sent successfully!")
+    except Exception as e:
+        await message.answer(f"❌ Failed to send warning: {e}")
+    
+    # Update appeal with warning note
+    col_appeals.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "last_warning": warning_text,
+                "last_warning_date": datetime.now(IST),
+                "warned_by": message.from_user.id
+            }
+        }
+    )
+    
+    await state.clear()
+    await show_dashboard_ui(message, message.from_user.id)
+    
+    await state.clear()
+    await show_dashboard_ui(message, message.from_user.id)
+
+
 # Main function
 if __name__ == "__main__":
     import asyncio
@@ -5310,5 +6753,4 @@ if __name__ == "__main__":
         time.sleep(2)
         asyncio.run(startup())
     except (KeyboardInterrupt, SystemExit):
-        print("🛑 Command Hub Stopped Safely")
-
+        print("🛑 Bot stopped by user")
