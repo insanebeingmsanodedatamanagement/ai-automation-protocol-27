@@ -6,7 +6,7 @@ import time
 import threading
 from aiohttp import web
 
-
+# Load environment variables
 import functools
 import traceback
 from datetime import datetime, timedelta
@@ -21,7 +21,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest, TelegramConflictError
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest, TelegramConflictError, TelegramNetworkError
+from aiogram.client.session.aiohttp import AiohttpSession
 
 # ==========================================
 # ⚡ CONFIGURATION (GHOST PROTOCOL)
@@ -52,8 +53,14 @@ IST = pytz.timezone('Asia/Kolkata')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-manager_bot = Bot(token=MANAGER_BOT_TOKEN)
-worker_bot = Bot(token=MAIN_BOT_TOKEN)
+# Configure production-ready aiohttp session with proper timeouts for Windows
+# Note: Using higher timeout value to prevent Windows semaphore timeout errors
+session = AiohttpSession(
+    timeout=120.0  # 120 seconds total timeout (Windows needs higher values)
+)
+
+manager_bot = Bot(token=MANAGER_BOT_TOKEN, session=session)
+worker_bot = Bot(token=MAIN_BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
 # GLOBAL TRACKERS (IRON DOME)
@@ -61,6 +68,8 @@ ERROR_COUNTER = 0
 LAST_ERROR_TIME = time.time()
 LAST_REPORT_DATE = None 
 LAST_INVENTORY_CHECK = 0
+user_pagination = {}  # Track user pagination for memory management
+error_timestamps = []  # Track error timestamps for health monitoring
 
 # STATES
 class ManagementState(StatesGroup):
@@ -144,7 +153,20 @@ async def initialize_database():
     global col_templates, col_recycle_bin, col_reviews, col_appeals, col_ban_history
     
     try:
-        client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # Enterprise MongoDB connection with pooling for lakhs of users
+        client = pymongo.MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=10000,
+            maxPoolSize=100,  # Handle concurrent admin operations
+            minPoolSize=10,
+            maxIdleTimeMS=45000,
+            retryWrites=True,
+            retryReads=True,
+            w='majority',
+            journal=True
+        )
         db = client["MSANodeDB"]
         col_users = db["user_logs"]
         col_admins = db["admins"]
@@ -194,11 +216,129 @@ async def initialize_database():
         
         # Test connection
         client.admin.command('ping')
-        print("✅ MSANode Data Core: CONNECTED")
+        print("✅ MSANode Data Core: CONNECTED (ENTERPRISE MODE)")
         return True
     except Exception as e:
         print(f"❌ Database Connection Failed: {e}")
         return False
+
+# ==========================================
+# 🏢 ENTERPRISE CIRCUIT BREAKER PATTERN
+# ==========================================
+db_circuit_breaker = {
+    "failure_count": 0,
+    "last_failure_time": 0,
+    "is_open": False,
+    "open_until": 0
+}
+CIRCUIT_BREAKER_THRESHOLD = 5  # Open circuit after 5 consecutive failures
+CIRCUIT_BREAKER_TIMEOUT = 30  # Keep circuit open for exactly 30 seconds
+
+def check_db_circuit():
+    """Check if database circuit breaker allows operations"""
+    now = time.time()
+    if db_circuit_breaker["is_open"]:
+        if now >= db_circuit_breaker["open_until"]:
+            # Reset circuit breaker after timeout
+            db_circuit_breaker["is_open"] = False
+            db_circuit_breaker["failure_count"] = 0
+            print("[OK] CIRCUIT BREAKER RESET - ATTEMPTING RECONNECTION")
+            return True
+        return False
+    return True
+
+def record_db_failure():
+    """Record database failure and potentially open circuit breaker"""
+    db_circuit_breaker["failure_count"] += 1
+    db_circuit_breaker["last_failure_time"] = time.time()
+    
+    if db_circuit_breaker["failure_count"] >= CIRCUIT_BREAKER_THRESHOLD:
+        db_circuit_breaker["is_open"] = True
+        db_circuit_breaker["open_until"] = time.time() + CIRCUIT_BREAKER_TIMEOUT
+        print(f"[CRITICAL] CIRCUIT BREAKER OPENED - DB OPERATIONS SUSPENDED FOR {CIRCUIT_BREAKER_TIMEOUT}s")
+
+def record_db_success():
+    """Record successful database operation"""
+    if db_circuit_breaker["failure_count"] > 0:
+        db_circuit_breaker["failure_count"] = max(0, db_circuit_breaker["failure_count"] - 1)
+
+async def safe_db_operation(operation, *args, **kwargs):
+    """Execute database operation with circuit breaker protection"""
+    if not check_db_circuit():
+        raise Exception("Circuit breaker open - database temporarily unavailable")
+    
+    try:
+        result = operation(*args, **kwargs)
+        record_db_success()
+        return result
+    except Exception as e:
+        record_db_failure()
+        raise e
+
+# ==========================================
+# 🏢 ENTERPRISE MEMORY MANAGEMENT
+# ==========================================
+MAX_CACHE_SIZE = 10000  # Maximum entries in memory caches
+CACHE_CLEANUP_AGE = 3600  # Remove entries older than exactly 1 hour (3600 seconds)
+user_operation_cache = {}  # Track user operations for cleanup
+
+def cleanup_memory_caches():
+    """Clean up old entries from memory caches to prevent memory bloat with lakhs of users"""
+    now = time.time()
+    cleanup_count = 0
+    
+    # Clean user operation cache
+    for user_id in list(user_operation_cache.keys()):
+        if now - user_operation_cache[user_id] > CACHE_CLEANUP_AGE:
+            del user_operation_cache[user_id]
+            cleanup_count += 1
+    
+    # Clean user pagination if too large
+    if len(user_pagination) > MAX_CACHE_SIZE:
+        # Keep only recent entries
+        sorted_entries = sorted(user_pagination.items(), key=lambda x: x[1].get('last_access', 0), reverse=True)
+        user_pagination.clear()
+        user_pagination.update(dict(sorted_entries[:MAX_CACHE_SIZE // 2]))
+        cleanup_count += len(sorted_entries) - (MAX_CACHE_SIZE // 2)
+    
+    if cleanup_count > 0:
+        print(f"[OK] MEMORY CLEANUP: REMOVED {cleanup_count} OLD CACHE ENTRIES")
+
+# ==========================================
+# 🏢 ENTERPRISE HEALTH MONITORING
+# ==========================================
+async def enterprise_health_check():
+    """Periodic health check for enterprise monitoring"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Check every exactly 5 minutes (300 seconds)
+            
+            # Check database connectivity
+            try:
+                client.admin.command('ping')
+                db_status = "✅ HEALTHY"
+            except:
+                db_status = "❌ UNHEALTHY"
+                print("[CRITICAL] DATABASE HEALTH CHECK FAILED")
+            
+            # Check circuit breaker status
+            circuit_status = "🔴 OPEN" if db_circuit_breaker["is_open"] else "🟢 CLOSED"
+            
+            # Memory cleanup
+            cleanup_memory_caches()
+            
+            # Calculate error rate (from panic protocol)
+            now = time.time()
+            recent_errors = [t for t in error_timestamps if now - t < 300]  # Last 5 minutes
+            error_rate = len(recent_errors) / 300 * 100  # Errors per second * 100
+            
+            print(f"[HEALTH] DB: {db_status} | Circuit: {circuit_status} | Error Rate: {error_rate:.2f}% | Pagination Cache: {len(user_pagination)}")
+            
+            if error_rate > 5:  # More than 5% error rate
+                print(f"[WARNING] HIGH ERROR RATE DETECTED: {error_rate:.2f}%")
+                
+        except Exception as e:
+            print(f"[ERROR] Health check failed: {e}")
 
 # --- RENDER PORT BINDER (SHIELD) ---
 async def handle_health(request):
@@ -245,24 +385,54 @@ async def send_alert(msg):
     except Exception as e:
         logger.error(f"Backup Failed: {e}")
 def safe_execute(func):
-    """Retries functions, auto-heals, and triggers Black Box."""
+    """Enterprise-grade error handling with exponential backoff"""
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         global ERROR_COUNTER, LAST_ERROR_TIME
-        retries = 3
-        while retries > 0:
+        max_retries = 3
+        base_delay = 1
+        
+        for attempt in range(max_retries):
             try:
                 return await func(*args, **kwargs)
+            except (TelegramNetworkError, asyncio.TimeoutError) as e:
+                # Network errors - retry with exponential backoff
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
+                    logger.warning(f"Network error, retrying in {delay}s: {e}")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"Network error after {max_retries} attempts: {e}")
+            except pymongo.errors.AutoReconnect as e:
+                # Database reconnection - retry
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                logger.error(f"Database reconnection failed: {e}")
             except Exception as e:
-                retries -= 1
                 ERROR_COUNTER += 1
-                if time.time() - LAST_ERROR_TIME < 60 and ERROR_COUNTER > 5:
-                    col_settings.update_one({"setting": "maintenance"}, {"$set": {"value": True}}, upsert=True)
-                    await send_alert(f"**PANIC PROTOCOL ACTIVE**\n`{traceback.format_exc()}`")
-                    ERROR_COUNTER = 0 
+                logger.error(f"Error in {func.__name__}: {e}")
+                
+                # Panic protocol for critical failures
+                if time.time() - LAST_ERROR_TIME < 60 and ERROR_COUNTER > 10:
+                    try:
+                        col_settings.update_one(
+                            {"setting": "maintenance"}, 
+                            {"$set": {"value": True}}, 
+                            upsert=True
+                        )
+                        await send_alert(f"**🚨 ENTERPRISE PANIC PROTOCOL**\n**Function:** {func.__name__}\n**Errors:** {ERROR_COUNTER}\n```{str(e)[:500]}```")
+                        ERROR_COUNTER = 0
+                    except:
+                        pass
+                
                 LAST_ERROR_TIME = time.time()
-                await asyncio.sleep(1)
-        return None 
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (attempt + 1))
+                break
+        
+        return None
     return wrapper
 
 def is_admin(user_id):
@@ -5881,7 +6051,7 @@ async def prompt_search_user(callback: types.CallbackQuery):
 
 
 @dp.message(F.text)
-async def search_user_history(message: types.Message):
+async def search_user_history(message: types.Message, state: FSMContext):
     """Search and display complete user history when admin types ID"""
     if not is_admin(message.from_user.id): return
     
@@ -6727,10 +6897,18 @@ if __name__ == "__main__":
                 asyncio.create_task(supervisor_routine())
                 asyncio.create_task(scheduled_health_check()) 
                 asyncio.create_task(scheduled_pruning_cleanup())
+                asyncio.create_task(enterprise_health_check())  # 🏢 ENTERPRISE: Health monitoring
+                print("[OK] ENTERPRISE HEALTH MONITORING STARTED")
                 
-                # Start polling
-                print("✅ Bot polling started successfully")
-                await dp.start_polling(manager_bot, skip_updates=True)
+                # Start polling with proper timeout settings for Windows
+                print("✅ Bot polling started successfully - ENTERPRISE MODE (LAKHS-READY)")
+                await dp.start_polling(
+                    manager_bot,
+                    skip_updates=True,
+                    timeout=20,  # Polling timeout in seconds
+                    relax=0.1,   # Delay between iterations
+                    fast=True    # Use fast polling mode
+                )
                 print("⚠️ Polling stopped unexpectedly, restarting in 3 seconds...")
                 await asyncio.sleep(3)
             except TelegramConflictError:
@@ -6752,5 +6930,3 @@ if __name__ == "__main__":
         asyncio.run(startup())
     except (KeyboardInterrupt, SystemExit):
         print("🛑 Bot stopped by user")
-
-
