@@ -12,10 +12,8 @@ import os
 import io
 import pytz
 from datetime import datetime
-from dotenv import load_dotenv
-
 # Load environment variables from .env file
-load_dotenv()
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject, ChatMemberUpdatedFilter, LEAVE_TRANSITION, JOIN_TRANSITION, Command, StateFilter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, ChatMemberUpdated
@@ -26,7 +24,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramConflictError, TelegramForbiddenError
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp import ClientTimeout, TCPConnector
 
 # ==========================================
 # ⚡ CONFIGURATION (GHOST PROTOCOL)
@@ -192,15 +189,9 @@ logging.getLogger('pymongo.topology').setLevel(logging.CRITICAL)
 logging.getLogger('pymongo.connection').setLevel(logging.CRITICAL)
 
 # Configure aiohttp session with proper timeouts for Windows
+# Note: Using higher timeout value to prevent Windows semaphore timeout errors
 session = AiohttpSession(
-    timeout=ClientTimeout(total=60, connect=30, sock_read=30, sock_connect=30),
-    connector=TCPConnector(
-        limit=100,
-        limit_per_host=30,
-        ttl_dns_cache=300,
-        force_close=False,
-        enable_cleanup_closed=True
-    )
+    timeout=120.0  # 120 seconds total timeout (Windows needs higher values)
 )
 
 bot = Bot(token=BOT_TOKEN, session=session)
@@ -258,6 +249,20 @@ def run_health_server():
         pass
 
 # --- BAN FEATURE CHECKER ---
+def is_user_banned_from_feature(user_id: int, feature_name: str) -> bool:
+    """Check if a specific feature is banned for user by user_id."""
+    try:
+        # Get user data from banned collection
+        ban_record = col_banned.find_one({"user_id": str(user_id)})
+        if not ban_record:
+            return False
+        
+        banned_features = ban_record.get("banned_features", [])
+        return feature_name in banned_features
+    except Exception as e:
+        print(f"Error checking feature ban for user {user_id}: {e}")
+        return False
+
 def is_feature_banned(user_data, feature_name):
     """Check if a specific feature is banned for a user."""
     try:
@@ -379,38 +384,87 @@ try:
         col_user_counter.insert_one({"_id": "msa_counter", "current": 0})
         print("[OK] USER ID COUNTER INITIALIZED")
     
-    # Assign IDs to existing users without msa_id
+    # Assign IDs to existing users without msa_id (using gap-filling logic)
     existing_users_without_id = col_users.find({"msa_id": {"$exists": False}})
     count_assigned = 0
+    
+    # First, get all existing MSA IDs to find gaps
+    existing_users_with_id = col_users.find({"msa_id": {"$exists": True}}, {"msa_id": 1})
+    used_ids = set()
+    for user in existing_users_with_id:
+        msa_id = user.get("msa_id", "")
+        if msa_id and msa_id.startswith("MSA"):
+            try:
+                num = int(msa_id.replace("MSA", ""))
+                used_ids.add(num)
+            except ValueError:
+                continue
+    
+    # Assign IDs filling gaps first
+    next_id = 1
     for user in existing_users_without_id:
-        counter_doc = col_user_counter.find_one_and_update(
-            {"_id": "msa_counter"},
-            {"$inc": {"current": 1}},
-            return_document=True
-        )
-        new_id = f"MSA{counter_doc['current']}"
+        # Find next available ID
+        while next_id in used_ids:
+            next_id += 1
+        
+        new_id = f"MSA{next_id}"
         col_users.update_one(
             {"_id": user["_id"]},
             {"$set": {"msa_id": new_id}}
         )
+        used_ids.add(next_id)
         count_assigned += 1
+        next_id += 1
     
     if count_assigned > 0:
-        print(f"[OK] ASSIGNED IDs TO {count_assigned} EXISTING USERS")
+        print(f"[OK] ASSIGNED {count_assigned} MSA IDs (GAP-FILLING ENABLED)")
+        # Update counter to highest ID
+        if used_ids:
+            col_user_counter.update_one(
+                {"_id": "msa_counter"},
+                {"$set": {"current": max(used_ids)}}
+            )
     
     # 🏢 ENTERPRISE: Create compound indexes for optimal performance with millions of records
+    # Check existing indexes first to avoid conflicts
+    def safe_create_index(collection, keys, **kwargs):
+        """Create index only if it doesn't exist with same specs"""
+        try:
+            existing_indexes = collection.index_information()
+            # Generate expected index name
+            if isinstance(keys, list):
+                index_name = "_".join([f"{k}_{v}" for k, v in keys])
+            else:
+                index_name = f"{keys}_1"
+            
+            # Check if index already exists
+            if index_name not in existing_indexes:
+                collection.create_index(keys, **kwargs)
+                return True
+            return False  # Already exists
+        except Exception as e:
+            # Silently ignore if index exists with different options
+            if "IndexOptionsConflict" in str(e) or "IndexKeySpecsConflict" in str(e):
+                return False
+            raise e
+    
     try:
-        col_users.create_index([("user_id", pymongo.ASCENDING)], unique=True, background=True)
-        col_users.create_index([("msa_id", pymongo.ASCENDING)], unique=True, sparse=True, background=True)
-        col_users.create_index([("status", pymongo.ASCENDING), ("last_active", pymongo.DESCENDING)], background=True)
-        col_users.create_index([("source", pymongo.ASCENDING), ("status", pymongo.ASCENDING)], background=True)
-        col_banned.create_index([("user_id", pymongo.ASCENDING)], background=True)
-        col_banned.create_index([("ban_type", pymongo.ASCENDING), ("ban_until", pymongo.ASCENDING)], background=True)
-        col_reviews.create_index([("user_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)], background=True)
-        col_appeals.create_index([("user_id", pymongo.ASCENDING), ("status", pymongo.ASCENDING)], background=True)
-        print("[OK] ENTERPRISE INDEXES CREATED FOR OPTIMAL PERFORMANCE")
+        created_count = 0
+        created_count += 1 if safe_create_index(col_users, [("user_id", pymongo.ASCENDING)], unique=True, background=True) else 0
+        created_count += 1 if safe_create_index(col_users, [("msa_id", pymongo.ASCENDING)], unique=True, sparse=True, background=True) else 0
+        created_count += 1 if safe_create_index(col_users, [("status", pymongo.ASCENDING), ("last_active", pymongo.DESCENDING)], background=True) else 0
+        created_count += 1 if safe_create_index(col_users, [("source", pymongo.ASCENDING), ("status", pymongo.ASCENDING)], background=True) else 0
+        created_count += 1 if safe_create_index(col_banned, [("user_id", pymongo.ASCENDING)], background=True) else 0
+        created_count += 1 if safe_create_index(col_banned, [("ban_type", pymongo.ASCENDING), ("ban_until", pymongo.ASCENDING)], background=True) else 0
+        created_count += 1 if safe_create_index(col_reviews, [("user_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)], background=True) else 0
+        created_count += 1 if safe_create_index(col_appeals, [("user_id", pymongo.ASCENDING), ("status", pymongo.ASCENDING)], background=True) else 0
+        
+        if created_count > 0:
+            print(f"[OK] CREATED {created_count} NEW ENTERPRISE INDEXES")
+        else:
+            print("[OK] ENTERPRISE INDEXES ALREADY EXIST - OPTIMIZED FOR LAKHS OF USERS")
     except Exception as idx_err:
-        print(f"[WARN] Index creation skipped (may already exist): {idx_err}")
+        print(f"[WARN] Index configuration issue: {idx_err}")
     
 except Exception as e:
     print(f"[ERROR] DATABASE OFFLINE: {e}")
@@ -647,6 +701,7 @@ user_template_views = {}  # Track template solution views {user_id: [timestamps]
 user_template_spam = {}  # Track template spam clicks {user_id: count}
 user_guide_views = {}  # Track guide section views {user_id: [timestamps]}
 user_guide_spam = {}  # Track guide rapid clicking {user_id: count}
+error_timestamps = []  # Track error timestamps for health monitoring
 
 # ==========================================
 # 🛡️ FINAL SECURITY CONFIGURATION
@@ -1312,7 +1367,8 @@ def get_main_keyboard(user_id: int = None):
     keyboard.extend([
         [KeyboardButton(text="💬 CUSTOMER SUPPORT")],
         [KeyboardButton(text="❓ FAQ / HELP")],
-        [KeyboardButton(text="📚 GUIDE / HOW TO USE")]
+        [KeyboardButton(text="📚 GUIDE / HOW TO USE")],
+        [KeyboardButton(text="📜 RULES & REGULATIONS")]
     ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=False)
 
@@ -1539,18 +1595,53 @@ async def send_admin_report(text: str):
         except: pass
 
 def get_next_msa_id():
-    """Generate next unique MSA ID (MSA1, MSA2, MSA3, etc.)"""
+    """Generate next unique MSA ID - reuses deleted IDs (MSA1, MSA2, etc.) before incrementing"""
     try:
-        counter_doc = col_user_counter.find_one_and_update(
-            {"_id": "msa_counter"},
-            {"$inc": {"current": 1}},
-            return_document=True
-        )
-        return f"MSA{counter_doc['current']}"
+        # Get all existing MSA IDs from users collection
+        existing_users = col_users.find({"msa_id": {"$exists": True}}, {"msa_id": 1})
+        existing_ids = set()
+        
+        for user in existing_users:
+            msa_id = user.get("msa_id", "")
+            if msa_id and msa_id.startswith("MSA"):
+                try:
+                    # Extract numeric part (e.g., "MSA5" -> 5)
+                    num = int(msa_id.replace("MSA", ""))
+                    existing_ids.add(num)
+                except ValueError:
+                    continue
+        
+        # Find the lowest available ID starting from 1
+        next_id = 1
+        while next_id in existing_ids:
+            next_id += 1
+        
+        # Update counter to highest ID seen (for consistency)
+        current_counter = col_user_counter.find_one({"_id": "msa_counter"})
+        if current_counter:
+            max_id = max(existing_ids) if existing_ids else 0
+            if next_id > max_id:
+                # We're assigning a new highest ID, update counter
+                col_user_counter.update_one(
+                    {"_id": "msa_counter"},
+                    {"$set": {"current": next_id}}
+                )
+        
+        return f"MSA{next_id}"
+        
     except Exception as e:
         logger.error(f"Error generating MSA ID: {e}")
-        # Fallback to timestamp-based ID
-        return f"MSA{int(time.time())}"
+        # Fallback to counter-based ID
+        try:
+            counter_doc = col_user_counter.find_one_and_update(
+                {"_id": "msa_counter"},
+                {"$inc": {"current": 1}},
+                return_document=True
+            )
+            return f"MSA{counter_doc['current']}"
+        except:
+            # Last resort: timestamp-based ID
+            return f"MSA{int(time.time())}"
 
 async def is_member(user_id):
     """Verifies user is inside MSANode Telegram Channel."""
@@ -2687,6 +2778,154 @@ async def handle_guide_button(message: types.Message):
         )
     except Exception as e:
         logger.error(f"Error sending guide menu: {e}")
+
+
+# ==========================================
+# 📜 RULES & REGULATIONS SYSTEM
+# ==========================================
+
+@dp.message(F.text == "📜 RULES & REGULATIONS")
+async def cmd_rules(message: types.Message):
+    """Display comprehensive rules and regulations with user profile"""
+    user_id = message.from_user.id
+    
+    # Check if user is completely banned
+    is_banned, ban_record, ban_msg = is_user_completely_banned(user_id)
+    if is_banned:
+        try:
+            await message.answer(ban_msg, parse_mode="Markdown")
+        except:
+            pass
+        return
+    
+    # Check if feature is banned
+    if is_user_banned_from_feature(user_id, "dashboard"):
+        feature_name = "rules"
+        try:
+            await message.answer(
+                f"🚫 **Feature Restricted**\n\n"
+                f"You are currently restricted from accessing {feature_name}.\n\n"
+                f"💡 Contact support if you believe this is an error.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await message.answer(f"❌ {feature_name.title()} feature is currently unavailable.")
+            print(f"Error sending feature ban message: {e}")
+        return
+    
+    # Fetch user from database to check if they exist
+    user_doc = col_users.find_one({"user_id": str(user_id)})
+    
+    if user_doc:
+        msa_id = user_doc.get("msa_id", "Not Assigned")
+        join_date = user_doc.get("timestamp", "Unknown")
+        if isinstance(join_date, datetime):
+            join_date = join_date.strftime("%d %b %Y")
+        status = user_doc.get("status", "active")
+    else:
+        msa_id = "Not Assigned"
+        join_date = "Today"
+        status = "new"
+    
+    # Loading animation
+    loading = await message.answer("📜 **Loading Rules & Regulations...**")
+    await asyncio.sleep(0.6)
+    await loading.edit_text("📋 **Fetching Guidelines from Database...**")
+    await asyncio.sleep(0.5)
+    await loading.delete()
+    
+    rules_message = (
+        f"╔══════════════════════════╗\n"
+        f"║  📜 **RULES & REGULATIONS**  ║\n"
+        f"╚══════════════════════════╝\n\n"
+        f"**👤 Your Profile:**\n"
+        f"• MSA ID: `{msa_id}`\n"
+        f"• Status: {status.upper()}\n"
+        f"• Member Since: {join_date}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"**1️⃣ GENERAL CONDUCT**\n"
+        f"• Be respectful to all users and staff\n"
+        f"• No harassment, hate speech, or abuse\n"
+        f"• Use the bot for intended purposes only\n"
+        f"• Follow all commands and guidelines\n\n"
+        f"**2️⃣ SPAM PREVENTION**\n"
+        f"• Do NOT spam commands repeatedly\n"
+        f"• Limit: 10 actions per minute\n"
+        f"• Spamming /start = Auto permanent ban\n"
+        f"• No flooding in reviews or support\n\n"
+        f"**3️⃣ REVIEWS & FEEDBACK**\n"
+        f"• Provide honest, constructive reviews\n"
+        f"• No fake, abusive, or spam reviews\n"
+        f"• Minimum rating rules apply\n"
+        f"• Review system can be disabled anytime\n\n"
+        f"**4️⃣ CUSTOMER SUPPORT**\n"
+        f"• Use support for legitimate issues only\n"
+        f"• Be patient, we respond ASAP\n"
+        f"• No spam or abuse in support tickets\n"
+        f"• One active ticket at a time\n\n"
+        f"**5️⃣ BANS & PENALTIES**\n"
+        f"• Violations = Temporary or permanent bans\n"
+        f"• Banned users can appeal via 🔔 APPEAL BAN\n"
+        f"• Repeat offenders = Permanent bans\n"
+        f"• Admin decisions are final\n\n"
+        f"**6️⃣ CONTENT ACCESS**\n"
+        f"• Telegram Vault membership required\n"
+        f"• Leaving channel = Access revoked\n"
+        f"• Social media verification required\n"
+        f"• Premium content via pinned comments\n\n"
+        f"**7️⃣ DATA & PRIVACY**\n"
+        f"• Your data is stored securely in MongoDB\n"
+        f"• MSA ID assigned for tracking\n"
+        f"• Activity logs maintained for security\n"
+        f"• No data shared with third parties\n"
+        f"• All operations are enterprise-secured\n\n"
+        f"**8️⃣ FEATURE-SPECIFIC BANS**\n"
+        f"• Admins can ban you from specific features\n"
+        f"• You may still use other bot features\n"
+        f"• Feature bans are temporary or permanent\n"
+        f"• Check your ban status in Dashboard\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"**✅ BY USING THIS BOT, YOU AGREE TO:**\n"
+        f"• Follow all rules above\n"
+        f"• Accept admin moderation decisions\n"
+        f"• Respect the community guidelines\n"
+        f"• Use the bot responsibly\n\n"
+        f"**⚠️ CONSEQUENCES OF VIOLATIONS:**\n"
+        f"• 1st Offense: Warning\n"
+        f"• 2nd Offense: Temporary ban (duration varies)\n"
+        f"• 3rd Offense: Permanent ban (no appeal)\n"
+        f"• Severe violations: Immediate permanent ban\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"**📞 NEED HELP?**\n"
+        f"• Questions about rules? Use 💬 CUSTOMER SUPPORT\n"
+        f"• Technical issues? Use ❓ FAQ / HELP\n"
+        f"• Bot guidance? Check 📚 GUIDE / HOW TO USE\n\n"
+        f"**🔒 ENTERPRISE SECURITY:**\n"
+        f"• Circuit breaker protection enabled\n"
+        f"• Health monitoring active 24/7\n"
+        f"• Connection pooling for lakhs of users\n"
+        f"• Memory management optimized\n"
+        f"• All data operations are journaled\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 **Remember:** These rules ensure a safe, fair, and enjoyable experience for everyone!\n\n"
+        f"✅ **Thank you for being a responsible user!**\n\n"
+        f"🎯 **Last Updated:** January 2026"
+    )
+    
+    await message.answer(rules_message, parse_mode="Markdown")
+    
+    # Log the rules view
+    if user_doc:
+        try:
+            col_users.update_one(
+                {"user_id": str(user_id)},
+                {
+                    "$set": {"last_rules_view": datetime.now(IST)},
+                    "$inc": {"rules_view_count": 1}
+                }
+            )
+        except Exception as e:
+            print(f"Error logging rules view: {e}")
 
 
 # ==========================================
@@ -6701,14 +6940,70 @@ async def cmd_start(message: types.Message, command: CommandObject):
     else:
         # No payload - check if NEW or RETURNING user
         if u_status == "NEW":
-            # NEW user without link - Guide them to pinned comments
+            # NEW user without link - Show Rules & Regulations first
             loading = await message.answer("🔍 **Scanning Access Level...**")
             await asyncio.sleep(0.8)
             await loading.edit_text("📊 **Analyzing Entry Point...**")
             await asyncio.sleep(0.7)
-            await loading.edit_text("⚠️ **Notice: Direct Access Detected**")
+            await loading.edit_text("✅ **New User Detected - Loading Guidelines**")
             await asyncio.sleep(0.6)
             await loading.delete()
+            
+            # Show Rules & Regulations to new users
+            rules_msg = (
+                f"**Welcome, {message.from_user.first_name}!** 🎉\n\n"
+                f"╔════════════════════════╗\n"
+                f"║  📜 **RULES & REGULATIONS** ║\n"
+                f"╚════════════════════════╝\n\n"
+                f"**⚠️ IMPORTANT: Please Read Carefully**\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"**1️⃣ GENERAL CONDUCT**\n"
+                f"• Be respectful to all users and staff\n"
+                f"• No harassment, hate speech, or abuse\n"
+                f"• Use the bot for intended purposes only\n"
+                f"• Follow all commands and guidelines\n\n"
+                f"**2️⃣ SPAM PREVENTION**\n"
+                f"• Do NOT spam commands repeatedly\n"
+                f"• Limit: 10 actions per minute\n"
+                f"• Spamming = Automatic permanent ban\n"
+                f"• No flooding in reviews or support\n\n"
+                f"**3️⃣ REVIEWS & FEEDBACK**\n"
+                f"• Provide honest, constructive reviews\n"
+                f"• No fake, abusive, or spam reviews\n"
+                f"• Minimum rating rules apply\n"
+                f"• Review system can be disabled anytime\n\n"
+                f"**4️⃣ CUSTOMER SUPPORT**\n"
+                f"• Use support for legitimate issues only\n"
+                f"• Be patient, we respond ASAP\n"
+                f"• No spam or abuse in support tickets\n"
+                f"• One active ticket at a time\n\n"
+                f"**5️⃣ BANS & PENALTIES**\n"
+                f"• Violations result in temporary or permanent bans\n"
+                f"• Banned users can appeal via 🔔 APPEAL BAN\n"
+                f"• Repeat offenders get permanent bans\n"
+                f"• Admin decisions are final\n\n"
+                f"**6️⃣ CONTENT ACCESS**\n"
+                f"• Membership in Telegram Vault required\n"
+                f"• Leaving channel = Access revoked\n"
+                f"• Social media verification required\n"
+                f"• Premium content via pinned comments\n\n"
+                f"**7️⃣ DATA & PRIVACY**\n"
+                f"• Your data is stored securely\n"
+                f"• MSA ID assigned for tracking\n"
+                f"• Activity logs maintained for security\n"
+                f"• No data shared with third parties\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"**✅ BY USING THIS BOT, YOU AGREE TO:**\n"
+                f"• Follow all rules above\n"
+                f"• Accept admin moderation decisions\n"
+                f"• Respect the community guidelines\n"
+                f"• Use the bot responsibly\n\n"
+                f"❌ **Violations = Immediate Action**\n"
+                f"💡 **Questions? Use** 💬 CUSTOMER SUPPORT\n\n"
+                f"🎯 **Now you're ready to explore!**"
+            )
+            await message.answer(rules_msg, parse_mode="Markdown")
+            await asyncio.sleep(1.0)
             
             kb = InlineKeyboardBuilder()
             kb.row(InlineKeyboardButton(text="▶️ YouTube Channel", url=YOUTUBE_LINK))
@@ -7308,7 +7603,14 @@ async def main():
     print("[OK] ENTERPRISE HEALTH MONITORING STARTED")
     
     print(f"✅ MSANODE GATEWAY ONLINE - ENTERPRISE MODE (LAKHS-READY)")
-    await dp.start_polling(bot, skip_updates=True)
+    # Configure polling with proper timeout settings for Windows
+    await dp.start_polling(
+        bot,
+        skip_updates=True,
+        timeout=20,  # Polling timeout in seconds
+        relax=0.1,   # Delay between iterations
+        fast=True    # Use fast polling mode
+    )
 
 if __name__ == "__main__":
     threading.Thread(target=run_health_server, daemon=True).start()
