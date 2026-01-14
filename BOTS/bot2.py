@@ -7,8 +7,7 @@ import threading
 from dotenv import load_dotenv
 from aiohttp import web
 
-# Load environment variables
-load_dotenv()
+
 import functools
 import traceback
 from datetime import datetime, timedelta
@@ -6754,3 +6753,4 @@ if __name__ == "__main__":
         asyncio.run(startup())
     except (KeyboardInterrupt, SystemExit):
         print("🛑 Bot stopped by user")
+
