@@ -12,8 +12,10 @@ import os
 import io
 import pytz
 from datetime import datetime
+from dotenv import load_dotenv
 
-# Environment variables are loaded from Render.com settings (no .env file needed in production)
+# Load environment variables from .env file
+load_dotenv()
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject, ChatMemberUpdatedFilter, LEAVE_TRANSITION, JOIN_TRANSITION, Command, StateFilter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, ChatMemberUpdated
@@ -23,6 +25,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramConflictError, TelegramForbiddenError
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout, TCPConnector
 
 # ==========================================
 # ⚡ CONFIGURATION (GHOST PROTOCOL)
@@ -32,6 +36,9 @@ MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_LOG_CHANNEL = os.getenv("ADMIN_LOG_CHANNEL")
 REVIEW_LOG_CHANNEL = os.getenv("REVIEW_LOG_CHANNEL")
 SUPPORT_CHANNEL_ID = os.getenv("SUPPORT_CHANNEL_ID")
+BAN_CHANNEL_ID = -1003575487367  # Ban notifications channel (legacy)
+BAN_REPORT_CHANNEL_ID = int(os.getenv("BAN_REPORT_CHANNEL_ID", -1003575487367))  # New ban report channel
+APPEAL_CHANNEL_ID = int(os.getenv("APPEAL_CHANNEL_ID", -1003354981499))  # Ban appeal channel
 
 try:
     OWNER_ID = int(os.getenv("OWNER_ID", 0))
@@ -184,12 +191,37 @@ logging.getLogger('pymongo.serverSelection').setLevel(logging.CRITICAL)
 logging.getLogger('pymongo.topology').setLevel(logging.CRITICAL)
 logging.getLogger('pymongo.connection').setLevel(logging.CRITICAL)
 
-bot = Bot(token=BOT_TOKEN)
+# Configure aiohttp session with proper timeouts for Windows
+session = AiohttpSession(
+    timeout=ClientTimeout(total=60, connect=30, sock_read=30, sock_connect=30),
+    connector=TCPConnector(
+        limit=100,
+        limit_per_host=30,
+        ttl_dns_cache=300,
+        force_close=False,
+        enable_cleanup_closed=True
+    )
+)
+
+bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
 # Manager Bot connection (for admin notifications)
 MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN")
-manager_bot = Bot(token=MANAGER_BOT_TOKEN) if MANAGER_BOT_TOKEN else None
+manager_bot = Bot(token=MANAGER_BOT_TOKEN, session=session) if MANAGER_BOT_TOKEN else None
+
+# ==========================================
+# 📊 ENTERPRISE HEALTH MONITORING
+# ==========================================
+
+health_metrics = {
+    'start_time': time.time(),
+    'total_requests': 0,
+    'failed_requests': 0,
+    'db_operations': 0,
+    'db_failures': 0,
+    'last_health_check': time.time()
+}
 
 # Admin notification helper
 async def notify_admins(message_text: str):
@@ -311,19 +343,20 @@ async def send_feature_ban_message(message: types.Message, feature_name: str, us
         await message.answer(f"❌ {feature_name.title()} feature is currently unavailable.")
         print(f"Error sending feature ban message: {e}")
 
-# --- MONGODB CONNECTION ---
+# --- MONGODB CONNECTION (ENTERPRISE-SCALE) ---
 try:
     client = pymongo.MongoClient(
         MONGO_URI,
-        maxPoolSize=10,  # Reduced pool size for better stability
-        minPoolSize=1,   # Lower minimum connections
-        maxIdleTimeMS=30000,  # Exactly 30 seconds (30,000ms) idle timeout
+        maxPoolSize=100,  # 🏢 ENTERPRISE: Handle 100 concurrent connections
+        minPoolSize=10,   # 🏢 ENTERPRISE: Always maintain 10 warm connections
+        maxIdleTimeMS=45000,  # Exactly 45 seconds (45,000ms) idle timeout for better connection reuse
         serverSelectionTimeoutMS=10000,  # Exactly 10 seconds (10,000ms) server selection timeout
         connectTimeoutMS=20000,  # Exactly 20 seconds (20,000ms) connection timeout
         socketTimeoutMS=20000,   # Exactly 20 seconds (20,000ms) socket timeout
         retryWrites=True,
         retryReads=True,
         w='majority',
+        journal=True,  # 🏢 ENTERPRISE: Ensure writes are journaled for data safety
         tlsAllowInvalidCertificates=False,  # Ensure proper SSL
         directConnection=False  # Use replica set routing
     )
@@ -334,6 +367,8 @@ try:
     col_reels = db["viral_reels"]
     col_settings = db["settings"] 
     col_banned = db["banned_users"]
+    col_ban_history = db["ban_history"]
+    col_appeals = db["ban_appeals"]  # New collection for ban appeals
     col_reviews = db["user_reviews"]
     col_user_counter = db["user_counter"]  # For tracking next MSA ID
     
@@ -363,9 +398,147 @@ try:
     if count_assigned > 0:
         print(f"[OK] ASSIGNED IDs TO {count_assigned} EXISTING USERS")
     
+    # 🏢 ENTERPRISE: Create compound indexes for optimal performance with millions of records
+    try:
+        col_users.create_index([("user_id", pymongo.ASCENDING)], unique=True, background=True)
+        col_users.create_index([("msa_id", pymongo.ASCENDING)], unique=True, sparse=True, background=True)
+        col_users.create_index([("status", pymongo.ASCENDING), ("last_active", pymongo.DESCENDING)], background=True)
+        col_users.create_index([("source", pymongo.ASCENDING), ("status", pymongo.ASCENDING)], background=True)
+        col_banned.create_index([("user_id", pymongo.ASCENDING)], background=True)
+        col_banned.create_index([("ban_type", pymongo.ASCENDING), ("ban_until", pymongo.ASCENDING)], background=True)
+        col_reviews.create_index([("user_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)], background=True)
+        col_appeals.create_index([("user_id", pymongo.ASCENDING), ("status", pymongo.ASCENDING)], background=True)
+        print("[OK] ENTERPRISE INDEXES CREATED FOR OPTIMAL PERFORMANCE")
+    except Exception as idx_err:
+        print(f"[WARN] Index creation skipped (may already exist): {idx_err}")
+    
 except Exception as e:
     print(f"[ERROR] DATABASE OFFLINE: {e}")
     sys.exit(1)
+
+# ==========================================
+# 🏢 ENTERPRISE CIRCUIT BREAKER PATTERN
+# ==========================================
+db_circuit_breaker = {
+    "failure_count": 0,
+    "last_failure_time": 0,
+    "is_open": False,
+    "open_until": 0
+}
+CIRCUIT_BREAKER_THRESHOLD = 5  # Open circuit after 5 consecutive failures
+CIRCUIT_BREAKER_TIMEOUT = 30  # Keep circuit open for exactly 30 seconds
+
+def check_db_circuit():
+    """Check if database circuit breaker allows operations"""
+    now = time.time()
+    if db_circuit_breaker["is_open"]:
+        if now >= db_circuit_breaker["open_until"]:
+            # Reset circuit breaker after timeout
+            db_circuit_breaker["is_open"] = False
+            db_circuit_breaker["failure_count"] = 0
+            print("[OK] CIRCUIT BREAKER RESET - ATTEMPTING RECONNECTION")
+            return True
+        return False
+    return True
+
+def record_db_failure():
+    """Record database failure and potentially open circuit breaker"""
+    db_circuit_breaker["failure_count"] += 1
+    db_circuit_breaker["last_failure_time"] = time.time()
+    
+    if db_circuit_breaker["failure_count"] >= CIRCUIT_BREAKER_THRESHOLD:
+        db_circuit_breaker["is_open"] = True
+        db_circuit_breaker["open_until"] = time.time() + CIRCUIT_BREAKER_TIMEOUT
+        print(f"[CRITICAL] CIRCUIT BREAKER OPENED - DB OPERATIONS SUSPENDED FOR {CIRCUIT_BREAKER_TIMEOUT}s")
+
+def record_db_success():
+    """Record successful database operation"""
+    if db_circuit_breaker["failure_count"] > 0:
+        db_circuit_breaker["failure_count"] = max(0, db_circuit_breaker["failure_count"] - 1)
+
+async def safe_db_operation(operation, *args, **kwargs):
+    """Execute database operation with circuit breaker protection"""
+    if not check_db_circuit():
+        raise Exception("Circuit breaker open - database temporarily unavailable")
+    
+    try:
+        result = operation(*args, **kwargs)
+        record_db_success()
+        return result
+    except Exception as e:
+        record_db_failure()
+        raise e
+
+# ==========================================
+# 🏢 ENTERPRISE MEMORY MANAGEMENT
+# ==========================================
+MAX_CACHE_SIZE = 10000  # Maximum entries in memory caches
+CACHE_CLEANUP_AGE = 3600  # Remove entries older than exactly 1 hour (3600 seconds)
+
+def cleanup_memory_caches():
+    """Clean up old entries from memory caches to prevent memory bloat with lakhs of users"""
+    now = time.time()
+    cleanup_count = 0
+    
+    # Clean user_last_action cache
+    for user_id in list(user_last_action.keys()):
+        if now - user_last_action[user_id] > CACHE_CLEANUP_AGE:
+            del user_last_action[user_id]
+            cleanup_count += 1
+    
+    # Clean start_command_tracker if too large
+    if len(start_command_tracker) > MAX_CACHE_SIZE:
+        # Keep only recent entries
+        sorted_entries = sorted(start_command_tracker.items(), key=lambda x: x[1], reverse=True)
+        start_command_tracker.clear()
+        start_command_tracker.update(dict(sorted_entries[:MAX_CACHE_SIZE // 2]))
+        cleanup_count += len(sorted_entries) - (MAX_CACHE_SIZE // 2)
+    
+    # Clean sync_cooldown if too large
+    if len(sync_cooldown) > MAX_CACHE_SIZE:
+        for user_id in list(sync_cooldown.keys()):
+            if now - sync_cooldown[user_id] > CACHE_CLEANUP_AGE:
+                del sync_cooldown[user_id]
+                cleanup_count += 1
+    
+    if cleanup_count > 0:
+        print(f"[OK] MEMORY CLEANUP: REMOVED {cleanup_count} OLD CACHE ENTRIES")
+
+# ==========================================
+# 🏢 ENTERPRISE HEALTH MONITORING
+# ==========================================
+async def enterprise_health_check():
+    """Periodic health check for enterprise monitoring"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Check every exactly 5 minutes (300 seconds)
+            
+            # Check database connectivity
+            try:
+                client.admin.command('ping')
+                db_status = "✅ HEALTHY"
+            except:
+                db_status = "❌ UNHEALTHY"
+                print("[CRITICAL] DATABASE HEALTH CHECK FAILED")
+            
+            # Check circuit breaker status
+            circuit_status = "🔴 OPEN" if db_circuit_breaker["is_open"] else "🟢 CLOSED"
+            
+            # Memory cleanup
+            cleanup_memory_caches()
+            
+            # Calculate error rate (from panic protocol)
+            now = time.time()
+            recent_errors = [t for t in error_timestamps if now - t < 300]  # Last 5 minutes
+            error_rate = len(recent_errors) / 300 * 100  # Errors per second * 100
+            
+            print(f"[HEALTH] DB: {db_status} | Circuit: {circuit_status} | Error Rate: {error_rate:.2f}% | Cache Size: {len(user_last_action)}")
+            
+            if error_rate > 5:  # More than 5% error rate
+                print(f"[WARNING] HIGH ERROR RATE DETECTED: {error_rate:.2f}%")
+                
+        except Exception as e:
+            print(f"[ERROR] Health check failed: {e}")
 
 # ==========================================
 # 🚀 SCALABILITY OPTIMIZATIONS
@@ -451,6 +624,11 @@ class ReviewState(StatesGroup):
 class SupportState(StatesGroup):
     selecting_issue = State()  # Selecting from predefined issues
     waiting_for_message = State()  # Typing custom message
+    processing = State()  # Anti-spam protection
+
+# Ban Appeal FSM States
+class AppealState(StatesGroup):
+    waiting_for_appeal_message = State()
     processing = State()  # Anti-spam protection
 
 # Advanced Anti-Spam Protection System
@@ -797,6 +975,71 @@ def sanitize_text(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> str:
     
     return text
 
+def is_user_completely_banned(user_id: int) -> tuple[bool, dict, str]:
+    """Check if user is completely banned from using bot. Returns (is_banned, ban_record, ban_message)"""
+    try:
+        ban_record = col_banned.find_one({"user_id": str(user_id)})
+        if not ban_record:
+            return (False, None, "")
+        
+        ban_type = ban_record.get("ban_type", "permanent")
+        ban_until = ban_record.get("ban_until")
+        banned_features = ban_record.get("banned_features", [])
+        
+        # Check if temporary ban has expired
+        if ban_type == "temporary" and ban_until:
+            if isinstance(ban_until, datetime):
+                if datetime.now(IST) >= ban_until:
+                    # Ban expired, remove it
+                    col_banned.delete_one({"user_id": str(user_id)})
+                    col_users.update_one({"user_id": str(user_id)}, {"$set": {"status": "active"}})
+                    return (False, None, "")
+        
+        # User is banned - check if it's a complete ban (all features banned)
+        if len(banned_features) >= 4 or ban_type == "permanent":
+            # Complete ban - generate message
+            custom_reason = ban_record.get("reason", "Violation of terms of service")
+            banned_at = ban_record.get("banned_at", "Unknown")
+            banned_by = ban_record.get("banned_by", "Admin")
+            banned_from = ban_record.get("banned_from", "Multiple violations")
+            violation_type = ban_record.get("violation_type", "Spam/Abuse")
+            msa_id = ban_record.get("msa_id", "UNKNOWN")
+            
+            if isinstance(banned_at, datetime):
+                ban_date = banned_at.strftime("%d %b %Y, %I:%M %p")
+            else:
+                ban_date = "Unknown Date"
+            
+            ban_msg = (
+                f"🚫 **ACCESS COMPLETELY DENIED**\n\n"
+                f"⛔ You are permanently banned from using this bot.\n\n"
+                f"**📋 Ban Details:**\n"
+                f"• MSA ID: {msa_id}\n"
+                f"• Reason: {custom_reason}\n"
+                f"• Violation Type: {violation_type}\n"
+                f"• Banned From: {banned_from}\n"
+                f"• Banned On: {ban_date}\n"
+                f"• Banned By: {banned_by.replace('System (Auto)', 'MSANode Security Agent')}\n\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"❌ **ALL FEATURES DISABLED**\n"
+                f"• Dashboard: Blocked\n"
+                f"• Reviews: Blocked\n"
+                f"• Support: Blocked\n"
+                f"• Guide: Blocked\n"
+                f"• FAQ: Blocked\n\n"
+                f"🔒 You cannot access any bot features.\n"
+                f"💬 Contact admin if this is a mistake."
+            )
+            
+            return (True, ban_record, ban_msg)
+        
+        # Partial ban (some features banned)
+        return (False, ban_record, "")
+        
+    except Exception as e:
+        logger.error(f"Error checking ban status: {e}")
+        return (False, None, "")
+
 def check_security_violation(user_id: int) -> tuple[bool, str]:
     """Check if user has violated security policies. Returns (is_banned, reason)"""
     current_time = time.time()
@@ -819,6 +1062,82 @@ def check_security_violation(user_id: int) -> tuple[bool, str]:
     
     return (False, "")
 
+async def send_ban_report(user_id: int, reason: str, violation_type: str, banned_from: str, banned_by: str = "System"):
+    """Send detailed ban report to BAN_REPORT_CHANNEL_ID"""
+    try:
+        # Get complete user info
+        user_doc = col_users.find_one({"user_id": str(user_id)})
+        if user_doc:
+            user_name = user_doc.get("first_name", "Unknown")
+            msa_id = user_doc.get("msa_id", "UNKNOWN")
+            username = user_doc.get("username", "No Username")
+            join_date = user_doc.get("first_seen")
+            last_active = user_doc.get("last_active")
+        else:
+            user_name = "Unknown"
+            msa_id = "UNKNOWN"
+            username = "No Username"
+            join_date = None
+            last_active = None
+        
+        now_str = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+        
+        # Build detailed report
+        report = (
+            f"🚨 **USER BANNED - DETAILED REPORT** 🚨\n"
+            f"═══════════════════════════════════\n\n"
+            f"**👤 USER INFORMATION:**\n"
+            f"• Name: {user_name}\n"
+            f"• Telegram ID: `{user_id}`\n"
+            f"• MSA ID: {msa_id}\n"
+            f"• Username: @{username}\n\n"
+            f"**⚠️ BAN DETAILS:**\n"
+            f"• Reason: {reason}\n"
+            f"• Violation Type: {violation_type}\n"
+            f"• Banned From: {banned_from}\n"
+            f"• Banned By: {banned_by.replace('System (Auto)', 'MSANode Security Agent')}\n"
+            f"• Ban Date: {now_str}\n"
+            f"• Ban Type: PERMANENT\n\n"
+            f"**📊 USER ACTIVITY:**\n"
+        )
+        
+        if join_date:
+            if isinstance(join_date, datetime):
+                join_str = join_date.strftime("%d-%m-%Y")
+            else:
+                join_str = str(join_date)
+            report += f"• Joined: {join_str}\n"
+        
+        if last_active:
+            if isinstance(last_active, datetime):
+                last_str = last_active.strftime("%d-%m-%Y %I:%M %p")
+            else:
+                last_str = str(last_active)
+            report += f"• Last Active: {last_str}\n"
+        
+        report += (
+            f"\n**🔒 BLOCKED FEATURES:**\n"
+            f"• ❌ Dashboard\n"
+            f"• ❌ Reviews\n"
+            f"• ❌ Customer Support\n"
+            f"• ❌ Guide/How to Use\n"
+            f"• ❌ FAQ/Help\n\n"
+            f"═══════════════════════════════════\n"
+            f"Status: 🔴 **PERMANENTLY BANNED**\n"
+            f"═══════════════════════════════════"
+        )
+        
+        # Send to ban report channel
+        if BAN_REPORT_CHANNEL_ID:
+            await bot.send_message(
+                chat_id=BAN_REPORT_CHANNEL_ID,
+                text=report,
+                parse_mode="Markdown"
+            )
+            logger.info(f"Ban report sent to channel for user {user_id}")
+    except Exception as e:
+        logger.error(f"Failed to send ban report: {e}")
+
 def record_violation(user_id: int, violation_type: str = "general"):
     """Record a security violation for a user"""
     current_time = time.time()
@@ -834,13 +1153,82 @@ def record_violation(user_id: int, violation_type: str = "general"):
     # Auto-ban if threshold reached
     if user_violation_count[user_id] >= GLOBAL_BAN_THRESHOLD:
         try:
+            # Get user info
+            user_doc = col_users.find_one({"user_id": str(user_id)})
+            user_name = user_doc.get("first_name", "Unknown User") if user_doc else "Unknown User"
+            msa_id = user_doc.get("msa_id", "UNKNOWN") if user_doc else "UNKNOWN"
+            username = user_doc.get("username", "No Username") if user_doc else "No Username"
+            
+            # Ban in database with complete information
             col_banned.insert_one({
                 "user_id": str(user_id),
+                "msa_id": msa_id,
+                "username": username,
+                "user_name": user_name,
                 "reason": f"Automatic ban: {GLOBAL_BAN_THRESHOLD} security violations",
                 "timestamp": datetime.now(IST),
                 "violation_type": violation_type,
-                "permanent": True
+                "banned_from": "Multiple violations",
+                "permanent": True,
+                "banned_at": datetime.now(IST),
+                "banned_by": "MSANode Security Agent",
+                "ban_type": "permanent",
+                "ban_until": None,
+                "banned_features": ["downloads", "reviews", "support", "search", "dashboard", "guide", "faq"]
             })
+            
+            # Log to ban history
+            col_ban_history.insert_one({
+                "user_id": str(user_id),
+                "msa_id": msa_id,
+                "username": username,
+                "user_name": user_name,
+                "action_type": "auto_ban",
+                "admin_name": "MSANode Security Agent",
+                "reason": f"Automatic ban: {GLOBAL_BAN_THRESHOLD} security violations",
+                "ban_type": "permanent",
+                "ban_until": None,
+                "banned_features": ["downloads", "reviews", "support", "search", "dashboard", "guide", "faq"],
+                "banned_from": "Multiple violations",
+                "violation_type": violation_type,
+                "timestamp": datetime.now(IST)
+            })
+            
+            # Send detailed ban report to BAN_REPORT_CHANNEL_ID
+            asyncio.create_task(send_ban_report(
+                user_id=user_id,
+                reason=f"Automatic ban: {GLOBAL_BAN_THRESHOLD} security violations",
+                violation_type=violation_type,
+                banned_from="Multiple violations",
+                banned_by="MSANode Security Agent"
+            ))
+            
+            # Send notification to legacy ban channel (if different)
+            if BAN_CHANNEL_ID and BAN_CHANNEL_ID != BAN_REPORT_CHANNEL_ID:
+                try:
+                    now_str = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+                    channel_msg = (
+                        f"🚨 **AUTO-BAN TRIGGERED**\n"
+                        f"═══════════════════════\n\n"
+                        f"👤 User: {user_name}\n"
+                        f"🆔 Telegram ID: {user_id}\n"
+                        f"🏷️ MSA ID: {msa_id}\n"
+                        f"👤 Username: @{username}\n"
+                        f"🤖 Banned By: System (Auto)\n"
+                        f"📅 Date: {now_str}\n\n"
+                        f"⚠️ Violation Type: {violation_type}\n"
+                        f"📝 Reason: {GLOBAL_BAN_THRESHOLD} Security Violations\n\n"
+                        f"═══════════════════════\n"
+                        f"Status: 🔒 PERMANENT (AUTO)"
+                    )
+                    asyncio.create_task(bot.send_message(
+                        chat_id=BAN_CHANNEL_ID,
+                        text=channel_msg,
+                        parse_mode="Markdown"
+                    ))
+                except Exception as e:
+                    logger.error(f"Failed to send auto-ban notification: {e}")
+            
             logger.critical(f"🚨 AUTO-BAN: User {user_id} permanently banned for {GLOBAL_BAN_THRESHOLD} violations")
         except Exception as e:
             logger.error(f"Failed to auto-ban user {user_id}: {e}")
@@ -887,8 +1275,20 @@ def validate_support_message(text: str) -> tuple[bool, str]:
 # ==========================================
 
 # Keyboard Builders
-def get_main_keyboard():
-    """Main menu with DASHBOARD, REVIEW, CUSTOMER SUPPORT, FAQ, and GUIDE buttons"""
+def get_main_keyboard(user_id: int = None):
+    """Main menu with DASHBOARD, REVIEW, CUSTOMER SUPPORT, FAQ, and GUIDE buttons
+    For banned users: Shows ONLY Appeal Ban button"""
+    
+    # Check if user is completely banned
+    if user_id:
+        is_banned, ban_record, ban_msg = is_user_completely_banned(user_id)
+        if is_banned:
+            # Return keyboard with ONLY Appeal Ban button for banned users
+            keyboard = [
+                [KeyboardButton(text="🔔 APPEAL BAN")]
+            ]
+            return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=False)
+    
     keyboard = [
         [KeyboardButton(text="📊 DASHBOARD")],
     ]
@@ -960,6 +1360,10 @@ def get_cancel_keyboard():
 def get_dashboard_actions_keyboard(has_pending_ticket: bool = False):
     """Dashboard action buttons with conditional cancel ticket option"""
     keyboard = []
+    
+    # Add history buttons
+    keyboard.append([KeyboardButton(text="📜 MY REVIEWS"), KeyboardButton(text="🎫 MY TICKETS")])
+    keyboard.append([KeyboardButton(text="📊 MY STATS")])
     
     if has_pending_ticket:
         keyboard.append([KeyboardButton(text="🚫 CANCEL MY TICKET")])
@@ -1289,6 +1693,15 @@ async def start_review(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     current_time = time.time()
     
+    # CRITICAL: Check if user is completely banned FIRST
+    is_banned, ban_record, ban_msg = is_user_completely_banned(user_id)
+    if is_banned:
+        try:
+            await message.answer(ban_msg, parse_mode="Markdown")
+        except:
+            pass
+        return
+    
     # Check if review system is enabled (CRITICAL CHECK)
     try:
         reviews_setting = col_settings.find_one({"setting": "reviews_enabled"})
@@ -1355,23 +1768,19 @@ async def start_review(message: types.Message, state: FSMContext):
     # Set processing state to block spam
     await state.set_state(ReviewState.processing)
     
-    # Enhanced premium animation sequence with stickers
-    msg = await message.answer("🎯 **Initializing Review Portal...**", parse_mode="Markdown")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("🎯 **Initializing Review Portal...**\n🔐 *Authenticating user...*", parse_mode="Markdown")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("🌟 **Loading Premium Interface...**\n⚡ *Scanning permissions...*", parse_mode="Markdown")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("✨ **Preparing Star System...**\n🎨 *Rendering components...*", parse_mode="Markdown")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("💎 **System Ready!**\n🚀 *Launching in 3...*", parse_mode="Markdown")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("💎 **System Ready!**\n🚀 *Launching in 2...*", parse_mode="Markdown")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("💎 **System Ready!**\n🚀 *Launching in 1...*", parse_mode="Markdown")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("🎊 **Welcome to Premium Reviews!**", parse_mode="Markdown")
+    # Enhanced premium animation sequence with progress bars
+    msg = await message.answer("┏━━━━━━━━━━━━━━━━━━━┓\n┃ 🎯 **Review Portal** ┃\n┗━━━━━━━━━━━━━━━━━━━┛\n\n⏳ *Initializing...*\n░░░░░░░░░░ 0%", parse_mode="Markdown")
+    await asyncio.sleep(0.15)
+    await msg.edit_text("┏━━━━━━━━━━━━━━━━━━━┓\n┃ 🔐 **Review Portal** ┃\n┗━━━━━━━━━━━━━━━━━━━┛\n\n🔍 *Authenticating user...*\n▰▰▱▱▱▱▱▱▱▱ 25%", parse_mode="Markdown")
+    await asyncio.sleep(0.15)
+    await msg.edit_text("┏━━━━━━━━━━━━━━━━━━━┓\n┃ 🌟 **Review Portal** ┃\n┗━━━━━━━━━━━━━━━━━━━┛\n\n⚡ *Loading interface...*\n▰▰▰▰▰▱▱▱▱▱ 50%", parse_mode="Markdown")
+    await asyncio.sleep(0.15)
+    await msg.edit_text("┏━━━━━━━━━━━━━━━━━━━┓\n┃ ✨ **Review Portal** ┃\n┗━━━━━━━━━━━━━━━━━━━┛\n\n🎨 *Preparing stars...*\n▰▰▰▰▰▰▰▱▱▱ 75%", parse_mode="Markdown")
+    await asyncio.sleep(0.15)
+    await msg.edit_text("┏━━━━━━━━━━━━━━━━━━━┓\n┃ 💎 **Review Portal** ┃\n┗━━━━━━━━━━━━━━━━━━━┛\n\n✅ *System Ready!*\n▰▰▰▰▰▰▰▰▰▰ 100%", parse_mode="Markdown")
     await asyncio.sleep(0.2)
+    await msg.edit_text("┏━━━━━━━━━━━━━━━━━━━┓\n┃ 🎊 **Welcome!** 🎊 ┃\n┗━━━━━━━━━━━━━━━━━━━┛\n\n🚀 *Launching...*", parse_mode="Markdown")
+    await asyncio.sleep(0.25)
     await msg.delete()
     
     # Check if user is a milestone reviewer (using cached count)
@@ -1764,13 +2173,15 @@ async def confirm_and_send_review(message: types.Message, state: FSMContext):
     
     data = await state.get_data()
     
-    # Fast submission animation sequence
-    msg = await message.answer("⏳ **Initiating submission...**")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("📡 **Transmitting to review center...**")
-    await asyncio.sleep(0.12)
-    await msg.edit_text("✅ **Review submitted successfully!**")
+    # Premium submission animation sequence
+    msg = await message.answer("┌─────────────────────┐\n│ ⏳ **Submitting...** │\n└─────────────────────┘\n\n🔄 *Processing review...*\n░░░░░░░░░░ 0%")
     await asyncio.sleep(0.15)
+    await msg.edit_text("┌─────────────────────┐\n│ 📡 **Submitting...** │\n└─────────────────────┘\n\n📤 *Transmitting data...*\n▰▰▰▰▰▱▱▱▱▱ 50%")
+    await asyncio.sleep(0.15)
+    await msg.edit_text("┌─────────────────────┐\n│ ✨ **Submitting...** │\n└─────────────────────┘\n\n💾 *Saving to database...*\n▰▰▰▰▰▰▰▰▱▱ 85%")
+    await asyncio.sleep(0.15)
+    await msg.edit_text("┌─────────────────────┐\n│ ✅ **Complete!** 🎉 │\n└─────────────────────┘\n\n🎊 *Review submitted!*\n▰▰▰▰▰▰▰▰▰▰ 100%")
+    await asyncio.sleep(0.2)
     await msg.delete()
     
     # Prepare data
@@ -1895,24 +2306,29 @@ async def confirm_and_send_review(message: types.Message, state: FSMContext):
     percentage_complete = 100  # 100% remaining (full cooldown)
     
     await message.answer(
-        f"{'🎊' if rating >= 4 else '🎉'} **Thank You, {name}!** {'🎊' if rating >= 4 else '🎉'}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"╔═══════════════════════════╗\n"
+        f"║ {'🎊' if rating >= 4 else '🎉'} **Thank You, {name}!** {'🎊' if rating >= 4 else '🎉'} ║\n"
+        f"╚═══════════════════════════╝\n\n"
         f"✅ Your review has been **{status_text}**!\n\n"
-        f"📊 **YOUR REVIEW:**\n"
-        f"📅 {timestamp}\n"
-        f"⭐ Rating: {'⭐' * rating} **{rating}/5**\n"
-        f"📈 [{'★' * rating}{'☆' * (5 - rating)}]\n\n"
-        f"⏳ **COOLDOWN STATUS:**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"[{progress_bar}] {percentage_complete}%\n\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃  📊 **YOUR REVIEW**    ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"📅 **Date:** {timestamp}\n"
+        f"⭐ **Rating:** {'⭐' * rating} **{rating}/5**\n"
+        f"📊 **Score:** [{'★' * rating}{'☆' * (5 - rating)}]\n\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃ ⏳ **COOLDOWN STATUS** ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"🔄 **Progress:**\n[{progress_bar}] {percentage_complete}%\n\n"
         f"⏱️ **Time Remaining:** `{REVIEW_COOLDOWN_DAYS} days`\n"
         f"🔓 **Next Review:** {next_review_formatted}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         f"{reward_msg}"
         f"{milestone_msg}\n\n"
-        f"🛡️ Quality control active to ensure meaningful feedback.\n"
-        f"🙏 Thank you for your time and honest feedback!\n\n"
-        f"🚀 **Continue Your Journey in MSANode!**",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡️ *Quality control ensures meaningful feedback*\n"
+        f"🙏 *Thank you for your time and honesty!*\n\n"
+        f"🚀 **Continue Your Premium Journey!**",
         reply_markup=get_main_keyboard()
     )
 
@@ -2114,11 +2530,20 @@ async def handle_guide_button(message: types.Message):
     """Handle guide button click from main menu"""
     user_id = message.from_user.id
     
-    # Ban check
+    # CRITICAL: Check if user is completely banned FIRST
+    is_banned, ban_record, ban_msg = is_user_completely_banned(user_id)
+    if is_banned:
+        try:
+            await message.answer(ban_msg, parse_mode="Markdown")
+        except:
+            pass
+        return
+    
+    # Ban check (legacy system - will be removed by new check above)
     if col_banned.find_one({"user_id": str(user_id)}):
         return
     
-    # Anti-spam protection
+    # Anti-spam protection with permanent ban for severe violations
     current_time = time.time()
     if user_id not in user_guide_views:
         user_guide_views[user_id] = []
@@ -2133,6 +2558,55 @@ async def handle_guide_button(message: types.Message):
     recent_views = len(user_guide_views[user_id])
     if recent_views >= 3:
         user_guide_spam[user_id] = user_guide_spam.get(user_id, 0) + 1
+        
+        # Severe spamming (10+ violations) = permanent ban
+        if user_guide_spam[user_id] >= 10:
+            # Get user info
+            user_doc = col_users.find_one({"user_id": str(user_id)})
+            msa_id = user_doc.get("msa_id", "UNKNOWN") if user_doc else "UNKNOWN"
+            user_name = user_doc.get("first_name", "Unknown") if user_doc else "Unknown"
+            username = user_doc.get("username", "No Username") if user_doc else "No Username"
+            
+            # Permanent ban
+            col_banned.insert_one({
+                "user_id": str(user_id),
+                "msa_id": msa_id,
+                "username": username,
+                "user_name": user_name,
+                "reason": f"Guide Button Spam - {user_guide_spam[user_id]} violations",
+                "violation_type": "Guide Button Spam",
+                "banned_from": "Guide Button",
+                "banned_at": datetime.now(IST),
+                "banned_by": "MSANode Security Agent",
+                "ban_type": "permanent",
+                "ban_until": None,
+                "banned_features": ["downloads", "reviews", "support", "search", "dashboard", "guide", "faq"]
+            })
+            
+            # Send ban report
+            asyncio.create_task(send_ban_report(
+                user_id=user_id,
+                reason=f"Guide Button Spam - {user_guide_spam[user_id]} violations",
+                violation_type="Guide Button Spam",
+                banned_from="Guide Button",
+                banned_by="MSANode Security Agent"
+            ))
+            
+            try:
+                await message.answer(
+                    f"🚫 **PERMANENTLY BANNED**\n\n"
+                    f"❌ You have been banned for excessive spam\n\n"
+                    f"**📋 Your Details:**\n"
+                    f"• MSA ID: {msa_id}\n\n"
+                    f"⚠️ Reason: Guide Button Spam\n\n"
+                    f"💀 This ban is permanent and irreversible.\n"
+                    f"💬 Use Customer Support below to appeal.",
+                    parse_mode="Markdown",
+                    reply_markup=get_main_keyboard(user_id)
+                )
+            except:
+                pass
+            return
         
         if user_guide_spam[user_id] >= GUIDE_SPAM_FREEZE:
             try:
@@ -2224,7 +2698,16 @@ async def handle_faq(message: types.Message):
     """Handle FAQ button - show frequently asked questions"""
     user_id = message.from_user.id
     
-    # Ban check
+    # CRITICAL: Check if user is completely banned FIRST
+    is_banned, ban_record, ban_msg = is_user_completely_banned(user_id)
+    if is_banned:
+        try:
+            await message.answer(ban_msg, parse_mode="Markdown")
+        except:
+            pass
+        return
+    
+    # Ban check (legacy system - will be removed by new check above)
     if col_banned.find_one({"user_id": str(user_id)}):
         return
     
@@ -2421,6 +2904,15 @@ async def show_dashboard(message: types.Message, state: FSMContext):
     """Display simple user dashboard with ID, username, and pending items"""
     user_id = str(message.from_user.id)
     
+    # CRITICAL: Check if user is completely banned
+    is_banned, ban_record, ban_msg = is_user_completely_banned(int(user_id))
+    if is_banned:
+        try:
+            await message.answer(ban_msg, parse_mode="Markdown")
+        except:
+            pass
+        return
+    
     # Only basic rate limiting for navigation (no progressive spam bans)
     is_rate_limited, rate_msg = check_rate_limit(user_id)
     if is_rate_limited:
@@ -2449,8 +2941,15 @@ async def show_dashboard(message: types.Message, state: FSMContext):
     if not user_review:
         pending_items.append("- Review not submitted yet")
     
-    # Check pending support ticket
+    # Check pending support ticket - verify both in-memory and database
     pending_ticket = user_support_pending.get(user_id)
+    db_support_status = user_doc.get("support_status") if user_doc else None
+    
+    # Clear in-memory if database shows resolved/responded
+    if db_support_status in ["resolved", "responded"] and pending_ticket:
+        user_support_pending[user_id]['status'] = 'cleared'
+        pending_ticket = None  # Don't show as pending
+    
     if pending_ticket and pending_ticket.get('status') == 'pending':
         ticket_msg = pending_ticket.get('message', '')[:40]
         ticket_time = pending_ticket.get('timestamp', time.time())
@@ -2486,9 +2985,13 @@ async def show_dashboard(message: types.Message, state: FSMContext):
     
     dashboard_msg += "\n======================="
     
+    # Only show cancel button if truly pending (not resolved in database)
+    has_active_ticket = (pending_ticket and pending_ticket.get('status') == 'pending' and 
+                         db_support_status not in ["resolved", "responded"])
+    
     await message.answer(
         dashboard_msg,
-        reply_markup=get_dashboard_actions_keyboard(has_pending_ticket=(pending_ticket and pending_ticket.get('status') == 'pending'))
+        reply_markup=get_dashboard_actions_keyboard(has_pending_ticket=has_active_ticket)
     )
 
 @dp.message(F.text == "🚫 CANCEL MY TICKET")
@@ -2609,11 +3112,29 @@ async def back_to_main_from_dashboard(message: types.Message, state: FSMContext)
 
 @dp.message(F.text == "💬 CUSTOMER SUPPORT")
 async def start_customer_support(message: types.Message, state: FSMContext):
-    """Handle customer support button click with spam protection"""
+    """Handle customer support button click with spam protection
+    Note: Banned users CANNOT use this - they must use Appeal Ban button"""
     user_id = str(message.from_user.id)
     current_time = time.time()
     
-    # Check if support feature is banned for this user
+    # CRITICAL: Check if user is completely banned - block them from support
+    is_banned, ban_record, ban_msg = is_user_completely_banned(int(user_id))
+    if is_banned:
+        try:
+            await message.answer(
+                f"⛔ **CUSTOMER SUPPORT NOT AVAILABLE**\n\n"
+                f"You are currently banned from using this bot.\n\n"
+                f"🔔 **To appeal your ban:**\n"
+                f"Use the 🔔 **APPEAL BAN** button below.\n\n"
+                f"💬 Customer Support is only for active users.",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard(int(user_id))
+            )
+        except:
+            pass
+        return
+    
+    # Check if support feature is banned for this user (partial ban)
     user_data = col_users.find_one({"user_id": user_id})
     if is_feature_banned(user_data, 'support'):
         await send_feature_ban_message(message, 'support', user_data)
@@ -2654,26 +3175,64 @@ async def start_customer_support(message: types.Message, state: FSMContext):
         user_doc = col_users.find_one({"user_id": user_id})
         msa_id = user_doc.get("msa_id", "UNKNOWN") if user_doc else "UNKNOWN"
         user_name = user_doc.get("first_name", "Unknown") if user_doc else "Unknown"
+        username = user_doc.get("username", "No Username") if user_doc else "No Username"
         
-        # PERMANENT BAN
+        # PERMANENT BAN with complete information
         col_banned.insert_one({
             "user_id": user_id,
             "msa_id": msa_id,
+            "username": username,
             "user_name": user_name,
-            "reason": "Customer Support Button Spam",
+            "reason": "Customer Support Button Spam - Excessive rapid clicking",
+            "violation_type": "Support Button Spam",
+            "banned_from": "Customer Support Button",
             "banned_at": datetime.now(IST),
-            "click_count": click_count
+            "banned_by": "MSANode Security Agent",
+            "ban_type": "permanent",
+            "ban_until": None,
+            "click_count": click_count,
+            "banned_features": ["downloads", "reviews", "support", "search", "dashboard", "guide", "faq"]
         })
+        
+        # Log to ban history
+        col_ban_history.insert_one({
+            "user_id": user_id,
+            "msa_id": msa_id,
+            "username": username,
+            "user_name": user_name,
+            "action_type": "auto_ban",
+            "admin_name": "MSANode Security Agent",
+            "reason": f"Customer Support Button Spam - {click_count} rapid clicks",
+            "ban_type": "permanent",
+            "ban_until": None,
+            "banned_features": ["downloads", "reviews", "support", "search", "dashboard", "guide", "faq"],
+            "banned_from": "Customer Support Button",
+            "violation_type": "Support Button Spam",
+            "timestamp": datetime.now(IST)
+        })
+        
+        # Send detailed ban report
+        asyncio.create_task(send_ban_report(
+            user_id=int(user_id),
+            reason=f"Customer Support Button Spam - {click_count} rapid clicks",
+            violation_type="Support Button Spam",
+            banned_from="Customer Support Button",
+            banned_by="MSANode Security Agent"
+        ))
         
         try:
             await message.answer(
-                "🚫 **PERMANENTLY BANNED**\n\n"
-                "❌ You have been automatically banned\n"
-                "⚠️ Reason: Excessive spam detected\n"
+                f"🚫 **PERMANENTLY BANNED**\n\n"
+                f"❌ You have been automatically banned\n\n"
+                f"**📋 Your Details:**\n"
+                f"• MSA ID: {msa_id}\n\n"
+                f"⚠️ Reason: Excessive spam detected\n"
                 f"📊 Violations: {click_count} rapid clicks\n\n"
-                "💀 **This ban is permanent and cannot be reversed.**\n\n"
-                "⚠️ Please respect bot usage guidelines.",
-                parse_mode="Markdown"
+                f"💀 **This ban is permanent and cannot be reversed.**\n\n"
+                f"⚠️ Please respect bot usage guidelines.\n"
+                f"💬 Use Customer Support below to appeal.",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard(int(user_id))
             )
         except:
             pass
@@ -2799,7 +3358,312 @@ async def start_customer_support(message: types.Message, state: FSMContext):
         logger.error(f"Error starting customer support: {e}")
 
 # ==========================================
-# 📚 GUIDE SECTION HANDLERS
+# � APPEAL BAN SYSTEM
+# ==========================================
+
+@dp.message(F.text == "🔔 APPEAL BAN")
+async def start_appeal_process(message: types.Message, state: FSMContext):
+    """Handle appeal ban button - only for banned users"""
+    user_id = str(message.from_user.id)
+    current_time = time.time()
+    
+    # Check if user is actually banned
+    is_banned, ban_record, ban_msg = is_user_completely_banned(int(user_id))
+    if not is_banned:
+        try:
+            await message.answer(
+                "✅ **NO BAN FOUND**\n\n"
+                "You are not currently banned.\n"
+                "This button is only for banned users.\n\n"
+                "📱 Use the main menu to access features.",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard(int(user_id))
+            )
+        except:
+            pass
+        return
+    
+    # Check if user has already appealed recently (spam protection)
+    existing_appeal = col_appeals.find_one({
+        "user_id": user_id,
+        "status": "pending"
+    })
+    
+    if existing_appeal:
+        appeal_time = existing_appeal.get("appeal_date")
+        appeal_time_str = appeal_time.strftime("%d-%m-%Y %I:%M %p") if appeal_time else "Unknown"
+        
+        try:
+            await message.answer(
+                "⏳ **APPEAL ALREADY SUBMITTED**\n\n"
+                f"📩 You have a pending appeal\n"
+                f"🕐 Submitted: {appeal_time_str}\n"
+                f"📊 Status: ⏳ PENDING REVIEW\n\n"
+                "✨ Our team will review your appeal soon!\n"
+                "⏰ Please wait for response before submitting another.\n\n"
+                "💎 *Thank you for your patience!*",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard(int(user_id))
+            )
+        except:
+            pass
+        return
+    
+    # Check last appeal time (24 hour limit)
+    last_appeal = col_appeals.find_one(
+        {"user_id": user_id},
+        sort=[("appeal_date", -1)]
+    )
+    
+    if last_appeal:
+        last_appeal_time = last_appeal.get("appeal_date")
+        if last_appeal_time:
+            # Make sure last_appeal_time is timezone-aware
+            if isinstance(last_appeal_time, datetime):
+                if last_appeal_time.tzinfo is None:
+                    last_appeal_time = IST.localize(last_appeal_time)
+            else:
+                # If it's a string, try to parse it
+                try:
+                    last_appeal_time = datetime.fromisoformat(str(last_appeal_time))
+                    if last_appeal_time.tzinfo is None:
+                        last_appeal_time = IST.localize(last_appeal_time)
+                except:
+                    last_appeal_time = None
+            
+            if last_appeal_time:
+                time_since_appeal = (datetime.now(IST) - last_appeal_time).total_seconds()
+                if time_since_appeal < 86400:  # 24 hours
+                    hours_remaining = int((86400 - time_since_appeal) / 3600)
+                    try:
+                        await message.answer(
+                            f"⏰ **APPEAL COOLDOWN ACTIVE**\n\n"
+                            f"You can submit another appeal in:\n"
+                            f"⏳ {hours_remaining} hours\n\n"
+                            f"⚠️ Limit: 1 appeal per 24 hours\n\n"
+                            f"💡 Please wait before trying again.",
+                            parse_mode="Markdown",
+                            reply_markup=get_main_keyboard(int(user_id))
+                        )
+                    except:
+                        pass
+                    return
+    
+    # Get user and ban details
+    user_doc = col_users.find_one({"user_id": user_id})
+    msa_id = ban_record.get("msa_id", "UNKNOWN")
+    username = ban_record.get("username", "No Username")
+    ban_reason = ban_record.get("reason", "No reason provided")
+    banned_by = ban_record.get("banned_by", "System")
+    banned_at = ban_record.get("banned_at")
+    banned_at_str = banned_at.strftime("%d-%m-%Y %I:%M %p") if banned_at else "Unknown"
+    
+    # Show ban details and request appeal message
+    try:
+        await message.answer(
+            "🔔 **BAN APPEAL SYSTEM**\n\n"
+            "📋 **Your Ban Details:**\n"
+            f"• MSA ID: `{msa_id}`\n"
+            f"• Username: @{username}\n"
+            f"• Banned By: {banned_by}\n"
+            f"• Date: {banned_at_str}\n"
+            f"• Reason: {ban_reason}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📝 **How to Appeal:**\n"
+            "1. Write a clear explanation\n"
+            "2. Explain why you should be unbanned\n"
+            "3. Promise to follow rules\n\n"
+            "💡 **Tips for Success:**\n"
+            "   • Be honest and respectful\n"
+            "   • Acknowledge your mistake\n"
+            "   • Show you understand the rules\n\n"
+            "⚠️ **Important:**\n"
+            "   • You can appeal once per 24 hours\n"
+            "   • Admin will review your appeal\n"
+            "   • Response may take up to 24 hours\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "✍️ **Type your appeal message below:**",
+            parse_mode="Markdown",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        await state.set_state(AppealState.waiting_for_appeal_message)
+    except Exception as e:
+        logger.error(f"Error starting appeal: {e}")
+
+
+@dp.message(AppealState.waiting_for_appeal_message)
+async def process_appeal_message(message: types.Message, state: FSMContext):
+    """Process the appeal message from banned user"""
+    user_id = str(message.from_user.id)
+    appeal_text = message.text
+    
+    # Validate appeal message
+    if not appeal_text or len(appeal_text.strip()) < 10:
+        try:
+            await message.answer(
+                "❌ **APPEAL TOO SHORT**\n\n"
+                "Your appeal must be at least 10 characters.\n"
+                "Please provide a clear explanation.\n\n"
+                "✍️ Try again:",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+        return
+    
+    if len(appeal_text) > 1000:
+        try:
+            await message.answer(
+                "❌ **APPEAL TOO LONG**\n\n"
+                "Maximum length: 1000 characters\n"
+                "Please shorten your message.\n\n"
+                "✍️ Try again:",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+        return
+    
+    # Get user details
+    is_banned, ban_record, _ = is_user_completely_banned(int(user_id))
+    if not is_banned:
+        await state.clear()
+        try:
+            await message.answer(
+                "✅ You are no longer banned!",
+                reply_markup=get_main_keyboard(int(user_id))
+            )
+        except:
+            pass
+        return
+    
+    user_doc = col_users.find_one({"user_id": user_id})
+    msa_id = ban_record.get("msa_id", "UNKNOWN")
+    username = ban_record.get("username", "No Username")
+    user_name = ban_record.get("user_name", "Unknown")
+    ban_reason = ban_record.get("reason", "No reason provided")
+    banned_by = ban_record.get("banned_by", "System")
+    banned_at = ban_record.get("banned_at")
+    
+    # Store appeal in database
+    appeal_doc = {
+        "user_id": user_id,
+        "msa_id": msa_id,
+        "username": username,
+        "user_name": user_name,
+        "appeal_text": appeal_text,
+        "ban_reason": ban_reason,
+        "banned_by": banned_by,
+        "banned_at": banned_at,
+        "appeal_date": datetime.now(IST),
+        "status": "pending",
+        "reviewed_by": None,
+        "review_date": None,
+        "response": None
+    }
+    
+    try:
+        col_appeals.insert_one(appeal_doc)
+    except Exception as e:
+        logger.error(f"Error storing appeal: {e}")
+        try:
+            await message.answer(
+                "❌ **ERROR**\n\nFailed to submit appeal. Please try again later.",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard(int(user_id))
+            )
+        except:
+            pass
+        await state.clear()
+        return
+    
+    # Send appeal to appeal channel with inline buttons
+    banned_at_str = banned_at.strftime("%d-%m-%Y %I:%M %p") if banned_at else "Unknown"
+    appeal_time_str = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+    
+    appeal_message = (
+        "🔔 **NEW BAN APPEAL**\n\n"
+        "👤 **User Information:**\n"
+        f"• MSA ID: `{msa_id}`\n"
+        f"• User ID: `{user_id}`\n"
+        f"• Username: @{username}\n"
+        f"• Name: {user_name}\n\n"
+        "🚫 **Ban Information:**\n"
+        f"• Reason: {ban_reason}\n"
+        f"• Banned By: {banned_by}\n"
+        f"• Banned Date: {banned_at_str}\n\n"
+        "📝 **Appeal Message:**\n"
+        f"{appeal_text}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 Appeal Time: {appeal_time_str}\n"
+        f"📊 Status: ⏳ PENDING REVIEW"
+    )
+    
+    # Send appeal to channel (no buttons - manage in bot2)
+    try:
+        channel_msg = await bot.send_message(
+            chat_id=APPEAL_CHANNEL_ID,
+            text=appeal_message,
+            parse_mode="Markdown"
+        )
+        # Store message ID and original text for later status updates
+        col_appeals.update_one(
+            {"user_id": user_id, "status": "pending"},
+            {
+                "$set": {
+                    "channel_message_id": channel_msg.message_id,
+                    "original_text": appeal_message
+                }
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error sending appeal to channel: {e}")
+    
+    # Premium confirmation animation
+    await state.clear()
+    
+    # Show premium processing animation
+    processing = await message.answer("⚡ **Processing Appeal...**", parse_mode="Markdown")
+    await asyncio.sleep(0.1)
+    await processing.edit_text("📝 **[▓░░░░] 20% - Validating Details...**", parse_mode="Markdown")
+    await asyncio.sleep(0.1)
+    await processing.edit_text("📤 **[▓▓░░░] 40% - Sending to Admin Team...**", parse_mode="Markdown")
+    await asyncio.sleep(0.1)
+    await processing.edit_text("🔔 **[▓▓▓░░] 60% - Notifying Admins...**", parse_mode="Markdown")
+    await asyncio.sleep(0.1)
+    await processing.edit_text("✨ **[▓▓▓▓░] 80% - Finalizing Submission...**", parse_mode="Markdown")
+    await asyncio.sleep(0.1)
+    await processing.edit_text("✅ **[▓▓▓▓▓] 100% - APPEAL SUBMITTED!**", parse_mode="Markdown")
+    await asyncio.sleep(0.2)
+    await processing.delete()
+    
+    try:
+        await message.answer(
+            "✅ **APPEAL SUBMITTED SUCCESSFULLY**\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📩 **Your appeal has been sent to the admin team**\n\n"
+            f"🆔 Appeal ID: `{msa_id}`\n"
+            f"🕐 Submitted: {appeal_time_str}\n"
+            f"📊 Status: ⏳ **PENDING REVIEW**\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "✨ **What happens next:**\n"
+            "   • 👀 Admin will review your case\n"
+            "   • 📬 You'll be notified of the decision\n"
+            "   • ⏰ Response time: Up to 24 hours\n\n"
+            "⚠️ **Important Guidelines:**\n"
+            "   • ❌ Do NOT submit multiple appeals\n"
+            "   • ⏸️ Wait patiently for admin response\n"
+            "   • Follow bot rules if unbanned\n\n"
+            "💎 *Thank you for your patience!*",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(int(user_id))
+        )
+    except Exception as e:
+        logger.error(f"Error sending confirmation: {e}")
+
+
+# ==========================================
+# �📚 GUIDE SECTION HANDLERS
 # ==========================================
 
 @dp.message(F.text == "📚 Support System Guide")
@@ -5114,7 +5978,7 @@ async def cmd_unban_user(message: types.Message, command: CommandObject):
                 f"🆔 **TELEGRAM ID:** `{target_user_id}`\n"
                 f"⚠️ **Original Ban Reason:** {ban_reason}\n"
                 f"📅 **Banned On:** {ban_date_str}\n"
-                f"🔓 **Unbanned By:** Admin\n"
+                f"🔓 **Processed By:** MSA NODE AGENT\n"
                 f"⏰ **Unbanned At:** {datetime.now(IST).strftime('%d-%m-%Y %I:%M %p')}\n\n"
                 f"💎 **User can now use the bot normally!**\n"
                 f"🔄 All bot features restored for this user.",
@@ -5320,6 +6184,61 @@ async def cmd_user_info(message: types.Message, command: CommandObject):
 async def cmd_start(message: types.Message, command: CommandObject):
     user_id = message.from_user.id
     
+    # 0. Check if user was previously banned but is now unbanned
+    user_doc = col_users.find_one({"user_id": str(user_id)})
+    if user_doc:
+        was_unbanned = user_doc.get("was_unbanned", False)
+        previous_ban_reason = user_doc.get("previous_ban_reason")
+        unbanned_at = user_doc.get("unbanned_at")
+        unbanned_by = user_doc.get("unbanned_by", "Admin")
+        
+        if was_unbanned:
+            # User was previously banned but unbanned - show warning
+            if isinstance(unbanned_at, datetime):
+                unban_date = unbanned_at.strftime("%d %b %Y, %I:%M %p")
+            else:
+                unban_date = "Recently"
+            
+            warning_msg = (
+                f"⚠️ **SECOND CHANCE GRANTED** ⚠️\n\n"
+                f"🔓 Your ban has been lifted by **MSA NODE AGENT**.\n\n"
+                f"**📋 Your Details:**\n"
+            )
+            
+            if user_doc.get("msa_id"):
+                warning_msg += f"• MSA ID: {user_doc.get('msa_id')}\n"
+            
+            if previous_ban_reason:
+                warning_msg += f"\n**📜 Previous Ban Reason:**\n{previous_ban_reason}\n"
+            
+            warning_msg += (
+                f"\n**🔓 Unbanned:** {unban_date}\n"
+                f"**👮 Processed By:** MSA NODE AGENT\n\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ **FINAL WARNING** ⚠️\n\n"
+                f"• This is your LAST CHANCE\n"
+                f"• Do NOT repeat the same violations\n"
+                f"• Follow bot usage guidelines strictly\n"
+                f"• Any spam/abuse = PERMANENT BAN (no appeal)\n\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"✅ You now have full access to all features.\n"
+                f"👉 Use the bot responsibly!"
+            )
+            
+            try:
+                await message.answer(warning_msg, parse_mode="Markdown")
+                await asyncio.sleep(2)
+            except:
+                pass
+            
+            # Clear the unbanned flag so we don't show this message again
+            col_users.update_one(
+                {"user_id": str(user_id)},
+                {"$set": {"was_unbanned": False}}
+            )
+            
+            # Continue to normal flow below
+    
     # 1. Ban Protection with custom message and temporary ban check
     ban_record = col_banned.find_one({"user_id": str(user_id)})
     if ban_record:
@@ -5372,6 +6291,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
                     custom_reason = ban_record.get("reason")
                     banned_at = ban_record.get("banned_at", "Unknown")
                     banned_by = ban_record.get("banned_by", "Admin")
+                    msa_id_temp = ban_record.get("msa_id", "UNKNOWN")
                     
                     if isinstance(banned_at, datetime):
                         ban_date = banned_at.strftime("%d %b %Y, %I:%M %p")
@@ -5390,7 +6310,9 @@ async def cmd_start(message: types.Message, command: CommandObject):
                         ban_msg = (
                             f"⏰ **TEMPORARY BAN ACTIVE**\n\n"
                             f"⛔ Your account is temporarily banned.\n\n"
-                            f"**📋 Reason:**\n{custom_reason}\n\n"
+                            f"**📋 Ban Details:**\n"
+                            f"• MSA ID: {msa_id_temp}\n"
+                            f"• Reason: {custom_reason}\n\n"
                             f"**⏳ Time Remaining:**\n"
                             f"  • {days} days, {hours} hours, {minutes} minutes\n\n"
                             f"**🔓 Auto-Unban:** {unban_date}\n"
@@ -5404,6 +6326,8 @@ async def cmd_start(message: types.Message, command: CommandObject):
                         ban_msg = (
                             f"⏰ **TEMPORARY BAN ACTIVE**\n\n"
                             f"⛔ Your account is temporarily banned.\n\n"
+                            f"**📋 Your Details:**\n"
+                            f"• MSA ID: {msa_id_temp}\n\n"
                             f"**⏳ Time Remaining:**\n"
                             f"  • {days} days, {hours} hours, {minutes} minutes\n\n"
                             f"**🔓 Auto-Unban:** {unban_date}\n"
@@ -5416,7 +6340,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
                         )
                     
                     try:
-                        await message.answer(ban_msg)
+                        await message.answer(ban_msg, reply_markup=get_main_keyboard(user_id))
                     except:
                         pass
                     return
@@ -5429,6 +6353,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
             custom_reason = ban_record.get("reason")
             banned_at = ban_record.get("banned_at", "Unknown")
             banned_by = ban_record.get("banned_by", "Admin")
+            msa_id_perm = ban_record.get("msa_id", "UNKNOWN")
             
             if isinstance(banned_at, datetime):
                 ban_date = banned_at.strftime("%d %b %Y, %I:%M %p")
@@ -5447,7 +6372,9 @@ async def cmd_start(message: types.Message, command: CommandObject):
                 ban_msg = (
                     f"🚫 **ACCESS DENIED**\n\n"
                     f"⛔ Your account has been permanently banned.\n\n"
-                    f"**📋 Reason:**\n{custom_reason}\n\n"
+                    f"**📋 Ban Details:**\n"
+                    f"• MSA ID: {msa_id_perm}\n"
+                    f"• Reason: {custom_reason}\n\n"
                     f"**📅 Banned On:** {ban_date}\n"
                     f"**👮 Banned By:** {banned_by}{feature_status}\n\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -5458,6 +6385,8 @@ async def cmd_start(message: types.Message, command: CommandObject):
                 ban_msg = (
                     f"🚫 **ACCESS DENIED**\n\n"
                     f"⛔ Your account has been banned from using this bot.\n\n"
+                    f"**📋 Your Details:**\n"
+                    f"• MSA ID: {msa_id_perm}\n\n"
                     f"**📅 Banned On:** {ban_date}\n"
                     f"**👮 Banned By:** {banned_by}{feature_status}\n\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -5468,7 +6397,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
                 )
             
             try:
-                await message.answer(ban_msg)
+                await message.answer(ban_msg, reply_markup=get_main_keyboard(user_id))
             except:
                 pass
             return
@@ -5492,23 +6421,61 @@ async def cmd_start(message: types.Message, command: CommandObject):
         user_doc = col_users.find_one({"user_id": str(user_id)})
         msa_id = user_doc.get("msa_id", "UNKNOWN") if user_doc else "UNKNOWN"
         user_name = user_doc.get("first_name", "Unknown") if user_doc else "Unknown"
+        username = user_doc.get("username", "No Username") if user_doc else "No Username"
         
-        # Permanent ban for severe spam
+        # Permanent ban for severe spam with complete information
         col_banned.insert_one({
             "user_id": str(user_id),
             "msa_id": msa_id,
+            "username": username,
             "user_name": user_name,
-            "reason": "Spamming /start command",
+            "reason": f"Spamming /start command - {start_count} attempts in 60 seconds",
+            "violation_type": "Start Command Spam",
+            "banned_from": "/start command",
             "banned_at": datetime.now(IST),
-            "banned_by": "system"
+            "banned_by": "MSANode Security Agent",
+            "ban_type": "permanent",
+            "ban_until": None,
+            "banned_features": ["downloads", "reviews", "support", "search", "dashboard", "guide", "faq"]
         })
+        
+        # Log to ban history
+        col_ban_history.insert_one({
+            "user_id": str(user_id),
+            "msa_id": msa_id,
+            "username": username,
+            "user_name": user_name,
+            "action_type": "auto_ban",
+            "admin_name": "MSANode Security Agent",
+            "reason": f"Spamming /start command - {start_count} attempts",
+            "ban_type": "permanent",
+            "ban_until": None,
+            "banned_features": ["downloads", "reviews", "support", "search", "dashboard", "guide", "faq"],
+            "banned_from": "/start command",
+            "violation_type": "Start Command Spam",
+            "timestamp": datetime.now(IST)
+        })
+        
+        # Send detailed ban report
+        asyncio.create_task(send_ban_report(
+            user_id=user_id,
+            reason=f"Spamming /start command - {start_count} attempts in 60 seconds",
+            violation_type="Start Command Spam",
+            banned_from="/start command",
+            banned_by="MSANode Security Agent"
+        ))
+        
         try:
             await message.answer(
-                "🚫 **ACCESS PERMANENTLY DENIED**\n\n"
-                "⚠️ Your account has been banned for spamming the bot.\n\n"
-                "**Reason:** Excessive /start command abuse\n"
-                "**Status:** Permanent Ban\n\n"
-                "❌ You can no longer access this bot."
+                f"🚫 **ACCESS PERMANENTLY DENIED**\n\n"
+                f"⛔ Your account has been banned for spamming the bot.\n\n"
+                f"**📋 Your Details:**\n"
+                f"• MSA ID: {msa_id}\n\n"
+                f"**Reason:** Excessive /start command abuse\n"
+                f"**Status:** Permanent Ban\n\n"
+                f"❌ You can no longer access this bot.\n"
+                f"💬 Use Customer Support below to appeal.",
+                reply_markup=get_main_keyboard(user_id)
             )
         except:
             pass
@@ -5551,18 +6518,16 @@ async def cmd_start(message: types.Message, command: CommandObject):
     u_status = await log_user(message.from_user, source)
 
     # 5. PREMIUM VERIFICATION ANIMATION
-    load = await message.answer("🎯 **MSANode Security Check...**", parse_mode="Markdown")
-    await asyncio.sleep(0.1)
-    await load.edit_text("🎯 **MSANode Security Check...**\n🔍 *Scanning credentials...*", parse_mode="Markdown")
-    await asyncio.sleep(0.1)
-    await load.edit_text("🛰️ **Connecting to Vault Network...**\n📡 *Establishing secure link...*", parse_mode="Markdown")
-    await asyncio.sleep(0.1)
-    await load.edit_text("⚡ **Authenticating Access...**\n🔐 *Verifying permissions...*", parse_mode="Markdown")
-    await asyncio.sleep(0.1)
-    await load.edit_text("🌟 **Loading User Profile...**\n📊 *Fetching membership data...*", parse_mode="Markdown")
-    await asyncio.sleep(0.1)
-    await load.edit_text("💎 **Premium Status Check...**\n✨ *Finalizing verification...*", parse_mode="Markdown")
-    await asyncio.sleep(0.1)
+    load = await message.answer("╔════════════════════╗\n║   🎯 **MSANode**   ║\n║  **Security Hub**  ║\n╚════════════════════╝\n\n🔄 *Initializing...*", parse_mode="Markdown")
+    await asyncio.sleep(0.15)
+    await load.edit_text("╔════════════════════╗\n║   🎯 **MSANode**   ║\n║  **Security Hub**  ║\n╚════════════════════╝\n\n🔐 *Scanning credentials...*\n▰▰▰▱▱▱▱▱▱▱ 30%", parse_mode="Markdown")
+    await asyncio.sleep(0.15)
+    await load.edit_text("╔════════════════════╗\n║   🛰️ **MSANode**   ║\n║  **Vault Network** ║\n╚════════════════════╝\n\n📡 *Establishing secure link...*\n▰▰▰▰▰▰▱▱▱▱ 60%", parse_mode="Markdown")
+    await asyncio.sleep(0.15)
+    await load.edit_text("╔════════════════════╗\n║   ⚡ **MSANode**   ║\n║ **Authentication** ║\n╚════════════════════╝\n\n🔓 *Verifying permissions...*\n▰▰▰▰▰▰▰▰▱▱ 85%", parse_mode="Markdown")
+    await asyncio.sleep(0.15)
+    await load.edit_text("╔════════════════════╗\n║   💎 **MSANode**   ║\n║  **Premium Hub**   ║\n╚════════════════════╝\n\n✨ *Access Granted!*\n▰▰▰▰▰▰▰▰▰▰ 100%", parse_mode="Markdown")
+    await asyncio.sleep(0.2)
 
     # 6. Membership Gate with Social Media Tracking
     if not await is_member(message.from_user.id):
@@ -6112,6 +7077,189 @@ async def deliver_content(message: types.Message, payload: str, source: str, u_s
         await message.answer(msg, reply_markup=kb.as_markup())
 
 # ==========================================
+# USER HISTORY HANDLERS
+# ==========================================
+@dp.message(F.text == "📜 MY REVIEWS")
+async def show_my_reviews(message: types.Message):
+    """Show user's review history"""
+    user_id = str(message.from_user.id)
+    is_banned, ban_record, ban_msg = is_user_completely_banned(int(user_id))
+    if is_banned:
+        try:
+            await message.answer(ban_msg, parse_mode="Markdown")
+        except:
+            pass
+        return
+    
+    reviews = list(col_reviews.find({"user_id": user_id}).sort("timestamp", -1))
+    
+    if not reviews:
+        await message.answer(
+            "📜 **MY REVIEW HISTORY**\n\n"
+            "❌ You haven't submitted any reviews yet.\n\n"
+            "💡 **Tip:** Use the ⭐ REVIEW button to share your experience!",
+            parse_mode="Markdown"
+        )
+        return
+    
+    msg = "📜 **MY REVIEW HISTORY**\n" + "="*35 + "\n\n"
+    msg += f"📊 **Total Reviews:** {len(reviews)}\n\n"
+    
+    for idx, review in enumerate(reviews[:10], 1):
+        rating = review.get("rating", 0)
+        stars = "⭐" * rating
+        review_text = review.get("review", "No text")[:100]
+        timestamp = review.get("timestamp")
+        
+        if timestamp:
+            if isinstance(timestamp, datetime):
+                if timestamp.tzinfo is None:
+                    timestamp = IST.localize(timestamp)
+            else:
+                try:
+                    timestamp = datetime.fromisoformat(str(timestamp))
+                    if timestamp.tzinfo is None:
+                        timestamp = IST.localize(timestamp)
+                except:
+                    timestamp = None
+            time_str = timestamp.strftime("%d %b %Y, %I:%M %p") if timestamp else "Unknown"
+        else:
+            time_str = "Unknown"
+        
+        msg += f"**#{idx}** {stars} ({rating}/5)\n"
+        msg += f"📅 {time_str}\n"
+        msg += f"💬 \"{review_text}\"\n"
+        msg += "-"*35 + "\n\n"
+    
+    if len(reviews) > 10:
+        msg += f"_...and {len(reviews) - 10} more reviews_\n"
+    
+    await message.answer(msg, parse_mode="Markdown")
+
+@dp.message(F.text == "🎫 MY TICKETS")
+async def show_my_tickets(message: types.Message):
+    """Show user's support ticket history"""
+    user_id = str(message.from_user.id)
+    is_banned, ban_record, ban_msg = is_user_completely_banned(int(user_id))
+    if is_banned:
+        try:
+            await message.answer(ban_msg, parse_mode="Markdown")
+        except:
+            pass
+        return
+    
+    user_doc = col_users.find_one({"user_id": user_id})
+    if not user_doc:
+        await message.answer(
+            "🎫 **MY SUPPORT TICKETS**\n\n"
+            "❌ No ticket history found.\n\n"
+            "💡 **Tip:** Use 💬 CUSTOMER SUPPORT to get help!",
+            parse_mode="Markdown"
+        )
+        return
+    
+    support_history = user_doc.get("support_history", [])
+    current_ticket = user_support_pending.get(user_id)
+    
+    msg = "🎫 **MY SUPPORT TICKETS**\n" + "="*35 + "\n\n"
+    
+    if current_ticket and current_ticket.get('status') == 'pending':
+        ticket_msg = current_ticket.get('message', '')[:80]
+        ticket_time = current_ticket.get('timestamp', time.time())
+        elapsed = int(time.time() - ticket_time)
+        hours = elapsed // 3600
+        minutes = (elapsed % 3600) // 60
+        msg += f"🟡 **CURRENT TICKET (Pending)**\n"
+        msg += f"💬 \"{ticket_msg}\"\n"
+        msg += f"⏳ Waiting: {hours}h {minutes}m\n"
+        msg += "-"*35 + "\n\n"
+    
+    if support_history:
+        msg += f"📊 **Past Tickets:** {len(support_history)}\n\n"
+        for idx, ticket in enumerate(support_history[-10:], 1):
+            issue = ticket.get("issue", "Unknown")[:60]
+            status = ticket.get("status", "unknown")
+            status_icon = "✅" if status == "resolved" else ("💬" if status == "responded" else "❓")
+            timestamp = ticket.get("timestamp", "Unknown")
+            msg += f"**#{idx}** {status_icon} {status.title()}\n"
+            msg += f"💬 \"{issue}\"\n"
+            msg += f"📅 {timestamp}\n"
+            msg += "-"*35 + "\n\n"
+        
+        if len(support_history) > 10:
+            msg += f"_...and {len(support_history) - 10} more tickets_\n"
+    else:
+        msg += "❌ No past tickets found.\n\n"
+    
+    msg += "\n💡 Need help? Use 💬 CUSTOMER SUPPORT!"
+    await message.answer(msg, parse_mode="Markdown")
+
+@dp.message(F.text == "📊 MY STATS")
+async def show_my_stats(message: types.Message):
+    """Show user's comprehensive statistics"""
+    user_id = str(message.from_user.id)
+    is_banned, ban_record, ban_msg = is_user_completely_banned(int(user_id))
+    if is_banned:
+        try:
+            await message.answer(ban_msg, parse_mode="Markdown")
+        except:
+            pass
+        return
+    
+    user_doc = col_users.find_one({"user_id": user_id})
+    if not user_doc:
+        await message.answer("❌ Profile not found. Use /start first.", parse_mode="Markdown")
+        return
+    
+    msa_id = user_doc.get("msa_id", "UNKNOWN")
+    username = user_doc.get("username", "No Username")
+    joined_date = user_doc.get("joined_date", "Unknown")
+    
+    review_count = col_reviews.count_documents({"user_id": user_id})
+    reviews = list(col_reviews.find({"user_id": user_id}))
+    if reviews:
+        ratings = [r.get("rating", 0) for r in reviews if r.get("rating")]
+        avg_rating = sum(ratings) / len(ratings) if ratings else 0
+    else:
+        avg_rating = 0
+    
+    support_history = user_doc.get("support_history", [])
+    ticket_count = len(support_history)
+    resolved_tickets = len([t for t in support_history if t.get("status") == "resolved"])
+    
+    ban_history_count = col_ban_history.count_documents({"user_id": user_id})
+    
+    msg = "📊 **MY STATISTICS**\n" + "="*35 + "\n\n"
+    msg += f"👤 **PROFILE INFO**\n"
+    msg += f"🆔 MSA ID: `{msa_id}`\n"
+    msg += f"👤 Username: @{username}\n"
+    msg += f"📅 Member Since: {joined_date}\n\n"
+    
+    msg += f"⭐ **REVIEW ACTIVITY**\n"
+    msg += f"📝 Total Reviews: {review_count}\n"
+    if review_count > 0:
+        msg += f"⭐ Average Rating: {avg_rating:.1f}/5.0\n"
+        msg += f"📈 Rating: {'★' * int(avg_rating)}{'☆' * (5 - int(avg_rating))}\n"
+    msg += "\n"
+    
+    msg += f"🎫 **SUPPORT ACTIVITY**\n"
+    msg += f"💬 Total Tickets: {ticket_count}\n"
+    if ticket_count > 0:
+        resolution_rate = (resolved_tickets / ticket_count * 100) if ticket_count > 0 else 0
+        msg += f"✅ Resolved: {resolved_tickets}\n"
+        msg += f"📊 Resolution Rate: {resolution_rate:.0f}%\n"
+    msg += "\n"
+    
+    msg += "🛡️ **ACCOUNT STATUS**\n"
+    if ban_history_count > 0:
+        msg += f"⚠️ Warnings: {ban_history_count}\n"
+    else:
+        msg += "✅ Clean Record\n"
+    
+    msg += "\n" + "="*35 + "\n💎 Keep up the great activity!"
+    await message.answer(msg, parse_mode="Markdown")
+
+# ==========================================
 # �️ CATCH-ALL HANDLER (MUST BE LAST)
 # ==========================================
 @dp.message()
@@ -6149,22 +7297,36 @@ async def handle_unhandled_messages(message: types.Message):
         logger.error(f"Error in catch-all handler: {e}")
 
 # ==========================================
-# �🚀 NUCLEAR SHIELD
+# 🚀 NUCLEAR SHIELD
 # ==========================================
 async def main():
     try: await bot.delete_webhook(drop_pending_updates=True)
     except: pass
-    print(f"✅ MSANODE GATEWAY ONLINE.")
+    
+    # 🏢 ENTERPRISE: Start health monitoring in background
+    asyncio.create_task(enterprise_health_check())
+    print("[OK] ENTERPRISE HEALTH MONITORING STARTED")
+    
+    print(f"✅ MSANODE GATEWAY ONLINE - ENTERPRISE MODE (LAKHS-READY)")
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     threading.Thread(target=run_health_server, daemon=True).start()
+    loop_count = 0
+    
     while True:
-        try: asyncio.run(main())
+        loop_count += 1
+        try:
+            # Use asyncio.run() which properly manages the event loop lifecycle
+            asyncio.run(main())
+            
         except TelegramConflictError:
             print("💀 GHOST DETECTED! Waiting 20s...")
             time.sleep(20)
+        except KeyboardInterrupt:
+            print("🛑 Bot stopped by user")
+            break
         except Exception as e:
-            print(f"⚠️ Error: {e}")
-            time.sleep(15)
+            print(f"⚠️ Error (attempt {loop_count}): {e}")
+            time.sleep(5)  # Wait before retry
  
