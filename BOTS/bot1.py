@@ -12,14 +12,20 @@ import os
 import io
 import pytz
 from datetime import datetime
-# Load environment variables from .env file
 
+# Load environment variables from .env file
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject, ChatMemberUpdatedFilter, LEAVE_TRANSITION, JOIN_TRANSITION, Command, StateFilter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, ChatMemberUpdated
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+
+# ==========================================
+# 📜 TERMS & CONDITIONS STATE
+# ==========================================
+class TermsState(StatesGroup):
+    waiting_for_acceptance = State()
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramConflictError, TelegramForbiddenError
@@ -376,6 +382,7 @@ try:
     col_appeals = db["ban_appeals"]  # New collection for ban appeals
     col_reviews = db["user_reviews"]
     col_user_counter = db["user_counter"]  # For tracking next MSA ID
+    col_terms = db["terms_acceptance"]  # For tracking terms & conditions acceptance
     
     print("[OK] GATEWAY DATA CORE: CONNECTED")
     
@@ -458,6 +465,7 @@ try:
         created_count += 1 if safe_create_index(col_banned, [("ban_type", pymongo.ASCENDING), ("ban_until", pymongo.ASCENDING)], background=True) else 0
         created_count += 1 if safe_create_index(col_reviews, [("user_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)], background=True) else 0
         created_count += 1 if safe_create_index(col_appeals, [("user_id", pymongo.ASCENDING), ("status", pymongo.ASCENDING)], background=True) else 0
+        created_count += 1 if safe_create_index(col_terms, [("user_id", pymongo.ASCENDING)], unique=True, background=True) else 0
         
         if created_count > 0:
             print(f"[OK] CREATED {created_count} NEW ENTERPRISE INDEXES")
@@ -657,7 +665,7 @@ def check_rate_limit(user_id: int) -> tuple[bool, str]:
             f"Wait: {RATE_LIMIT_WINDOW_SECONDS} seconds before trying again\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"⏰ Please wait and try again shortly.\n"
-            f"🛡️ This protects the system from overload.")
+            f"🛡️ This protects the MSA NODE system from overload.")
     
     # Track this request
     user_request_tracker[user_id].append(now)
@@ -750,25 +758,80 @@ GUIDE_SPAM_FREEZE = 5  # Freeze after 5 rapid clicks
 GUIDE_CLICK_WINDOW = 10  # seconds for rapid click detection
 SUPPORT_BAN_CLICKS = 5  # clicks to trigger permanent ban
 
-# Spam/Test Message Detection - Blacklisted Keywords
-SPAM_KEYWORDS = {
-    # Greetings only (no context)
-    'hi', 'hello', 'hey', 'hii', 'hiii', 'helloo', 'helo', 'hellow',
-    # Test messages
-    'test', 'testing', 'tests', 'tst', 'check', 'checking',
-    # Nonsense
-    'lol', 'lmao', 'haha', 'lmfao', 'rofl', 'bruh',
-    # Single words
-    'ok', 'okay', 'yes', 'no', 'yep', 'nope', 'ya', 'nah',
-    # Spam indicators
-    'spam', 'fake', 'joke', 'kidding', 'jk', 'lmk', 
-    # Random
-    'random', 'anything', 'idk', 'nothing', 'whatever', 'dunno',
-    # Common fake phrases
-    'just testing', 'test message', 'checking bot', 'does this work',
-    'are you there', 'hello there', 'hi there'
-}
+# ==========================================
+# 🛑 THE TOTAL BLACKLIST (MAXIMUM PROTECTION)
+# ==========================================
+import re
 
+# ==========================================
+# 🛑 THE NUCLEAR BLACKLIST (TIER-6 SECURITY)
+# ==========================================
+SPAM_KEYWORDS = {
+    # --- Greetings & Casual Noise (English & Romanized Hindi/Urdu) ---
+    'hi', 'hello', 'hey', 'hii', 'hiii', 'helloo', 'helo', 'hellow', 'hlo', 'hlw',
+    'yo', 'sup', 'wassup', 'watsup', 'yoo', 'yooo', 'heyya', 'hiyah', 'hola', 'salam',
+    'namaste', 'morning', 'night', 'evening', 'buddy', 'friend', 'sir', 'bro', 'bruh',
+    'bruv', 'dude', 'man', 'guys', 'everyone', 'bhai', 'bhaiya', 'yaar', 'yr', 'ji',
+    
+    # --- Standalone Gratitude (Belongs in Reviews) ---
+    'thanks', 'thx', 'thank', 'thankyou', 'tq', 'ty', 'thnx', 'thnk', 'appreciate',
+    'grateful', 'bless', 'blessing', 'god bless', 'respect', 'tysm', 'tyvm', 'shukriya',
+    
+    # --- Testing & Probing ---
+    'test', 'testing', 'tests', 'tst', 'check', 'checking', 'chk', 'chck', 'live',
+    'active', 'online', 'work', 'working', 'works', 'does it work', 'are you there',
+    'u there', 'anybody', 'anyone', 'hello there', 'hi there', 'ping', 'pong', 'echo',
+    
+    # --- Nonsense & Emotional Fillers ---
+    'lol', 'lmao', 'haha', 'hehe', 'lmfao', 'rofl', 'xd', 'wow', 'cool', 'nice',
+    'great', 'amazing', 'hmm', 'hmmm', 'huh', 'eh', 'oh', 'woww', 'pff', 'meh',
+    'sad', 'happy', 'good', 'bad', 'okies', 'okie', 'yah', 'yeah', 'yea', 'mast',
+    
+    # --- Single/Double Letter Noise ---
+    'k', 'kk', 'done', 'yes', 'no', 'yep', 'nope', 'ya', 'nah', 'ok', 'okay',
+    'wait', 'stop', 'go', 'stfu', 'pls', 'plz', 'please', 'kindly', 'suno',
+    
+    # --- Identity & AI Baiting ---
+    'bot', 'ai', 'robot', 'are you real', 'who are you', 'are you bot', 'gemini',
+    'gpt', 'chatgpt', 'openai', 'system', 'admin', 'owner', 'manager', 'creator',
+    'developer', 'who made you', 'how do you work', 'fake bot', 'scam', 'fraud',
+    
+    # --- Vague Demands (No Context) ---
+    'help', 'helpme', 'help me', 'fast', 'urgent', 'now', 'today', 'immediately',
+    'asap', 'hurry', 'quickly', 'send', 'give', 'show', 'tell', 'want', 'need',
+    'i need', 'give me', 'send me', 'send link', 'open', 'unlock', 'dikhao', 'do',
+    
+    # --- Indecisive & Vague ---
+    'random', 'anything', 'idk', 'nothing', 'whatever', 'dunno', 'maybe', 'perhaps',
+    'idrc', 'something', 'just', 'only', 'mere', 'basically'
+}
+async def smart_protection_check(text):
+    """Tier-6 Heuristic Analysis for Message Integrity."""
+    t = text.lower().strip()
+    
+    # A. Length Barrier (Minimum 4 words for technical reports)
+    if len(t.split()) < 4:
+        return True, "Transmission too short. Minimum 4 words required for technical audit."
+
+    # B. Repetitive Character Detection (e.g., "heyyyyyy", "!!!!!!!!!")
+    if re.search(r'(.)\1{3,}', t):
+        return True, "Pattern violation: Excessive character repetition detected."
+
+    # C. Emoji-Only or Excessive Emoji Check
+    emoji_count = len(re.findall(r'[^\w\s,.]', t))
+    if emoji_count > 3:
+        return True, "Pattern violation: Excessive symbolic noise (emojis) detected."
+
+    # D. All-Caps Aggression
+    if text.isupper() and len(text) > 5:
+        return True, "Protocol violation: High-decibel transmission (All-Caps) detected."
+
+    # E. Keyword Blacklist Check
+    words = t.split()
+    if any(word in SPAM_KEYWORDS for word in words):
+        return True, "Transmission contains restricted non-technical keywords."
+
+    return False, ""
 def is_fake_support_message(text: str) -> tuple[bool, str]:
     """Check if message is fake/spam. Returns (is_fake, reason)"""
     text_lower = text.lower().strip()
@@ -1650,6 +1713,14 @@ async def is_member(user_id):
         return status.status in ['member', 'administrator', 'creator']
     except: return False
 
+def has_accepted_terms(user_id: int) -> bool:
+    """Check if user has accepted terms and conditions"""
+    try:
+        terms_record = col_terms.find_one({"user_id": str(user_id)})
+        return terms_record is not None and terms_record.get("accepted", False)
+    except:
+        return False
+
 async def log_user(user: types.User, source: str):
     """Identity Engine: Returns NEW or RETURNING with IST format."""
     now_str = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
@@ -1670,7 +1741,8 @@ async def log_user(user: types.User, source: str):
                 "joined_date": now_str,
                 "source": source,
                 "status": "Active",
-                "has_reported": False 
+                "has_reported": False,
+                "terms_accepted": False  # Track terms acceptance in user doc
             })
             logger.info(f"✅ NEW USER REGISTERED: {msa_id} (Telegram ID: {u_id})")
             return "NEW"
@@ -1791,6 +1863,24 @@ async def start_review(message: types.Message, state: FSMContext):
             await message.answer(ban_msg, parse_mode="Markdown")
         except:
             pass
+        return
+    
+    # CRITICAL: Check if user has accepted terms & conditions
+    if not has_accepted_terms(user_id):
+        await message.answer(
+            "⚠️ **Terms & Conditions Required**\n\n"
+            f"{message.from_user.first_name}, you must accept our Terms & Conditions before using any bot features.\n\n"
+            "📜 Please accept the terms to continue.",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="✅ I Accept the Terms & Conditions")],
+                    [KeyboardButton(text="❌ I Reject")]
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=False
+            ),
+            parse_mode="Markdown"
+        )
         return
     
     # Check if review system is enabled (CRITICAL CHECK)
@@ -2749,7 +2839,7 @@ async def handle_guide_button(message: types.Message):
     user_name = user_doc.get("first_name", "User") if user_doc else "User"
     
     guide_message = (
-        "📚 **MSANode Bot - Complete User Guide**\n"
+        "📚 **MSANode AGENT - Complete User Guide**\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 **Welcome, {user_name}!**\n"
         f"🏷️ **Your MSA ID:** `{msa_id}`\n\n"
@@ -2761,7 +2851,7 @@ async def handle_guide_button(message: types.Message):
         "📚 **Support System** - Complete guide on getting help\n"
         "⭐ **Review System** - How reviews work & tips\n"
         "🛡️ **Anti-Spam Info** - All protections explained\n"
-        "⚡ **Commands** - Every command & button explained\n"
+        "⚡ **Buttons** - Every button explained\n"
         "💎 **Premium Features** - Advanced functionality\n"
         "❓ **FAQ** - 15 frequently asked questions\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2836,82 +2926,48 @@ async def cmd_rules(message: types.Message):
     
     rules_message = (
         f"╔══════════════════════════╗\n"
-        f"║  📜 **RULES & REGULATIONS**  ║\n"
+        f"║   📜 **MSANode AGENT PROTOCOLS** ║\n"
         f"╚══════════════════════════╝\n\n"
-        f"**👤 Your Profile:**\n"
+        f"👤 **Operative Dossier:**\n"
         f"• MSA ID: `{msa_id}`\n"
-        f"• Status: {status.upper()}\n"
-        f"• Member Since: {join_date}\n\n"
+        f"• Clearance: {status.upper()}\n"
+        f"• Active Since: {join_date}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"**1️⃣ GENERAL CONDUCT**\n"
-        f"• Be respectful to all users and staff\n"
-        f"• No harassment, hate speech, or abuse\n"
-        f"• Use the bot for intended purposes only\n"
-        f"• Follow all commands and guidelines\n\n"
-        f"**2️⃣ SPAM PREVENTION**\n"
-        f"• Do NOT spam commands repeatedly\n"
-        f"• Limit: 10 actions per minute\n"
-        f"• Spamming /start = Auto permanent ban\n"
-        f"• No flooding in reviews or support\n\n"
-        f"**3️⃣ REVIEWS & FEEDBACK**\n"
-        f"• Provide honest, constructive reviews\n"
-        f"• No fake, abusive, or spam reviews\n"
-        f"• Minimum rating rules apply\n"
-        f"• Review system can be disabled anytime\n\n"
-        f"**4️⃣ CUSTOMER SUPPORT**\n"
-        f"• Use support for legitimate issues only\n"
-        f"• Be patient, we respond ASAP\n"
-        f"• No spam or abuse in support tickets\n"
-        f"• One active ticket at a time\n\n"
-        f"**5️⃣ BANS & PENALTIES**\n"
-        f"• Violations = Temporary or permanent bans\n"
-        f"• Banned users can appeal via 🔔 APPEAL BAN\n"
-        f"• Repeat offenders = Permanent bans\n"
-        f"• Admin decisions are final\n\n"
-        f"**6️⃣ CONTENT ACCESS**\n"
-        f"• Telegram Vault membership required\n"
-        f"• Leaving channel = Access revoked\n"
-        f"• Social media verification required\n"
-        f"• Premium content via pinned comments\n\n"
-        f"**7️⃣ DATA & PRIVACY**\n"
-        f"• Your data is stored securely in MongoDB\n"
-        f"• MSA ID assigned for tracking\n"
-        f"• Activity logs maintained for security\n"
-        f"• No data shared with third parties\n"
-        f"• All operations are enterprise-secured\n\n"
-        f"**8️⃣ FEATURE-SPECIFIC BANS**\n"
-        f"• Admins can ban you from specific features\n"
-        f"• You may still use other bot features\n"
-        f"• Feature bans are temporary or permanent\n"
-        f"• Check your ban status in Dashboard\n\n"
+        f"**1️⃣ OPERATIVE ETHICS**\n"
+        f"• Maintain professional conduct within the Syndicate.\n"
+        f"• Zero tolerance for harassment or unauthorized disruption.\n"
+        f"• Use all assets and blueprints for their intended purpose only.\n\n"
+        f"**2️⃣ TRANSMISSION EFFICIENCY**\n"
+        f"• Avoid redundant command execution (Spam).\n"
+        f"• Systematic flooding of the /start command results in immediate revocation of access.\n"
+        f"• Respect the bandwidth of the Vault Core.\n\n"
+        f"**3️⃣ INTELLIGENCE AUDITS**\n"
+        f"• Provide honest and objective ratings for all blueprints.\n"
+        f"• Fake or manipulative feedback is a violation of Syndicate trust.\n\n"
+        f"**4️⃣ PRIORITY SUPPORT LINE**\n"
+        f"• Use Customer Support for critical technical failures only.\n"
+        f"• Protocol allows for only one active support ticket per operative.\n"
+        f"• Patience is required; intelligence reports are processed in order of priority.\n\n"
+        f"**5️⃣ ACCESS CONTROL & SECURITY**\n"
+        f"• Permanent membership in the Telegram Vault is mandatory.\n"
+        f"• Revoking your membership will trigger an automatic lockout from all blueprints.\n"
+        f"• Social synchronization (IG/YT) is required to maintain clearance.\n\n"
+        f"**6️⃣ DATA PRIVACY**\n"
+        f"• Your activity logs are encrypted and stored within our secure data core.\n"
+        f"• Your MSA ID is your unique identifier; keep your terminal secure.\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"**✅ BY USING THIS BOT, YOU AGREE TO:**\n"
-        f"• Follow all rules above\n"
-        f"• Accept admin moderation decisions\n"
-        f"• Respect the community guidelines\n"
-        f"• Use the bot responsibly\n\n"
-        f"**⚠️ CONSEQUENCES OF VIOLATIONS:**\n"
-        f"• 1st Offense: Warning\n"
-        f"• 2nd Offense: Temporary ban (duration varies)\n"
-        f"• 3rd Offense: Permanent ban (no appeal)\n"
-        f"• Severe violations: Immediate permanent ban\n\n"
+        f"**✅ BY PROCEEDING, YOU ACKNOWLEDGE:**\n"
+        f"• Full compliance with the protocols stated above.\n"
+        f"• Admin decisions regarding access revocation are final.\n\n"
+        f"**⚠️ DISCIPLINARY ACTIONS:**\n"
+        f"• Protocol Breach 1: Official Warning\n"
+        f"• Protocol Breach 2: Temporary Terminal Suspension\n"
+        f"• Protocol Breach 3: Permanent Revocation of Syndicate Status\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"**📞 NEED HELP?**\n"
-        f"• Questions about rules? Use 💬 CUSTOMER SUPPORT\n"
-        f"• Technical issues? Use ❓ FAQ / HELP\n"
-        f"• Bot guidance? Check 📚 GUIDE / HOW TO USE\n\n"
-        f"**🔒 ENTERPRISE SECURITY:**\n"
-        f"• Circuit breaker protection enabled\n"
-        f"• Health monitoring active 24/7\n"
-        f"• Connection pooling for lakhs of users\n"
-        f"• Memory management optimized\n"
-        f"• All data operations are journaled\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 **Remember:** These rules ensure a safe, fair, and enjoyable experience for everyone!\n\n"
-        f"✅ **Thank you for being a responsible user!**\n\n"
-        f"🎯 **Last Updated:** January 2026"
+        f"💡 **Note:** These protocols ensure the stability and exclusivity of the MSANode ecosystem.\n\n"
+        f"🤝 **Thank you for your professionalism, {message.from_user.first_name}.**\n\n"
+        f"🎯 **Protocols Updated:** 2026 by MSA NODE "
     )
-    
     await message.answer(rules_message, parse_mode="Markdown")
     
     # Log the rules view
@@ -3047,7 +3103,7 @@ async def faq_review_not_showing(message: types.Message):
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         "**Possible Reasons:**\n\n"
         "1️⃣ **Still in Cooldown**\n"
-        "   • Check if 7 days have passed\n"
+        "   • Check if setted or 7 days have passed\n"
         "   • View exact time in dashboard\n\n"
         "2️⃣ **Review Too Short**\n"
         "   • Minimum 10 characters required\n"
@@ -3056,7 +3112,7 @@ async def faq_review_not_showing(message: types.Message):
         "   • Don't click too fast\n"
         "   • Wait for cooldown to expire\n\n"
         "4️⃣ **Already Submitted**\n"
-        "   • Can only review once per 7 days\n"
+        "   • Can only review once per 7 or setted days\n"
         "   • Check dashboard for last review\n\n"
         "**Where Reviews Go:**\n"
         "✅ Admin review channel (for moderation)\n"
@@ -3088,7 +3144,7 @@ async def faq_spam_protections(message: types.Message):
         "• Protects server from overload\n"
         "• Fair usage for all users\n\n"
         "⏰ **4. Review Cooldown**\n"
-        "• Exactly 7 days (604,800 seconds)\n"
+        "• Exactly 7 days (604,800 seconds) or setted days \n"
         "• Cannot be bypassed\n"
         "• Automatic reset after period\n\n"
         "**Why These Protections?**\n"
@@ -3152,6 +3208,24 @@ async def show_dashboard(message: types.Message, state: FSMContext):
             pass
         return
     
+    # CRITICAL: Check if user has accepted terms & conditions
+    if not has_accepted_terms(int(user_id)):
+        await message.answer(
+            "⚠️ **Terms & Conditions Required**\n\n"
+            f"{message.from_user.first_name}, you must accept our Terms & Conditions before using any bot features.\n\n"
+            "📜 Please accept the terms to continue.",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="✅ I Accept the Terms & Conditions")],
+                    [KeyboardButton(text="❌ I Reject")]
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=False
+            ),
+            parse_mode="Markdown"
+        )
+        return
+    
     # Only basic rate limiting for navigation (no progressive spam bans)
     is_rate_limited, rate_msg = check_rate_limit(user_id)
     if is_rate_limited:
@@ -3211,18 +3285,31 @@ async def show_dashboard(message: types.Message, state: FSMContext):
             pending_items.append(f"- ⏳ Support: {ticket_msg}... (Waiting {wait_time})")
     
     # Build simple dashboard
-    dashboard_msg = "=== YOUR DASHBOARD ===\n\n"
-    dashboard_msg += f"User ID: {msa_id}\n"
-    dashboard_msg += f"Username: @{username}\n\n"
+    # Check maintenance status
+    maint = col_settings.find_one({"setting": "maintenance"})
+    is_maintenance = maint and maint.get("value")
+    agent_status = "🔴 Offline (Maintenance)" if is_maintenance else "🟢 Online"
+    
+    dashboard_msg = (
+        "╔═════════════════════════╗\n"
+        "║  📊 **YOUR DASHBOARD**  ║\n"
+        "╚═════════════════════════╝\n\n"
+        f"**MSANODE AGENT:** {agent_status}\n"
+        "⚡ **Status:** Active\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"**👤 Profile Information:**\n"
+        f"• MSA ID: `{msa_id}`\n"
+        f"• Username: {username}\n\n"
+    )
     
     if pending_items:
-        dashboard_msg += "PENDING UPDATES:\n"
+        dashboard_msg += "**📋 PENDING UPDATES:**\n"
         dashboard_msg += "\n".join(pending_items)
     else:
-        dashboard_msg += "📰 NEWS & UPDATES:\n"
-        dashboard_msg += "- No new updates at this time.\n"
+        dashboard_msg += "**📰 NEWS & UPDATES:**\n"
+        dashboard_msg += "✅ No new updates at this time.\n"
     
-    dashboard_msg += "\n======================="
+    dashboard_msg += "\n━━━━━━━━━━━━━━━━━━━━━━━"
     
     # Only show cancel button if truly pending (not resolved in database)
     has_active_ticket = (pending_ticket and pending_ticket.get('status') == 'pending' and 
@@ -3230,7 +3317,8 @@ async def show_dashboard(message: types.Message, state: FSMContext):
     
     await message.answer(
         dashboard_msg,
-        reply_markup=get_dashboard_actions_keyboard(has_pending_ticket=has_active_ticket)
+        reply_markup=get_dashboard_actions_keyboard(has_pending_ticket=has_active_ticket),
+        parse_mode="Markdown"
     )
 
 @dp.message(F.text == "🚫 CANCEL MY TICKET")
@@ -3371,6 +3459,24 @@ async def start_customer_support(message: types.Message, state: FSMContext):
             )
         except:
             pass
+        return
+    
+    # CRITICAL: Check if user has accepted terms & conditions
+    if not has_accepted_terms(int(user_id)):
+        await message.answer(
+            "⚠️ **Terms & Conditions Required**\n\n"
+            f"{message.from_user.first_name}, you must accept our Terms & Conditions before using any bot features.\n\n"
+            "📜 Please accept the terms to continue.",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="✅ I Accept the Terms & Conditions")],
+                    [KeyboardButton(text="❌ I Reject")]
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=False
+            ),
+            parse_mode="Markdown"
+        )
         return
     
     # Check if support feature is banned for this user (partial ban)
@@ -3938,7 +4044,6 @@ async def guide_support_system(message: types.Message):
         "🎯 **How To Get Support:**\n\n"
         "**1️⃣ START SUPPORT REQUEST**\n"
         "   • Click \"💬 Customer Support\" button\n"
-        "   • Or send /support command\n\n"
         "**2️⃣ CHOOSE ISSUE TYPE**\n"
         "   You'll see 6 common issue templates:\n"
         "   • 📄 PDF/Link Not Working\n"
@@ -3950,15 +4055,15 @@ async def guide_support_system(message: types.Message):
         "**3️⃣ VIEW SOLUTION**\n"
         "   • You'll see detailed troubleshooting steps\n"
         "   • Try each step carefully\n"
-        "   • Most issues are solved here!\n\n"
+        "   • Most issues are solved instantly!\n\n"
         "**4️⃣ AFTER SOLUTION**\n"
         "   Four options appear:\n"
         "   ✅ **SOLVED** - Issue fixed? Mark as solved!\n"
         "   ❌ **NOT SOLVED** - Need more help? Escalates to team\n"
         "   🔄 **Check Other** - Browse other solutions\n"
-        "   💬 **Contact Support** - Talk to human support\n\n"
+        "   💬 **Contact Support** - Talk to direct support\n\n"
         "**5️⃣ CUSTOM MESSAGE (Optional)**\n"
-        "   • If templates don't match\n"
+        "   • If no matching support available!!!\n"
         "   • Click \"✍️ Other Issue\"\n"
         "   • Describe your problem (minimum 10 characters)\n"
         "   • Goes directly to support team\n\n"
@@ -3970,7 +4075,7 @@ async def guide_support_system(message: types.Message):
         "• Only custom messages count toward limit\n\n"
         "⏱️ **RESPONSE TIME:**\n"
         "• Self-help solutions: Instant\n"
-        "• Support team: Usually within 1-24 hours\n\n"
+        "• Support team: Usually within 1-72 hours\n\n"
         "💡 **PRO TIP:** Always try template solutions first!\n"
         "   Most issues are solved instantly without waiting!\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -4015,11 +4120,13 @@ async def guide_review_system(message: types.Message):
         "📝 **How To Leave A Review:**\n\n"
         "**1️⃣ START REVIEW**\n"
         "   • Click \"⭐ Leave Your Review\" button\n"
-        "   • Or send /review command\n\n"
         "**2️⃣ CHOOSE RATING**\n"
         "   • Select 1-5 stars\n"
-        "   • ⭐ = Poor\n"
-        "   • ⭐⭐⭐⭐⭐ = Excellent\n\n"
+        f"⭐         • **DISAPPOINTING** (Not what I expected)\n"
+        f"⭐⭐       • **UNSATISFACTORY** (Needs more value)\n"
+        f"⭐⭐⭐     • **DECENT** (It's okay, but could be better)\n"
+        f"⭐⭐⭐⭐   • **IMPRESSIVE** (High-quality and helpful)\n"
+        f"⭐⭐⭐⭐⭐ • **EXCEPTIONAL** (Exceeded all my expectations)\n\n"
         "**3️⃣ WRITE FEEDBACK**\n"
         "   • Minimum 10 characters required\n"
         "   • Maximum 500 characters\n"
@@ -4029,18 +4136,14 @@ async def guide_review_system(message: types.Message):
         "   • Click \"✅ CONFIRM & SEND\"\n"
         "   • Or \"❌ CANCEL\" to restart\n\n"
         "**5️⃣ PUBLISHED!**\n"
-        "   • Your review is now live\n"
-        "   • Visible in review channel\n"
-        "   • Thank you for feedback!\n\n"
+        "   • Your review is now live and submitted\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🔄 **UPDATE EXISTING REVIEW:**\n\n"
         "   • Already reviewed? No problem!\n"
-        "   • Submit a new review anytime\n"
-        "   • Your old review gets updated\n"
-        "   • Shows \"🔄 UPDATED\" badge\n\n"
+        "   • Submit a new review again\n"
         "⏱️ **COOLDOWN SYSTEM:**\n\n"
-        "   • **After Submission:** 7 days cooldown\n"
-        "   • **Updates:** Reset cooldown to 7 days\n"
+        "   • **After Submission:** setted up cooldown days applied by MSANode AGENT\n"
+        "   • **Updates:** Reset cooldown to setted up days\n"
         "   • **Purpose:** Prevent spam reviews\n\n"
         "🎯 **REVIEW QUALITY TIPS:**\n\n"
         "   ✅ **Good Reviews:**\n"
@@ -4058,7 +4161,26 @@ async def guide_review_system(message: types.Message):
         "   • Help us improve\n"
         "   • Guide other users\n"
         "   • Show appreciation\n"
-        "   • Build community trust\n\n"
+        "   • Build community trust in MSANode Family\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+          "━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ **WHAT GETS YOU BANNED:**\n\n"
+        "   🚫 Excessive button spam\n"
+        "   🚫 Command flooding (/start abuse)\n"
+        "   🚫 Fake/spam messages repeatedly\n"
+        "   🚫 Attempting to bypass cooldowns\n"
+        "   🚫 Abusive behavior\n\n"
+        "✅ **HOW TO AVOID ISSUES:**\n\n"
+        "   ✔️ Use bot normally\n"
+        "   ✔️ Wait for cooldowns to expire\n"
+        "   ✔️ Don't spam buttons/commands\n"
+        "   ✔️ Write meaningful messages\n"
+        "   ✔️ Respect limits\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 **GOT BANNED BY MISTAKE?**\n\n"
+        "   • Contact support team\n"
+        "   • Explain situation calmly\n"
+        "   • Admin can unban with /unban command\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🔙 Use the keyboard below to explore other guides!"
     )
@@ -4106,7 +4228,7 @@ async def guide_antispam(message: types.Message):
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🔒 **PROTECTION SYSTEMS:**\n\n"
         "**1️⃣ PROGRESSIVE COOLDOWNS**\n"
-        "   If you spam buttons/commands:\n"
+        "   If you spam buttons:\n"
         "   • 1st offense: 30 seconds\n"
         "   • 2nd offense: 1 minute\n"
         "   • 3rd offense: 3 minutes\n"
@@ -4118,7 +4240,7 @@ async def guide_antispam(message: types.Message):
         "   • Template browsing = unlimited\n"
         "   • 1 hour cooldown after resolution\n\n"
         "**3️⃣ REVIEW COOLDOWN**\n"
-        "   • 7 days between reviews\n"
+        "   • setted days between reviews\n"
         "   • Prevents review spam\n"
         "   • Updates allowed (resets cooldown)\n\n"
         "**4️⃣ RAPID CLICK DETECTION**\n"
@@ -4132,7 +4254,7 @@ async def guide_antispam(message: types.Message):
         "**6️⃣ COMMAND SPAM PROTECTION**\n"
         "   • /start spam = instant ban\n"
         "   • 5 /start commands in 60 seconds = permanent ban\n"
-        "   • 3-4 commands = warning\n\n"
+        "   • 3-4 buttons at once = warning\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "⚠️ **WHAT GETS YOU BANNED:**\n\n"
         "   🚫 Excessive button spam\n"
@@ -4188,46 +4310,29 @@ async def guide_commands(message: types.Message):
     await loading.delete()
     
     guide_text = (
-        "⚡ **COMMANDS & FEATURES**\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👥 **USER COMMANDS:**\n\n"
-        "/start - Start bot & show main menu\n"
-        "/guide - Open this guide system\n"
-        "/support - Request customer support\n"
-        "/review - Leave a review\n"
-        "/mystatus - Check your account status\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 **MAIN MENU BUTTONS:**\n\n"
-        "**💬 Customer Support**\n"
-        "   • Get help with issues\n"
-        "   • Browse 6 solution templates\n"
-        "   • Contact support team\n\n"
-        "**⭐ Leave Your Review**\n"
-        "   • Share your feedback\n"
-        "   • Rate 1-5 stars\n"
-        "   • Update existing reviews\n\n"
-        "**📚 Guide / How To Use**\n"
-        "   • Complete documentation\n"
-        "   • Step-by-step tutorials\n"
-        "   • Feature explanations\n\n"
-        "**👤 Profile / Status**\n"
-        "   • View your MSA ID\n"
-        "   • Check membership status\n"
-        "   • See your stats\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔧 **ADMIN COMMANDS:**\n\n"
-        "/resolve <id> - Mark support request as resolved\n"
-        "/unban <id> - Unban a user\n"
-        "/userinfo <id> - Get user information\n"
-        "/resetcooldown <id> - Reset user's cooldowns\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "💎 **PREMIUM ANIMATIONS:**\n\n"
-        "Every action includes beautiful animations:\n"
-        "   • Progress bars with percentages\n"
-        "   • Loading sequences\n"
-        "   • Status updates\n"
-        "   • Smooth transitions\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
+      f"🚀 **BUTTONS & COMMAND SESSION**\n"
+        f"• 🛠 /start - Initialize terminal and access the main dashboard.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 **SYSTEM MODULES**\n\n"
+        f"🏠 **DASHBOARD**\n"
+        f"• Start bot & show main menu\n\n"
+        f"⭐ **REVIEW**\n"
+        f"• Open this guide system\n"
+        f"• Share your feedback & rate 1-5 stars\n"
+        f"• Update existing reviews\n\n"
+        f"🛠 **CUSTOMER SUPPORT**\n"
+        f"• Request customer support\n"
+        f"• Get help with issues & browse 6 solution templates\n"
+        f"• Direct contact with support team\n\n"
+        f"❓ **FAQ / HELP**\n"
+        f"• Most Fequently Asked Questions\n\n"
+        f"📚 **GUIDE / HOW TO USE**\n"
+        f"• Check your account status\n"
+        f"• Complete documentation & step-by-step tutorials\n"
+        f"• Detailed feature explanations\n\n"
+        f"📜 **RULES & REGULATIONS**\n"
+        f"• Rules And Regulations Of MSANode AGENT\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
         "✨ **SPECIAL FEATURES:**\n\n"
         "   🎯 Self-Help Solutions - 6 templates\n"
         "   🛡️ Multi-Layer Spam Protection\n"
@@ -4279,76 +4384,48 @@ async def guide_premium(message: types.Message):
     await loading.delete()
     
     guide_text = (
-        "💎 **PREMIUM FEATURES EXPLAINED**\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "✨ **What Makes This Bot Premium:**\n\n"
-        "**1️⃣ ADVANCED ANIMATIONS**\n"
-        "   • Progress bars with percentages\n"
-        "   • Multi-stage loading sequences\n"
-        "   • Smooth transitions\n"
-        "   • Professional UI polish\n\n"
-        "**2️⃣ SELF-HELP SOLUTION SYSTEM**\n"
-        "   • 6 comprehensive templates\n"
-        "   • 4-5 steps per issue type\n"
-        "   • Instant problem resolution\n"
-        "   • No waiting for support team\n\n"
-        "**3️⃣ INTELLIGENT ANTI-SPAM**\n"
-        "   • Progressive cooldown system\n"
-        "   • Rapid click detection\n"
-        "   • Fake message filtering\n"
-        "   • Multi-layer protection\n\n"
-        "**4️⃣ SMART FEEDBACK ROUTING**\n"
-        "   • 4 feedback options after solutions\n"
-        "   • Automatic escalation\n"
-        "   • Template vs custom routing\n"
-        "   • Success tracking\n\n"
-        "**5️⃣ PROFESSIONAL NOTIFICATIONS**\n"
-        "   • Admin resolution alerts\n"
-        "   • User status updates\n"
-        "   • Real-time tracking\n"
-        "   • Detailed reports\n\n"
-        "**6️⃣ REVIEW MANAGEMENT**\n"
-        "   • Update existing reviews\n"
-        "   • 7-day cooldown system\n"
-        "   • Quality validation\n"
-        "   • Channel integration\n\n"
-        "**7️⃣ MSA ID SYSTEM**\n"
-        "   • Unique identifier per user\n"
-        "   • Sequential numbering\n"
-        "   • Easy tracking\n"
-        "   • Professional support\n\n"
-        "**8️⃣ ADMIN TOOLS**\n"
-        "   • Resolve tickets\n"
-        "   • User management\n"
-        "   • Ban/unban system\n"
-        "   • Cooldown resets\n"
-        "   • Detailed user info\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 **HOW ANIMATIONS WORK:**\n\n"
-        "Every major action includes:\n"
-        "   1. Initial loading message\n"
-        "   2. Progress bar updates\n"
-        "   3. Percentage indicators\n"
-        "   4. Completion confirmation\n"
-        "   5. Clean message deletion\n\n"
-        "Example sequence:\n"
-        "   🔍 [░░░░░] 20% - Loading...\n"
-        "   📊 [██░░░] 40% - Processing...\n"
-        "   ⚙️ [███░░] 60% - Analyzing...\n"
-        "   🎯 [████░] 80% - Finalizing...\n"
-        "   ✅ [█████] 100% - Complete!\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 **BENEFITS:**\n\n"
-        "   ✅ Professional user experience\n"
-        "   ✅ Instant issue resolution\n"
-        "   ✅ Fair spam protection\n"
-        "   ✅ Efficient support workflow\n"
-        "   ✅ Clean, modern design\n"
-        "   ✅ Scalable architecture\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔙 Use the keyboard below to explore other guides!"
+        f"💎 **PREMIUM CAPABILITIES**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✨ **What defines the MSANode experience:**\n\n"
+        f"**1️⃣ INTERACTIVE VISUALS**\n"
+        f"   • Real-time progress bars and sync-loading.\n"
+        f"   • High-fidelity transitions between modules.\n"
+        f"   • A clean, cinematic UI optimized for future.\n\n"
+        f"**2️⃣ INSTANT RESOLUTION SYSTEM**\n"
+        f"   • 6 pre-configured intelligence templates.\n"
+        f"   • Step-by-step guidance for every blueprint type.\n"
+        f"   • Solve anomalies instantly without waiting for command.\n\n"
+        f"**3️⃣ IRON DOME SECURITY**\n"
+        f"   • Personalized protection for your terminal access.\n"
+        f"   • Intelligent safeguard against accidental pings.\n"
+        f"   • Multi-layer security to keep the vault stable.\n\n"
+        f"**4️⃣ PRIORITY COMMUNICATION**\n"
+        f"   • Direct synchronization with MSANode Intelligence.\n"
+        f"   • Your feedback is analyzed and logged immediately.\n"
+        f"   • Personalized response paths based on your input.\n\n"
+        f"**5️⃣ LIVE STATUS UPDATES**\n"
+        f"   • Instant alerts when a task is completed.\n"
+        f"   • Real-time tracking of your clearance level.\n"
+        f"   • Transparent reporting on your Syndicate activity.\n\n"
+        f"**6️⃣ REPUTATION MANAGEMENT**\n"
+        f"   • Ability to refine and update your audits anytime.\n"
+        f"   • Quality-controlled feedback to ensure high standards.\n"
+        f"   • Direct influence on upcoming blueprint releases.\n\n"
+        f"**7️⃣ MSANODE PASSPORT (ID)**\n"
+        f"   • A unique, permanent signature for your account.\n"
+        f"   • Professional tracking for elite support handling.\n"
+        f"   • Your key to the entire MSANode ecosystem.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 **ELITE BENEFITS:**\n\n"
+        f"   ✅ Sophisticated and smooth user journey\n"
+        f"   ✅ Zero-delay problem solving\n"
+        f"   ✅ Secure and stable operational environment\n"
+        f"   ✅ Direct influence on Syndicate growth\n"
+        f"   ✅ Modern, high-authority terminal design\n"
+        f"   ✅ 24/7 Access to high-tier intelligence\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔙 *Use the keyboard below to navigate other sectors.*"
     )
-    
     try:
         await message.answer(guide_text, reply_markup=get_guide_main_keyboard(), parse_mode="Markdown")
     except Exception as e:
@@ -4400,7 +4477,7 @@ async def guide_faq(message: types.Message):
         "**Q4: How do I update my review?**\n"
         "A: Just submit a new review!\n"
         "   Your old review will be updated automatically.\n"
-        "   Note: Cooldown resets to 7 days.\n\n"
+        "   Note: Cooldown resets to 7 days or setted days.\n\n"
         "**Q5: What's the difference between templates and custom?**\n"
         "A: Templates: Self-help solutions, instant, unlimited\n"
         "   Custom: Goes to support team, counts toward limits\n\n"
@@ -4411,10 +4488,10 @@ async def guide_faq(message: types.Message):
         "   • Multiple requests\n"
         "   Wait for cooldown to expire.\n\n"
         "**Q7: How to check my status?**\n"
-        "A: Click \"👤 Profile / Status\" or send /mystatus\n"
+        "A: Click \"DASHBOARD\" then Click \"📊 STATUS\" \n"
         "   Shows: MSA ID, membership, pending requests, etc.\n\n"
         "**Q8: Can I cancel a support request?**\n"
-        "A: While typing: Click \"❌ CANCEL\" button\n"
+        "A: While typing: Click \"❌ CANCEL\" button or DASHBOARD press \"❌ CANCEL\" button \n"
         "   After submission: No, wait for admin resolution\n\n"
         "**Q9: How long until support responds?**\n"
         "A: Usually within 1-24 hours\n"
@@ -4431,14 +4508,14 @@ async def guide_faq(message: types.Message):
         "   • Fake/abusive messages\n"
         "   Contact admin to appeal.\n\n"
         "**Q12: Can I use bot without joining channel?**\n"
-        "A: No, membership is required.\n"
+        "A: No, MSAnode VAULT membership is required.\n"
         "   You'll be prompted to join automatically.\n\n"
         "**Q13: Template solutions don't help. What now?**\n"
         "A: After trying template:\n"
         "   Click \"❌ NOT SOLVED\" or \"💬 Contact Support\"\n"
         "   This escalates to human support team.\n\n"
         "**Q14: How often can I leave reviews?**\n"
-        "A: Every 7 days\n"
+        "A: Every 7 days or setted days \n"
         "   Or update existing review (resets cooldown)\n\n"
         "**Q15: What's the ❌ CANCEL button for?**\n"
         "A: Stops current action immediately\n"
@@ -4624,26 +4701,26 @@ async def handle_issue_selection(message: types.Message, state: FSMContext):
             "💡 **Still not working?** Try restarting your device!"
         ),
         "🤖 Bot Not Responding": (
-            "🤖 **Bot Response Issues**\n\n"
-            "🔍 **Quick Fixes:**\n\n"
-            "1️⃣ **Basic Commands**\n"
-            "   • Type /start to restart\n"
-            "   • Try /help for menu\n\n"
-            "2️⃣ **Check Bot Status**\n"
+            "🤖 **Bot Response Issues?**\n\n"
+            "If the bot isn't responding, try these quick fixes:\n\n"
+            "**1️⃣ Restart the Bot**\n"
+            "   • Use the buttons below to navigate\n"
+            "   • Tap 📊 DASHBOARD to refresh\n\n"
+            "**2️⃣ Check Bot Status**\n"
             "   • Bot might be under maintenance\n"
             "   • Wait 2-3 minutes and retry\n\n"
-            "3️⃣ **Clear Chat History**\n"
-            "   • Delete conversation\n"
-            "   • Start fresh with /start\n\n"
-            "4️⃣ **Restart Telegram**\n"
+            "**3️⃣ Clear & Restart**\n"
+            "   • Delete this conversation\n"
+            "   • Start fresh using your original link\n\n"
+            "**4️⃣ Restart Telegram**\n"
             "   • Close app completely\n"
             "   • Clear from recent apps\n"
             "   • Reopen and try again\n\n"
-            "5️⃣ **Check Your Membership**\n"
-            "   • Make sure you're still in the channel\n"
-            "   • Re-join if you left\n\n"
+            "**5️⃣ Verify Membership**\n"
+            "   • Ensure you're still in the Telegram Vault\n"
+            "   • Re-join if you left the channel\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "💡 **Pro Tip:** Update Telegram to latest version!"
+            "💡 **Pro Tip:** Keep Telegram updated to the latest version for best performance!\n\n"
         ),
         "⭐ Review Issue": (
             "⭐ **Review System Help**\n\n"
@@ -4714,7 +4791,7 @@ async def handle_issue_selection(message: types.Message, state: FSMContext):
             "5️⃣ **Missing Content**\n"
             "   • Content may be time-limited\n"
             "   • Check announcements\n"
-            "   • Ask in community group\n\n"
+            "   • Ask support \n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "💡 **Tip:** Save important content immediately!"
         ),
@@ -6737,14 +6814,127 @@ async def cmd_start(message: types.Message, command: CommandObject):
     # Add current timestamp
     start_command_tracker[user_id].append(current_time)
     
-    # 3. Maintenance Check
+    # 3. Maintenance Check - PREMIUM VERSION
     maint = col_settings.find_one({"setting": "maintenance"})
     if maint and maint.get("value"):
+        # Premium maintenance animation
+        maint_msg = await message.answer("🔍 **Checking System Status...**", parse_mode="Markdown")
+        await asyncio.sleep(0.4)
+        await maint_msg.edit_text("⚙️ **[░░░░░] 20% - Scanning Servers...**", parse_mode="Markdown")
+        await asyncio.sleep(0.3)
+        await maint_msg.edit_text("🔧 **[██░░░] 40% - Verifying Systems...**", parse_mode="Markdown")
+        await asyncio.sleep(0.3)
+        await maint_msg.edit_text("🛠️ **[████░] 80% - Status Retrieved...**", parse_mode="Markdown")
+        await asyncio.sleep(0.3)
+        await maint_msg.edit_text("⚠️ **[█████] 100% - Maintenance Detected**", parse_mode="Markdown")
+        await asyncio.sleep(0.5)
+        await maint_msg.delete()
+        
+        # Get maintenance details
+        maint_reason = maint.get("reason", "System upgrades in progress")
+        maint_eta = maint.get("eta", "Soon")
+        maint_started = maint.get("started_at", "Unknown")
+        
         try:
-            await message.answer("🚧 **System Maintenance In Progress**\n\nWe'll be back online shortly. Thank you for your patience.")
+            await message.answer(
+                "╔══════════════════════════╗\n"
+                "║  🔴 **MSANODE AGENT**    ║\n"
+                "║     **● OFFLINE**        ║\n"
+                "╚══════════════════════════╝\n\n"
+                "🚧 **SYSTEM MAINTENANCE IN PROGRESS**\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"**📋 Status:** Under Maintenance\n"
+                f"**🔧 Reason:** {maint_reason}\n"
+                f"**⏰ Started:** {maint_started}\n"
+                f"**🕐 ETA:** {maint_eta}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "**⚠️ ALL SERVICES TEMPORARILY UNAVAILABLE:**\n"
+                "• Content downloads\n"
+                "• Review system\n"
+                "• Customer support\n"
+                "• Dashboard access\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "💡 **We'll notify you when the system is back online!**\n\n"
+                "🔔 **Stay tuned for updates.**\n"
+                "Thank you for your patience! 🙏",
+                parse_mode="Markdown"
+            )
         except:
             pass
         return 
+
+    # 3.5. Terms & Conditions Check - Must be accepted before using bot
+    if not has_accepted_terms(user_id):
+        # User hasn't accepted terms yet - show terms and require acceptance
+        terms_kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="✅ I Accept the Terms & Conditions")],
+                [KeyboardButton(text="❌ I Reject")]
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=False
+        )
+        
+        terms_message = (
+            f"**Welcome, {message.from_user.first_name}!** 🎉\n\n"
+            f"╔════════════════════════════╗\n"
+            f"║  📜 **TERMS & CONDITIONS**  ║\n"
+            f"╚════════════════════════════╝\n\n"
+            f"⚠️ **IMPORTANT: You must read and accept our terms to use this bot.**\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"**1️⃣ GENERAL CONDUCT**\n"
+            f"• Be respectful to all users and staff\n"
+            f"• No harassment, hate speech, or abuse\n"
+            f"• Use the bot for intended purposes only\n"
+            f"• Follow all commands and guidelines\n\n"
+            f"**2️⃣ SPAM PREVENTION**\n"
+            f"• Do NOT spam commands repeatedly\n"
+            f"• Limit: 10 actions per minute\n"
+            f"• Spamming = Automatic permanent ban\n"
+            f"• No flooding in reviews or support\n\n"
+            f"**3️⃣ REVIEWS & FEEDBACK**\n"
+            f"• Provide honest, constructive reviews\n"
+            f"• No fake, abusive, or spam reviews\n"
+            f"• Minimum rating rules apply\n"
+            f"• Review system can be disabled anytime\n\n"
+            f"**4️⃣ CUSTOMER SUPPORT**\n"
+            f"• Use support for legitimate issues only\n"
+            f"• Be patient, we respond ASAP\n"
+            f"• No spam or abuse in support tickets\n"
+            f"• One active ticket at a time\n\n"
+            f"**5️⃣ BANS & PENALTIES**\n"
+            f"• Violations result in temporary or permanent bans\n"
+            f"• Banned users can appeal via 🔔 APPEAL BAN\n"
+            f"• Repeat offenders get permanent bans\n"
+            f"• Admin decisions are final\n\n"
+            f"**6️⃣ CONTENT ACCESS**\n"
+            f"• Membership in Telegram Vault required\n"
+            f"• Leaving channel = Access revoked\n"
+            f"• Social media verification required\n"
+            f"• Premium content via pinned comments\n\n"
+            f"**7️⃣ DATA & PRIVACY**\n"
+            f"• Your data is stored securely\n"
+            f"• MSA ID assigned for tracking\n"
+            f"• Activity logs maintained for security\n"
+            f"• No data shared with third parties\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"**✅ BY ACCEPTING, YOU AGREE TO:**\n"
+            f"• Follow all rules above\n"
+            f"• Accept admin moderation decisions\n"
+            f"• Respect the community guidelines\n"
+            f"• Use the bot responsibly\n\n"
+            f"❌ **BY REJECTING:**\n"
+            f"• You will NOT be able to use this bot\n"
+            f"• All features will remain locked\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"**👇 Please make your choice below:**"
+        )
+        
+        try:
+            await message.answer(terms_message, reply_markup=terms_kb, parse_mode="Markdown")
+        except:
+            pass
+        return
 
     # 4. Parse Arg/Source & Log
     raw_arg = command.args
@@ -6756,7 +6946,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
     
     u_status = await log_user(message.from_user, source)
 
-    # 5. PREMIUM VERIFICATION ANIMATION
+    # 6. PREMIUM VERIFICATION ANIMATION
     load = await message.answer("╔════════════════════╗\n║   🎯 **MSANode**   ║\n║  **Security Hub**  ║\n╚════════════════════╝\n\n🔄 *Initializing...*", parse_mode="Markdown")
     await asyncio.sleep(0.15)
     await load.edit_text("╔════════════════════╗\n║   🎯 **MSANode**   ║\n║  **Security Hub**  ║\n╚════════════════════╝\n\n🔐 *Scanning credentials...*\n▰▰▰▱▱▱▱▱▱▱ 30%", parse_mode="Markdown")
@@ -6767,14 +6957,32 @@ async def cmd_start(message: types.Message, command: CommandObject):
     await asyncio.sleep(0.15)
     await load.edit_text("╔════════════════════╗\n║   💎 **MSANode**   ║\n║  **Premium Hub**   ║\n╚════════════════════╝\n\n✨ *Access Granted!*\n▰▰▰▰▰▰▰▰▰▰ 100%", parse_mode="Markdown")
     await asyncio.sleep(0.2)
+    
+    # Show MSANODE AGENT status for unrestricted users
+    try:
+        await load.delete()
+    except:
+        pass
+    
+    # Display MSANODE AGENT LIVE status
+    agent_status = await message.answer(
+        "╔════════════════════════╗\n"
+        "║   🟢 **MSANODE AGENT**   ║\n"
+        "║      **● ONLINE**        ║\n"
+        "╚════════════════════════╝\n\n"
+        "✅ **System Status:** Operational\n"
+        "🔐 **Security:** Active\n"
+        "⚡ **Response Time:** Real-time",
+        parse_mode="Markdown"
+    )
+    await asyncio.sleep(1.5)
+    try:
+        await agent_status.delete()
+    except:
+        pass
 
-    # 6. Membership Gate with Social Media Tracking
+    # 7. Membership Gate with Social Media Tracking
     if not await is_member(message.from_user.id):
-        try:
-            await load.delete()
-        except:
-            pass
-        
         # Check if user is RETURNING (was member before but left) or NEW
         user_doc = col_users.find_one({"user_id": str(user_id)})
         is_returning_user = user_doc is not None  # If user exists in DB, they were here before
@@ -6898,7 +7106,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
         user_social_clicks[user_id]['verify_msg_id'] = verify_msg.message_id
         return
 
-    # 7. Core Delivery Logic - User is in Telegram vault
+    # 8. Core Delivery Logic - User is in Telegram vault
     # Delete rejoin message if it exists (returning user who just rejoined)
     if user_id in user_social_clicks and 'rejoin_msg_id' in user_social_clicks[user_id]:
         try:
@@ -7287,6 +7495,128 @@ async def check_join(callback: types.CallbackQuery):
     callback.data = f"verify_Unknown_{raw_arg}"
     await verify_all_requirements(callback)
 
+# ==========================================
+# 📜 TERMS & CONDITIONS ACCEPTANCE HANDLERS
+# ==========================================
+
+@dp.message(F.text == "✅ I Accept the Terms & Conditions")
+async def handle_terms_accept(message: types.Message):
+    """Handle user acceptance of terms and conditions"""
+    user_id = message.from_user.id
+    
+    # Check if already accepted
+    if has_accepted_terms(user_id):
+        await message.answer(
+            "✅ **You have already accepted the Terms & Conditions.**\n\n"
+            "You have full access to all bot features!",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    
+    # Record acceptance in database
+    try:
+        now = datetime.now(IST)
+        now_str = now.strftime("%d-%m-%Y %I:%M %p")
+        
+        # Insert into terms collection
+        col_terms.insert_one({
+            "user_id": str(user_id),
+            "accepted": True,
+            "accepted_at": now,
+            "accepted_at_str": now_str,
+            "first_name": message.from_user.first_name,
+            "username": f"@{message.from_user.username}" if message.from_user.username else "None"
+        })
+        
+        # Update user document
+        col_users.update_one(
+            {"user_id": str(user_id)},
+            {"$set": {"terms_accepted": True, "terms_accepted_at": now_str}}
+        )
+        
+        # Show acceptance animation
+        loading = await message.answer("⚡ **Processing Your Acceptance...**")
+        await asyncio.sleep(0.15)
+        await loading.edit_text("📝 **[░░░░░] 20% - Recording Decision...**")
+        await asyncio.sleep(0.15)
+        await loading.edit_text("🔐 **[██░░░] 40% - Verifying Agreement...**")
+        await asyncio.sleep(0.15)
+        await loading.edit_text("✅ **[████░] 80% - Activating Access...**")
+        await asyncio.sleep(0.15)
+        await loading.edit_text("🎉 **[█████] 100% - Complete!**")
+        await asyncio.sleep(0.3)
+        await loading.delete()
+        
+        # Welcome message with full access
+        await message.answer(
+            f"🎉 **Thank you, {message.from_user.first_name}!**\n\n"
+            f"✅ **Terms & Conditions Accepted**\n\n"
+            f"You now have full access to all bot features:\n"
+            f"💎 Premium content downloads\n"
+            f"💎 Review system\n"
+            f"💎 Customer support\n"
+            f"💎 Search & vault features\n"
+            f"💎 All bot commands\n\n"
+            f"🚀 **Welcome to MSANode!** Use the menu below to get started.",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
+        
+        # Log acceptance
+        user_doc = col_users.find_one({"user_id": str(user_id)})
+        msa_id = user_doc.get("msa_id", "UNKNOWN") if user_doc else "UNKNOWN"
+        logger.info(f"✅ User {msa_id} ({user_id}) accepted Terms & Conditions")
+        
+    except Exception as e:
+        logger.error(f"Error recording terms acceptance: {e}")
+        await message.answer(
+            "⚠️ **An error occurred while processing your acceptance.**\n\n"
+            "Please try again by clicking the Accept button.",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="✅ I Accept the Terms & Conditions")],
+                    [KeyboardButton(text="❌ I Reject")]
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=False
+            )
+        )
+
+@dp.message(F.text == "❌ I Reject")
+async def handle_terms_reject(message: types.Message):
+    """Handle user rejection of terms and conditions"""
+    user_id = message.from_user.id
+    
+    # Keep showing the same keyboard - don't let them proceed
+    terms_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ I Accept the Terms & Conditions")],
+            [KeyboardButton(text="❌ I Reject")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+    
+    await message.answer(
+        f"❌ **Terms & Conditions Rejected**\n\n"
+        f"**{message.from_user.first_name}, you must accept our Terms & Conditions to use this bot.**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ **Without acceptance:**\n"
+        f"• You cannot access any bot features\n"
+        f"• All commands will be blocked\n"
+        f"• No content downloads available\n"
+        f"• No support or reviews access\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 **To continue:**\n"
+        f"➤ Read the terms carefully\n"
+        f"➤ Click '✅ I Accept' button below\n\n"
+        f"⏸️ **You can't proceed until you accept the terms.**",
+        reply_markup=terms_kb,
+        parse_mode="Markdown"
+    )
+    
+    logger.info(f"❌ User {user_id} rejected Terms & Conditions")
+
 async def deliver_content(message: types.Message, payload: str, source: str, u_status: str = "UNKNOWN"):
     u_id = str(message.chat.id)
     name = message.chat.first_name or "Operative"
@@ -7583,7 +7913,10 @@ async def handle_unhandled_messages(message: types.Message):
             "💎 **Use the premium menu below**\n\n"
             "📊 **DASHBOARD** - View your profile & status\n"
             "⭐ **REVIEW** - Share your feedback\n"
-            "💬 **CUSTOMER SUPPORT** - Get help\n\n"
+            "💬 **CUSTOMER SUPPORT** - Get help\n"
+            "❓ **FAQ / HELP** - Common questions\n"
+            "📚 **GUIDE / HOW TO USE** - Learn how to use\n"
+            "📜 **RULES & REGULATIONS** - View bot rules\n\n"
             "🚀 **Navigate using the buttons for the best experience!**",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard()
