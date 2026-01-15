@@ -3288,13 +3288,20 @@ async def show_dashboard(message: types.Message, state: FSMContext):
     # Check maintenance status
     maint = col_settings.find_one({"setting": "maintenance"})
     is_maintenance = maint and maint.get("value")
-    agent_status = "🔴 Offline (Maintenance)" if is_maintenance else "🟢 Online"
+    
+    if is_maintenance:
+        agent_status = "🔴 Offline (Maintenance)"
+        heartbeat = "💔 Paused"
+    else:
+        agent_status = "🟢 Online"
+        heartbeat = "💚 Live • Breathing"
     
     dashboard_msg = (
         "╔═════════════════════════╗\n"
         "║  📊 **YOUR DASHBOARD**  ║\n"
         "╚═════════════════════════╝\n\n"
         f"**MSANODE AGENT:** {agent_status}\n"
+        f"**Heartbeat:** {heartbeat}\n"
         "⚡ **Status:** Active\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"**👤 Profile Information:**\n"
@@ -6964,20 +6971,50 @@ async def cmd_start(message: types.Message, command: CommandObject):
     except:
         pass
     
-    # Display MSANODE AGENT LIVE status
-    agent_status = await message.answer(
+    # Display MSANODE AGENT LIVE status with breathing animation
+    agent_msg = await message.answer(
+        "╔════════════════════════╗\n"
+        "║   ⚪ **MSANODE AGENT**   ║\n"
+        "║      **○ Starting...**   ║\n"
+        "╚════════════════════════╝",
+        parse_mode="Markdown"
+    )
+    
+    # Breathing animation - 4 stages
+    await asyncio.sleep(0.4)
+    await agent_msg.edit_text(
+        "╔════════════════════════╗\n"
+        "║   🔵 **MSANODE AGENT**   ║\n"
+        "║      **◐ Initializing**  ║\n"
+        "╚════════════════════════╝",
+        parse_mode="Markdown"
+    )
+    
+    await asyncio.sleep(0.4)
+    await agent_msg.edit_text(
+        "╔════════════════════════╗\n"
+        "║   🟡 **MSANODE AGENT**   ║\n"
+        "║      **◑ Connecting...**  ║\n"
+        "╚════════════════════════╝",
+        parse_mode="Markdown"
+    )
+    
+    await asyncio.sleep(0.4)
+    await agent_msg.edit_text(
         "╔════════════════════════╗\n"
         "║   🟢 **MSANODE AGENT**   ║\n"
-        "║      **● ONLINE**        ║\n"
+        "║      **● ACTIVE**        ║\n"
         "╚════════════════════════╝\n\n"
         "✅ **System Status:** Operational\n"
         "🔐 **Security:** Active\n"
-        "⚡ **Response Time:** Real-time",
+        "⚡ **Response Time:** <1ms\n"
+        "💚 **Heartbeat:** Live",
         parse_mode="Markdown"
     )
-    await asyncio.sleep(1.5)
+    
+    await asyncio.sleep(1.2)
     try:
-        await agent_status.delete()
+        await agent_msg.delete()
     except:
         pass
 
