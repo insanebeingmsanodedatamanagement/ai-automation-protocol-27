@@ -9,8 +9,6 @@ import threading
 from aiohttp import web
 import shutil
 import base64
-import sys
-import socket
 import time
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
@@ -20,37 +18,37 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import FSInputFile, ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 # ReportLab & Google Imports
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-from reportlab.lib.colors import Color, gray
+from reportlab.lib.colors import Color, gray, black
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # ==========================================
-# ⚡ CONFIGURATION (SECURED GOD-MODE)
+# ⚡ CONFIGURATION
 # ==========================================
-# All sensitive IDs are now pulled from Render Environment Variables.
 BOT_TOKEN = os.getenv("BOT_4_TOKEN") 
-MONGO_URI = os.getenv("MONGO_URI") 
+MONGO_URI = os.getenv("MONGO_URI")
 
-# HIDDEN IDENTITY: No plain text ID or Folder link remains.
-OWNER_ID = int(os.environ.get("MASTER_ADMIN_ID", 0)) 
-PARENT_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
-
-# System File Mapping
-CREDENTIALS_FILE = os.environ.get("CRED_FILE_NAME", 'credentials.json')
-TOKEN_FILE = os.environ.get("TOKEN_FILE_NAME", 'token.pickle')
+if not BOT_TOKEN:
+    print("Bot 4 Error: BOT_4_TOKEN not found in Render Environment!")
+OWNER_ID = 6988593629 
+PARENT_FOLDER_ID = '1J0iGLcwjTTdQRQJ--A9s8D26a3-gN7IB'
+CREDENTIALS_FILE = 'credentials.json'
+TOKEN_FILE = 'token.pickle'
 
 START_TIME = time.time() 
-
-if not BOT_TOKEN or not PARENT_FOLDER_ID:
-    print("❌ CRITICAL ERROR: Bot 4 Security credentials missing!")
 
 # ==========================================
 # 🛠 SETUP
@@ -60,7 +58,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 col_pdfs = None
 db_client = None
-# --- RENDER SECRET INJECTION ---
+
 def prepare_secrets():
     """Moves Google secrets from Render /etc/secrets to local folder."""
     targets = {"token.pickle.base64": "token.pickle", "credentials.json": "credentials.json"}
@@ -75,11 +73,11 @@ def prepare_secrets():
                         binary = base64.b64decode(f.read().strip())
                     with open(target, "wb") as f: f.write(binary)
                 else:
-                    shutil.copy(full_src, target)
-                print(f"✅ Secret Injected: {target}")
+                    if os.path.abspath(full_src) != os.path.abspath(target):
+                        shutil.copy(full_src, target)
+                print(f"Secret Injected: {target}")
                 break
 
-# --- RENDER PORT BINDER ---
 async def handle_health(request):
     return web.Response(text="CORE 4 (PDF INFRASTRUCTURE) IS ACTIVE")
 
@@ -91,6 +89,7 @@ def run_health_server():
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"📡 Health Server Note: {e}")
+
 def connect_db():
     global col_pdfs, db_client
     try:
@@ -104,12 +103,13 @@ def connect_db():
         return False
 
 connect_db()
+
 class BotState(StatesGroup):
     waiting_for_code = State()
     processing_script = State()
     fetching_link = State()
     deleting_pdf = State()
-    confirm_overwrite = State()  # Add this line
+    confirm_overwrite = State()
 
 def get_main_menu():
     builder = ReplyKeyboardBuilder()
@@ -117,10 +117,6 @@ def get_main_menu():
     builder.row(KeyboardButton(text="📋 Show Library"), KeyboardButton(text="📊 Storage Info"))
     builder.row(KeyboardButton(text="🗑 Remove PDF"), KeyboardButton(text="💎 Elite Help"))
     return builder.as_markup(resize_keyboard=True)
-
-# ==========================================
-# 📊 VISUAL ANALYTICS
-# ==========================================
 
 def generate_progress_bar(percentage):
     """Creates a visual progress bar for Telegram."""
@@ -185,60 +181,322 @@ async def weekly_backup():
         except: pass
 
 # ==========================================
-# 🧠 PDF & DRIVE LOGIC
+# 🧠 PDF GENERATION - S19 STYLE
 # ==========================================
 
-def draw_canvas_extras(canvas, doc):
-    canvas.saveState()
-    canvas.translate(letter[0]/2, letter[1]/2); canvas.rotate(45); canvas.setFillColor(Color(0,0,0,alpha=0.08)) 
-    canvas.setFont("Helvetica-Bold", 70); canvas.drawCentredString(0, 0, "MSANODE"); canvas.restoreState()
-    canvas.saveState(); canvas.setFont("Helvetica", 9); canvas.setFillColor(gray)
-    canvas.drawRightString(letter[0]-0.75*inch, 0.5*inch, f"MSANODE OFFICIAL GUIDE | Page {doc.page}"); canvas.restoreState()
+def draw_canvas_extras(canvas_obj, doc):
+    """Adds MSANODE watermark and page numbers like S19.pdf"""
+    canvas_obj.saveState()
+    
+    # Watermark
+    canvas_obj.translate(letter[0]/2, letter[1]/2)
+    canvas_obj.rotate(45)
+    canvas_obj.setFillColor(Color(0, 0, 0, alpha=0.08))
+    canvas_obj.setFont("Helvetica-Bold", 70)
+    canvas_obj.drawCentredString(0, 0, "MSANODE")
+    canvas_obj.restoreState()
+    
+    # Page number footer
+    canvas_obj.saveState()
+    canvas_obj.setFont("Helvetica", 9)
+    canvas_obj.setFillColor(gray)
+    canvas_obj.drawRightString(
+        letter[0] - 0.75*inch, 
+        0.5*inch, 
+        f"MSANODE OFFICIAL GUIDE | Page {doc.page}"
+    )
+    canvas_obj.restoreState()
 
 def create_goldmine_pdf(text, filename):
-    t = re.compile(r'[^\x00-\x7F]+').sub('', text)
-    t = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', t)
-    t = re.sub(r'__(.*?)__', r'<u>\1</u>', t)
-    doc = SimpleDocTemplate(filename, pagesize=letter, leftMargin=0.75*inch, rightMargin=0.75*inch, topMargin=0.75*inch, bottomMargin=0.75*inch)
+    """Creates PDF in S19 professional format"""
+    
+    # Clean text
+    text = re.compile(r'[^\x00-\x7F]+').sub('', text)
+    
+    # CRITICAL FIX: Add line breaks where sections should split
+    # This handles text that comes in without proper line breaks
+    text = re.sub(r'(CORE TOOLS USED|CORE TOOLS|I\.|II\.|III\.|IV\.|V\.|VI\.|VII\.|VIII\.|IX\.|X\.)', r'\n\n\1', text)
+    text = re.sub(r'(\([A-Z][^)]+\))', r'\n\1', text)  # Add breaks before (The Managerial Mindset) style text
+    text = re.sub(r'(The [A-Z][a-z]+ [A-Z][a-z]+:)', r'\n\n\1', text)  # The Logic Translation:
+    
+    # Setup document
+    doc = SimpleDocTemplate(
+        filename, 
+        pagesize=letter,
+        leftMargin=0.75*inch,
+        rightMargin=0.75*inch,
+        topMargin=0.75*inch,
+        bottomMargin=0.75*inch
+    )
+    
+    # Define styles matching S19.pdf
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name='GB', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=11, leading=16, alignment=4, spaceAfter=12))
-    story = [Paragraph(p.strip().replace('\n', ' '), styles['GB']) for p in t.split('\n\n') if p.strip()]
+    
+    # Header style (MSANODE)
+    styles.add(ParagraphStyle(
+        name='MSAHeader',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=16,
+        leading=20,
+        textColor=black,
+        alignment=TA_CENTER,
+        spaceAfter=6
+    ))
+    
+    # Main Title style (for the very first line)
+    styles.add(ParagraphStyle(
+        name='MainTitle',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=11,
+        leading=14,
+        textColor=black,
+        alignment=TA_LEFT,
+        spaceAfter=12
+    ))
+    
+    # Section Header (I, II, III, etc.)
+    styles.add(ParagraphStyle(
+        name='SectionHeader',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=11,
+        leading=14,
+        textColor=black,
+        alignment=TA_LEFT,
+        spaceAfter=8,
+        spaceBefore=12
+    ))
+    
+    # Subsection with parentheses
+    styles.add(ParagraphStyle(
+        name='ParenSubsection',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=10,
+        leading=13,
+        textColor=black,
+        alignment=TA_LEFT,
+        spaceAfter=6,
+        spaceBefore=6
+    ))
+    
+    # Subsection (The, Core, etc.)
+    styles.add(ParagraphStyle(
+        name='Subsection',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=10,
+        leading=13,
+        textColor=black,
+        alignment=TA_LEFT,
+        spaceAfter=6,
+        spaceBefore=8
+    ))
+    
+    # Body text
+    styles.add(ParagraphStyle(
+        name='Body',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=10,
+        leading=14,
+        textColor=black,
+        alignment=TA_LEFT,
+        spaceAfter=8
+    ))
+    
+    # Build story
+    story = []
+    
+    # Add header (MSANODE)
+    story.append(Paragraph("MSANODE", styles['MSAHeader']))
+    story.append(Spacer(1, 0.1*inch))
+    
+    # Parse and format content
+    lines = text.split('\n')
+    
+    # Track if we've added the main title
+    main_title_added = False
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # First substantive line is the main title
+        if not main_title_added and len(line) > 20:
+            story.append(Paragraph(line, styles['MainTitle']))
+            main_title_added = True
+            continue
+            
+        # Roman numerals sections (I., II., III., etc.)
+        if re.match(r'^(I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII)\.\s+[A-Z]', line):
+            story.append(Spacer(1, 0.08*inch))
+            story.append(Paragraph(line, styles['SectionHeader']))
+            continue
+        
+        # Parentheses subsections like (The Managerial Mindset)
+        if re.match(r'^\([A-Z].*?\)', line):
+            story.append(Paragraph(line, styles['ParenSubsection']))
+            continue
+        
+        # Subsections starting with "The" followed by title case
+        if re.match(r'^The [A-Z][a-z]+.*?:', line):
+            story.append(Paragraph(line, styles['Subsection']))
+            continue
+        
+        # Other bold subsections (Core Tools, etc.)
+        if line.startswith('Core ') or line.startswith('CORE '):
+            story.append(Paragraph(f"<b>{line}</b>", styles['Subsection']))
+            continue
+        
+        # All caps headers (but not too long)
+        if line.isupper() and 5 < len(line) < 80:
+            story.append(Paragraph(f"<b>{line}</b>", styles['MainTitle']))
+            continue
+        
+        # Bullet points or dashes
+        if line.startswith('-') or line.startswith('•'):
+            story.append(Paragraph(line, styles['Body']))
+            continue
+        
+        # Regular body text - split into sentences if too long
+        if len(line) > 500:
+            # Split long paragraphs at sentence boundaries
+            sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', line)
+            for sentence in sentences:
+                if sentence.strip():
+                    story.append(Paragraph(sentence.strip(), styles['Body']))
+        else:
+            story.append(Paragraph(line, styles['Body']))
+    
+    # Build PDF
     doc.build(story, onFirstPage=draw_canvas_extras, onLaterPages=draw_canvas_extras)
 
-# ==========================================
-# 🧠 SECURE DRIVE SERVICE (FIXED)
-# ==========================================
 def get_drive_service():
     creds = None
-    # Check if token exists
     if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'rb') as t:
-            creds = pickle.load(t)
-            
-    # If no valid creds, we cannot re-auth on Render
+        with open(TOKEN_FILE, 'rb') as t: creds = pickle.load(t)
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                with open(TOKEN_FILE, 'wb') as t:
-                    pickle.dump(creds, t)
-            except Exception as e:
-                # This is where the 'invalid_grant' happens
-                raise Exception("TOKEN_EXPIRED: Master Sadiq, your Drive Token is dead. Re-auth locally.")
+        if creds and creds.expired and creds.refresh_token: creds.refresh(Request())
         else:
-            raise Exception("AUTH_MISSING: Credentials not found or invalid.")
-            
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, ['https://www.googleapis.com/auth/drive.file'])
+            creds = flow.run_local_server(port=8080)
+        with open(TOKEN_FILE, 'wb') as t: pickle.dump(creds, t)
     return build('drive', 'v3', credentials=creds)
+
 def upload_to_drive(filename):
     service = get_drive_service()
+    
+    # Generate dynamic folder name
+    month_name = datetime.now().strftime('%b_%Y').upper()
+    folder_name = f"{month_name}_GUIDES"
+    
+    # Check if folder exists
+    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and '{PARENT_FOLDER_ID}' in parents and trashed = false"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    folders = results.get('files', [])
+    
+    if folders:
+        target_folder_id = folders[0]['id']
+    else:
+        folder_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [PARENT_FOLDER_ID]
+        }
+        folder = service.files().create(body=folder_metadata, fields='id').execute()
+        target_folder_id = folder.get('id')
+        print(f"◈ System: Created new monthly vault: {folder_name}")
+
+    # Upload file
     media = MediaIoBaseUpload(io.FileIO(filename, 'rb'), mimetype='application/pdf')
-    file = service.files().create(body={'name': filename, 'parents': [PARENT_FOLDER_ID]}, media_body=media, fields='id, webViewLink').execute()
+    file_metadata = {'name': filename, 'parents': [target_folder_id]}
+    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+    
     service.permissions().create(fileId=file.get('id'), body={'type': 'anyone', 'role': 'reader'}).execute()
+    
     return file.get('webViewLink')
 
 # ==========================================
 # 🤖 HANDLERS
 # ==========================================
+
+@dp.message(Command("start"))
+@dp.message(F.text == "🔙 Back to Menu")
+async def start(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID: return
+    await state.clear()
+    await message.answer("💎 **MSANODE BOT 4**\nAt your service, Master Sadiq.", reply_markup=get_main_menu())
+
+@dp.message(F.text == "📊 Storage Info")
+async def storage_info(message: types.Message):
+    try:
+        stats = db_client["MSANodeDB"].command("collstats", "pdf_library")
+        m_count = stats.get('count', 0)
+        m_used = stats.get('size', 0) / (1024 * 1024)
+        m_limit = 512.0
+        m_perc = (m_used / m_limit) * 100
+        
+        service = get_drive_service()
+        about = service.about().get(fields="storageQuota").execute()
+        quota = about.get('storageQuota', {})
+        d_limit = int(quota.get('limit')) / (1024**3)
+        d_used = int(quota.get('usage')) / (1024**3)
+        d_perc = (d_used / d_limit) * 100
+
+        msg = (
+            f"📊 **MASTER SADIQ'S STORAGE CENTER**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🍃 **MongoDB (Metadata)**\n"
+            f"Records: `{m_count}`\n"
+            f"Used: `{m_used:.2f} MB` / `{m_limit} MB`\n"
+            f"`{generate_progress_bar(m_perc)}`\n\n"
+            f"☁️ **Google Drive (Files)**\n"
+            f"Used: `{d_used:.2f} GB` / `{d_limit:.0f} GB`\n"
+            f"`{generate_progress_bar(d_perc)}`\n\n"
+            f"✅ **System Status: Optimal**"
+        )
+        await message.answer(msg)
+    except Exception as e:
+        await message.answer(f"⚠️ Analytics failed, Master Sadiq: `{e}`")
+
+@dp.message(F.text == "📄 Generate PDF")
+async def gen_btn(message: types.Message, state: FSMContext):
+    await state.update_data(raw_script="")
+    await message.answer("📝 **Master Sadiq, enter Project Code:**", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True))
+    await state.set_state(BotState.waiting_for_code)
+
+@dp.message(BotState.waiting_for_code)
+async def code_input(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Back to Menu": return await start(message, state)
+    
+    code = message.text.strip().upper()
+    exists = col_pdfs.find_one({"code": code})
+    
+    if exists:
+        await state.update_data(pending_code=code)
+        builder = ReplyKeyboardBuilder()
+        builder.row(KeyboardButton(text="✅ OVERWRITE"), KeyboardButton(text="❌ NEW CODE"))
+        
+        await message.answer(
+            f"⚠️ **ALERT:** Project `{code}` already exists in the Vault.\n"
+            "Do you want to replace the old version with this new one?",
+            reply_markup=builder.as_markup(resize_keyboard=True)
+        )
+        await state.set_state(BotState.confirm_overwrite)
+        return
+
+    await state.update_data(code=code)
+    await message.answer(
+        f"🖋 **Code `{code}` Registered.**\n"
+        "Master Sadiq, paste your script now:",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
+    )
+    await state.set_state(BotState.processing_script)
+
 @dp.message(BotState.confirm_overwrite)
 async def handle_overwrite_decision(message: types.Message, state: FSMContext):
     if message.text == "❌ NEW CODE":
@@ -258,123 +516,6 @@ async def handle_overwrite_decision(message: types.Message, state: FSMContext):
         await state.set_state(BotState.processing_script)
     else:
         await message.answer("Please use the buttons: ✅ OVERWRITE or ❌ NEW CODE")
-@dp.message(Command("start"))
-@dp.message(F.text == "🔙 Back to Menu")
-async def start(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID: return
-    await state.clear()
-    await message.answer("💎 **MSANODE BOT 4**\nAt your service, Master Sadiq.", reply_markup=get_main_menu())
-
-@dp.message(F.text == "📊 Storage Info")
-# ==========================================
-# 📊 STORAGE HANDLER (SECURED)
-# ==========================================
-@dp.message(F.text == "📊 Storage Info")
-async def storage_info(message: types.Message):
-    try:
-        # 1. MongoDB Logic (Always Works)
-        stats = db_client["MSANodeDB"].command("collstats", "pdf_library")
-        m_count = stats.get('count', 0)
-        m_used = stats.get('size', 0) / (1024 * 1024)
-        m_limit = 512.0
-        m_perc = (m_used / m_limit) * 100
-        
-        # 2. Drive Logic (Handles the Token Error)
-        try:
-            service = get_drive_service()
-            about = service.about().get(fields="storageQuota").execute()
-            quota = about.get('storageQuota', {})
-            d_limit = int(quota.get('limit')) / (1024**3)
-            d_used = int(quota.get('usage')) / (1024**3)
-            d_perc = (d_used / d_limit) * 100
-            drive_report = (
-                f"☁️ **Google Drive (Files)**\n"
-                f"Used: `{d_used:.2f} GB` / `{d_limit:.0f} GB`\n"
-                f"`{generate_progress_bar(d_perc)}`"
-            )
-        except Exception as drive_err:
-            logging.error(f"Drive Storage Error: {drive_err}")
-            drive_report = "⚠️ **Drive Access Error:** Token Expired. Please re-authenticate locally and update Render."
-
-        msg = (
-            f"📊 **MASTER SADIQ'S STORAGE CENTER**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🍃 **MongoDB (Metadata)**\n"
-            f"Records: `{m_count}`\n"
-            f"Used: `{m_used:.2f} MB` / `{m_limit} MB`\n"
-            f"`{generate_progress_bar(m_perc)}`\n\n"
-            f"{drive_report}\n\n"
-            f"✅ **System Status: Checking...**"
-        )
-        await message.answer(msg)
-    except Exception as e:
-        await message.answer(f"❌ Analytics Engine Failure: `{e}`")
-@dp.message(F.text == "📄 Generate PDF")
-async def gen_btn(message: types.Message, state: FSMContext):
-    await state.update_data(raw_script="")
-    await message.answer("📝 **Master Sadiq, enter Project Code:**", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True))
-    await state.set_state(BotState.waiting_for_code)
-
-
-# ==========================================
-# 🛑 STEP 1: CODE INPUT & DUPLICATE CHECK
-# ==========================================
-@dp.message(BotState.waiting_for_code)
-async def code_input(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Back to Menu": return await start(message, state)
-    
-    # Clean input and search MongoDB
-    code = message.text.strip().upper()
-    exists = col_pdfs.find_one({"code": code})
-    
-    if exists:
-        # Save the code to memory while we ask for permission
-        await state.update_data(pending_code=code)
-        
-        # Build the decision buttons
-        builder = ReplyKeyboardBuilder()
-        builder.row(KeyboardButton(text="✅ OVERWRITE"), KeyboardButton(text="❌ NEW CODE"))
-        
-        await message.answer(
-            f"⚠️ **ALERT:** Project `{code}` already exists in the Vault.\n"
-            "Do you want to replace the old version with this new one?",
-            reply_markup=builder.as_markup(resize_keyboard=True)
-        )
-        await state.set_state(BotState.confirm_overwrite)
-        return
-
-    # If it's a new code, proceed as normal
-    await state.update_data(code=code)
-    await message.answer(
-        f"🖋 **Code `{code}` Registered.**\n"
-        "Master Sadiq, paste your script now:",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
-    )
-    await state.set_state(BotState.processing_script)
-
-# ==========================================
-# 🛑 STEP 2: DECISION HANDLER
-# ==========================================
-@dp.message(BotState.confirm_overwrite)
-async def handle_overwrite_decision(message: types.Message, state: FSMContext):
-    if message.text == "❌ NEW CODE":
-        await message.answer("🔄 **Enter a different Project Code:**")
-        await state.set_state(BotState.waiting_for_code)
-        return
-        
-    if message.text == "✅ OVERWRITE":
-        data = await state.get_data()
-        code = data.get('pending_code')
-        await state.update_data(code=code) # Move the pending code to the active code slot
-        await message.answer(
-            f"🚀 **Overwriting `{code}`.**\n"
-            "Master Sadiq, paste the new script contents:",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
-        )
-        await state.set_state(BotState.processing_script)
-    else:
-        # Fallback if they type something else
-        await message.answer("Please use the buttons: ✅ OVERWRITE or ❌ NEW CODE")
 
 @dp.message(BotState.processing_script, F.text)
 async def merge_script(message: types.Message, state: FSMContext):
@@ -384,12 +525,11 @@ async def merge_script(message: types.Message, state: FSMContext):
     updated = data.get('raw_script', '') + "\n\n" + message.text
     await state.update_data(raw_script=updated)
     
-    # Check if a task is already running to prevent PermissionError spam
     if not data.get('timer_active'):
         await state.update_data(timer_active=True)
         
         async def auto_finish(uid, st):
-            await asyncio.sleep(5) # Set to 5 seconds to give you time to paste everything
+            await asyncio.sleep(5)
             await finalize_pdf(uid, st)
             
         asyncio.create_task(auto_finish(message.from_user.id, state))
@@ -403,12 +543,9 @@ async def finalize_pdf(user_id, state):
     filename = f"{code}.pdf"
     
     try:
-        # 1. Generate and Upload
         await asyncio.to_thread(create_goldmine_pdf, script, filename)
         link = await asyncio.to_thread(upload_to_drive, filename)
         
-        # 2. DATABASE SYNC (Fixes Duplicate/Ghost Issue)
-        # Delete any existing entry with this code before adding the new one
         col_pdfs.delete_many({"code": code}) 
         col_pdfs.insert_one({
             "code": code, 
@@ -416,15 +553,13 @@ async def finalize_pdf(user_id, state):
             "timestamp": datetime.now()
         })
         
-        # 3. Send to User
         await bot.send_document(
             user_id, 
             FSInputFile(filename), 
             caption=f"✅ **READY**\nCode: `{code}`\n🔗 **Link:** {link}"
         )
         
-        # 4. WINDOWS SAFE CLEANUP (Fixes PermissionError)
-        await asyncio.sleep(2) # Buffer for Windows file lock
+        await asyncio.sleep(2)
         if os.path.exists(filename):
             try:
                 os.remove(filename)
@@ -439,15 +574,10 @@ async def finalize_pdf(user_id, state):
     except Exception as e: 
         await bot.send_message(user_id, f"❌ Error: `{e}`")
     
-    # Ensure timer flag is reset and state is cleared
     await state.clear()
-# ==========================================
-# 📋 LIBRARY & MANAGEMENT HANDLERS
-# ==========================================
 
 @dp.message(F.text == "📋 Show Library")
 async def list_library(message: types.Message):
-    # Sort by most recent first
     docs = list(col_pdfs.find().sort("timestamp", -1))
     
     if not docs: 
@@ -459,13 +589,12 @@ async def list_library(message: types.Message):
     
     for d in docs:
         code = d.get('code')
-        # Only list unique codes to prevent duplicate clutter
         if code and code not in seen_codes:
             timestamp = d.get('timestamp', datetime.now()).strftime('%d/%m')
             res.append(f"{count}. `{code}` — [{timestamp}]")
             seen_codes.add(code)
             count += 1
-            if count > 25: break # Limit list length for Telegram
+            if count > 25: break
             
     res.append("━━━━━━━━━━━━━━━━━━━━")
     res.append("💎 *System: God-Mode filtered entries.*")
@@ -482,7 +611,6 @@ async def fetch_link(message: types.Message, state: FSMContext):
     if message.text == "🔙 Back to Menu": return await start(message, state)
     
     code_query = message.text.strip().upper()
-    # Pull the most recent entry for this code
     doc = col_pdfs.find_one({"code": code_query}, sort=[("timestamp", -1)])
     
     if doc: 
@@ -502,7 +630,6 @@ async def delete_exec(message: types.Message, state: FSMContext):
     if message.text == "🔙 Back to Menu": return await start(message, state)
     
     code_query = message.text.strip().upper()
-    # Delete all instances of this code to ensure clean library
     res = col_pdfs.delete_many({"code": code_query})
     
     if res.deleted_count > 0:
@@ -542,83 +669,41 @@ async def help_feature(message: types.Message):
     )
     
     await message.answer(help_text, parse_mode="HTML")
-def upload_to_drive(filename):
-    service = get_drive_service()
-    
-    # 1. GENERATE DYNAMIC FOLDER NAME
-    month_name = datetime.now().strftime('%b_%Y').upper() # e.g., DEC_2025
-    folder_name = f"{month_name}_GUIDES"
-    
-    # 2. CHECK IF FOLDER EXISTS
-    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and '{PARENT_FOLDER_ID}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="files(id)").execute()
-    folders = results.get('files', [])
-    
-    if folders:
-        target_folder_id = folders[0]['id']
-    else:
-        # 3. CREATE FOLDER IF NOT FOUND
-        folder_metadata = {
-            'name': folder_name,
-            'mimeType': 'application/vnd.google-apps.folder',
-            'parents': [PARENT_FOLDER_ID]
-        }
-        folder = service.files().create(body=folder_metadata, fields='id').execute()
-        target_folder_id = folder.get('id')
-        print(f"◈ System: Created new monthly vault: {folder_name}")
 
-    # 4. UPLOAD FILE TO THE TARGET FOLDER
-    media = MediaIoBaseUpload(io.FileIO(filename, 'rb'), mimetype='application/pdf')
-    file_metadata = {'name': filename, 'parents': [target_folder_id]}
-    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-    
-    # Set public permissions
-    service.permissions().create(fileId=file.get('id'), body={'type': 'anyone', 'role': 'reader'}).execute()
-    
-    return file.get('webViewLink')
 # ==========================================
 # 🚀 CORE INITIALIZATION
 # ==========================================
 
 async def main():
-    # Force reset of old stuck sessions
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_my_commands([BotCommand(command="start", description="Menu")])
     
-    # Initialize Automated Background Tasks
     asyncio.create_task(auto_janitor())
     asyncio.create_task(weekly_backup())
     asyncio.create_task(system_guardian())
     asyncio.create_task(daily_briefing())
     asyncio.create_task(hourly_pulse())
     
-    print("💎 MSANODE BOT 4 ONLINE")
+    print("MSANODE BOT 4 ONLINE")
     
     try: 
-        await bot.send_message(OWNER_ID, "🚀 **God Mode Online.**\nInfrastructure reset and ready, Master Sadiq.", parse_mode="HTML")
+        await bot.send_message(OWNER_ID, "**God Mode Online.**\n\nInfrastructure reset and ready, Master Sadiq.", parse_mode="HTML")
     except Exception as e:
         print(f"Startup notify failed: {e}")
 
-    # Polling Loop with Safety Shield
     try:
         await dp.start_polling(bot, skip_updates=True)
     finally:
         await bot.session.close()
 
 if __name__ == "__main__":
-    print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 4")
+    print("STARTING INDIVIDUAL CORE TEST: BOT 4")
     
-    # 1. Prepare Google Drive Secrets first
     prepare_secrets()
     
-    # 2. Start Health Server in background
     threading.Thread(target=run_health_server, daemon=True).start()
     
-    # 3. Launch Bot 4
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Bot 4 Shutdown.")
-
-
-
