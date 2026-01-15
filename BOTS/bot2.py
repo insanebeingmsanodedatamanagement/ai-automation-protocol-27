@@ -5202,11 +5202,49 @@ async def run_diagnosis(callback: types.CallbackQuery):
     
     await callback.message.edit_text(diagnosis_text, reply_markup=kb.as_markup())
 
+# ==========================================
+# MAINTENANCE NOTIFICATION HELPER
+# ==========================================
+async def notify_users_maintenance(message: str, admin_id: int):
+    """Send maintenance notification to all active users"""
+    try:
+        sent = 0
+        failed = 0
+        cursor = col_users.find({"status": "Active"}, {"user_id": 1})
+        
+        for doc in cursor:
+            uid = doc.get("user_id")
+            try:
+                await worker_bot.send_message(uid, message, parse_mode="Markdown")
+                sent += 1
+                
+                # Anti-spam delay
+                if sent % 10 == 0:
+                    await asyncio.sleep(2)
+                else:
+                    await asyncio.sleep(0.15)
+            except:
+                failed += 1
+        
+        # Send result to admin
+        result_msg = (
+            f"📢 **Notification Complete**\n\n"
+            f"✅ Sent: `{sent}`\n"
+            f"❌ Failed: `{failed}`"
+        )
+        await manager_bot.send_message(admin_id, result_msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Maintenance notification error: {e}")
+
+# ==========================================
+# MAINTENANCE CONTROL HANDLERS
+# ==========================================
 @dp.callback_query(F.data == "btn_maint_toggle")
 async def lockdown_menu(callback: types.CallbackQuery):
     """Enhanced MSANODE AGENT maintenance control dashboard"""
     if not is_admin(callback.from_user.id): return
     
+    # Fetch fresh data from database
     curr = col_settings.find_one({"setting": "maintenance"})
     is_locked = curr and curr.get("value", False)
     lockdown_time = curr.get("started_at") if curr else None
@@ -5217,11 +5255,15 @@ async def lockdown_menu(callback: types.CallbackQuery):
     status_emoji = "🔴" if is_locked else "🟢"
     status_text = "OFFLINE" if is_locked else "ONLINE"
     
+    # Get active users count for notification stats
+    active_users = col_users.count_documents({"status": "Active"})
+    
     text = (
         f"╔════════════════════════════╗\n"
         f"║  🔐 **MAINTENANCE CONTROL**  ║\n"
         f"╚════════════════════════════╝\n\n"
         f"**MSANODE AGENT Status:** {status_emoji} {status_text}\n"
+        f"**Active Users:** `{active_users}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     
@@ -5246,19 +5288,19 @@ async def lockdown_menu(callback: types.CallbackQuery):
             f"**💡 Maintenance Mode:**\n"
             f"• Disables all bot1 features\n"
             f"• Shows premium offline message\n"
-            f"• Activates emergency protocols\n"
+            f"• Notifies all active users\n"
             f"• Useful for system upgrades\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
     
     kb = InlineKeyboardBuilder()
     if is_locked:
-        kb.row(InlineKeyboardButton(text="🟢 Bring Bot ONLINE", callback_data="lockdown_disable"))
+        kb.row(InlineKeyboardButton(text="🟢 BRING ONLINE (Notify Users)", callback_data="lockdown_disable"))
     else:
-        kb.row(InlineKeyboardButton(text="🔴 Take Bot OFFLINE", callback_data="lockdown_enable"))
+        kb.row(InlineKeyboardButton(text="🔴 TAKE OFFLINE (Notify Users)", callback_data="lockdown_enable"))
     
-    kb.row(InlineKeyboardButton(text="⚙️ Set Maintenance Details", callback_data="lockdown_settings"))
-    kb.row(InlineKeyboardButton(text="📊 Check Status", callback_data="lockdown_status"))
+    kb.row(InlineKeyboardButton(text="⚙️ Maintenance Settings", callback_data="lockdown_settings"))
+    kb.row(InlineKeyboardButton(text="🔄 Refresh Status", callback_data="btn_maint_toggle"))
     kb.row(InlineKeyboardButton(text="🔙 Back to Hub", callback_data="btn_refresh"))
     
     await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
@@ -5271,20 +5313,41 @@ async def enable_lockdown(callback: types.CallbackQuery):
     
     now_str = datetime.now(IST).strftime('%d-%m-%Y %I:%M %p IST')
     
+    # Get current settings for reason and ETA
+    curr = col_settings.find_one({"setting": "maintenance"})
+    reason = curr.get("reason", "System upgrades in progress") if curr else "System upgrades in progress"
+    eta = curr.get("eta", "1-2 hours") if curr else "1-2 hours"
+    
     col_settings.update_one(
         {"setting": "maintenance"},
         {"$set": {
             "value": True,
             "started_at": now_str,
             "enabled_by": callback.from_user.first_name,
-            "reason": "System upgrades in progress",
-            "eta": "1-2 hours"
+            "reason": reason,
+            "eta": eta
         }},
         upsert=True
     )
     
+    # Notify all active users
+    notification_msg = (
+        "╔════════════════════════╗\n"
+        "║  🔴 **SYSTEM OFFLINE**  ║\n"
+        "╚════════════════════════╝\n\n"
+        "**MSANODE AGENT is temporarily offline for maintenance.**\n\n"
+        f"**📋 Details:**\n"
+        f"• Reason: {reason}\n"
+        f"• ETA: {eta}\n"
+        f"• Started: {now_str}\n\n"
+        "⏳ We'll be back online shortly. Thanks for your patience!"
+    )
+    
+    # Send notification in background
+    asyncio.create_task(notify_users_maintenance(notification_msg, callback.from_user.id))
+    
     # Show confirmation
-    await callback.answer("🔴 MSANODE AGENT IS NOW OFFLINE!", show_alert=True)
+    await callback.answer("🔴 MSANODE AGENT IS NOW OFFLINE! Notifying users...", show_alert=True)
     await lockdown_menu(callback)
 
 @dp.callback_query(F.data == "lockdown_disable")
@@ -5293,18 +5356,64 @@ async def disable_lockdown(callback: types.CallbackQuery):
         await callback.answer("🚫 Only owner can bring bot online!", show_alert=True)
         return
     
+    now_str = datetime.now(IST).strftime('%d-%m-%Y %I:%M %p IST')
+    
     col_settings.update_one(
         {"setting": "maintenance"},
         {"$set": {
             "value": False,
-            "disabled_at": datetime.now(IST).strftime('%d-%m-%Y %I:%M %p IST'),
+            "disabled_at": now_str,
             "disabled_by": callback.from_user.first_name
         }},
         upsert=True
     )
     
-    await callback.answer("🟢 MSANODE AGENT IS NOW ONLINE!", show_alert=True)
+    # Notify all active users that bot is back online
+    notification_msg = (
+        "╔════════════════════════╗\n"
+        "║  🟢 **SYSTEM ONLINE**  ║\n"
+        "╚════════════════════════╝\n\n"
+        "**MSANODE AGENT is back online!**\n\n"
+        "✅ All systems operational\n"
+        "💚 Heartbeat: Live • Breathing\n"
+        "⚡ Response time: <1ms\n\n"
+        f"**Restored:** {now_str}\n\n"
+        "🚀 You can now use all bot features. Welcome back!"
+    )
+    
+    # Send notification in background
+    asyncio.create_task(notify_users_maintenance(notification_msg, callback.from_user.id))
+    
+    await callback.answer("🟢 MSANODE AGENT IS NOW ONLINE! Notifying users...", show_alert=True)
     await lockdown_menu(callback)
+
+@dp.callback_query(F.data == "lockdown_settings")
+async def lockdown_settings(callback: types.CallbackQuery):
+    """Show maintenance settings configuration"""
+    if not is_admin(callback.from_user.id): return
+    
+    curr = col_settings.find_one({"setting": "maintenance"})
+    reason = curr.get("reason", "System upgrades") if curr else "System upgrades"
+    eta = curr.get("eta", "1-2 hours") if curr else "1-2 hours"
+    
+    text = (
+        "⚙️ **MAINTENANCE SETTINGS**\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        f"**Current Reason:** {reason}\n"
+        f"**Current ETA:** {eta}\n\n"
+        "💡 **Note:** These settings are used when\n"
+        "maintenance mode is enabled. They're shown\n"
+        "to users in the offline message.\n\n"
+        "**To update settings:**\n"
+        "1. Click the button below to set reason\n"
+        "2. Or use direct database update\n"
+        "3. Or edit via MongoDB directly"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔙 Back", callback_data="btn_maint_toggle"))
+    
+    await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "lockdown_status")
 async def lockdown_status(callback: types.CallbackQuery):
