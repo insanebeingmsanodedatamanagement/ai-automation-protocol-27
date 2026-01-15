@@ -4,11 +4,9 @@ import os
 import csv
 import time
 import threading
-from dotenv import load_dotenv
 from aiohttp import web
 
 # Load environment variables
-load_dotenv()
 import functools
 import traceback
 from datetime import datetime, timedelta
