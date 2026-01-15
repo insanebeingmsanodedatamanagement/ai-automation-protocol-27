@@ -4,9 +4,11 @@ import os
 import csv
 import time
 import threading
+from dotenv import load_dotenv
 from aiohttp import web
 
 # Load environment variables
+load_dotenv()
 import functools
 import traceback
 from datetime import datetime, timedelta
@@ -145,12 +147,13 @@ col_templates = None
 col_recycle_bin = None
 col_reviews = None
 col_appeals = None
+col_terms = None  # Terms & conditions acceptance tracking
 
 async def initialize_database():
     """Initialize database connections asynchronously after bot starts"""
     global client, db, col_users, col_admins, col_settings, col_active
     global col_viral, col_reels, col_banned, col_broadcast_logs
-    global col_templates, col_recycle_bin, col_reviews, col_appeals, col_ban_history
+    global col_templates, col_recycle_bin, col_reviews, col_appeals, col_ban_history, col_terms
     
     try:
         # Enterprise MongoDB connection with pooling for lakhs of users
@@ -181,6 +184,7 @@ async def initialize_database():
         col_recycle_bin = db["recycle_bin"]
         col_reviews = db["reviews"]
         col_appeals = db["ban_appeals"]
+        col_terms = db["terms_acceptance"]  # Terms & conditions tracking
         
         # Create indexes for optimized queries (handles millions of users)
         # Wrap each index creation separately to avoid conflicts with existing indexes
@@ -1034,22 +1038,216 @@ async def process_hub_find(message: types.Message, state: FSMContext):
         # Try username or regular ID
         user = col_users.find_one({"$or": [{"user_id": clean_q}, {"username": {"$regex": f"^{clean_q}$", "$options": "i"}}]})
     
-    if not user: return await message.answer(" No Operative found.", reply_markup=back_kb())
+    if not user: 
+        return await message.answer("❌ No Operative found.", reply_markup=back_kb())
     
-    msa_id_str = f" MSA ID: `{user.get('msa_id')}`\n" if user.get('msa_id') else ""
-    dossier = (
-        f" **OPERATIVE DOSSIER**\n"
-        f"━━━━━━━━━━━━━━━━━\n"
-        f" Name: {user.get('first_name')}\n"
-        f" Username: {user.get('username')}\n"
-        f" User ID: `{user.get('user_id')}`\n"
-        f"{msa_id_str}"
-        f" Joined: {user.get('joined_date')}\n"
-        f" Origin: {user.get('source')}\n"
-        f" Status: {user.get('status')}\n"
-        f"━━━━━━━━━━━━━━━━━"
+    user_id = user.get('user_id')
+    msa_id = user.get('msa_id', 'UNKNOWN')
+    
+    # ═══════════════════════════════════════════
+    # 📊 COMPREHENSIVE USER DATA EXTRACTION
+    # ═══════════════════════════════════════════
+    
+    # 1. TERMS & CONDITIONS
+    terms_status = "❌ NOT ACCEPTED"
+    terms_date = "Never"
+    terms_ip = "N/A"
+    try:
+        terms_record = col_terms.find_one({"user_id": user_id})
+        if terms_record and terms_record.get("accepted"):
+            terms_status = "✅ ACCEPTED"
+            terms_date = terms_record.get("accepted_at_str", "Unknown")
+            terms_ip = terms_record.get("ip_address", "N/A")
+    except:
+        pass
+    
+    # 2. REVIEWS HISTORY
+    reviews_list = []
+    reviews_count = 0
+    try:
+        reviews = list(col_reviews.find({"user_id": user_id}).sort("timestamp", -1).limit(10))
+        reviews_count = len(reviews)
+        for idx, rev in enumerate(reviews, 1):
+            rating = rev.get('rating', 0)
+            stars = "⭐" * rating
+            review_msg = rev.get('message', 'No message')[:50]
+            timestamp = rev.get('timestamp_str', 'Unknown')
+            status = rev.get('status', 'pending')
+            reviews_list.append(f"{idx}. {stars} ({rating}/5) - {status}\n   \"{review_msg}...\"\n   📅 {timestamp}")
+    except Exception as e:
+        reviews_list.append(f"Error loading reviews: {e}")
+    
+    # 3. SUPPORT TICKETS HISTORY
+    support_history = []
+    try:
+        # Current active support
+        current_support_status = user.get('support_status', 'none')
+        current_support_msg = user.get('support_message', 'N/A')
+        current_support_time = user.get('support_timestamp', 'N/A')
+        
+        if current_support_status != 'none':
+            support_history.append(
+                f"🔴 ACTIVE TICKET:\n"
+                f"   Status: {current_support_status.upper()}\n"
+                f"   Message: \"{current_support_msg[:60]}...\"\n"
+                f"   Opened: {current_support_time}"
+            )
+        else:
+            support_history.append("✅ No active support tickets")
+    except:
+        support_history.append("Error loading support data")
+    
+    # 4. BAN HISTORY
+    ban_info = []
+    current_ban = None
+    try:
+        current_ban = col_banned.find_one({"user_id": user_id})
+        if current_ban:
+            ban_type = current_ban.get('ban_type', 'permanent')
+            ban_reason = current_ban.get('reason', 'No reason provided')
+            banned_at = current_ban.get('banned_at', 'Unknown')
+            banned_by = current_ban.get('banned_by', 'System')
+            ban_until = current_ban.get('ban_until', None)
+            
+            if isinstance(banned_at, datetime):
+                banned_at = banned_at.strftime("%d-%m-%Y %I:%M %p")
+            
+            ban_info.append(
+                f"🚫 CURRENTLY BANNED\n"
+                f"   Type: {ban_type.upper()}\n"
+                f"   Reason: {ban_reason}\n"
+                f"   Banned By: {banned_by}\n"
+                f"   Date: {banned_at}"
+            )
+            
+            if ban_type == 'temporary' and ban_until:
+                if isinstance(ban_until, datetime):
+                    ban_until_str = ban_until.strftime("%d-%m-%Y %I:%M %p")
+                    ban_info.append(f"   Expires: {ban_until_str}")
+        else:
+            ban_info.append("✅ Not currently banned")
+        
+        # Get ban history
+        ban_history_records = list(col_ban_history.find({"user_id": user_id}).sort("timestamp", -1).limit(5))
+        if ban_history_records:
+            ban_info.append(f"\n📜 Ban History ({len(ban_history_records)} records):")
+            for idx, record in enumerate(ban_history_records, 1):
+                action = record.get('action_type', 'unknown')
+                reason = record.get('reason', 'No reason')[:40]
+                timestamp = record.get('timestamp', 'Unknown')
+                if isinstance(timestamp, datetime):
+                    timestamp = timestamp.strftime("%d-%m-%Y %I:%M %p")
+                ban_info.append(f"   {idx}. {action.upper()} - {timestamp}\n      \"{reason}...\"")
+    except Exception as e:
+        ban_info.append(f"Error loading ban data: {e}")
+    
+    # 5. APPEALS HISTORY
+    appeals_info = []
+    try:
+        appeals = list(col_appeals.find({"user_id": user_id}).sort("submitted_at", -1).limit(5))
+        if appeals:
+            appeals_info.append(f"📝 Appeals Filed: {len(appeals)}")
+            for idx, appeal in enumerate(appeals, 1):
+                status = appeal.get('status', 'pending')
+                reason = appeal.get('reason', 'No reason')[:40]
+                submitted = appeal.get('submitted_at', 'Unknown')
+                if isinstance(submitted, datetime):
+                    submitted = submitted.strftime("%d-%m-%Y %I:%M %p")
+                appeals_info.append(f"   {idx}. Status: {status.upper()}\n      Filed: {submitted}\n      \"{reason}...\"")
+        else:
+            appeals_info.append("📝 No ban appeals filed")
+    except:
+        appeals_info.append("Error loading appeals data")
+    
+    # 6. VAULT STATUS
+    vault_status = "🔓 ACTIVE ACCESS" if not current_ban else "🔒 VAULT LOCKED"
+    
+    # 7. ACCOUNT STATUS
+    account_status = user.get('status', 'Unknown')
+    last_active = user.get('last_active', 'Never')
+    joined_date = user.get('joined_date', 'Unknown')
+    source = user.get('source', 'Unknown')
+    
+    # 8. ADDITIONAL FLAGS
+    has_reported = user.get('has_reported', False)
+    was_unbanned = user.get('was_unbanned', False)
+    
+    # ═══════════════════════════════════════════
+    # 📋 GENERATE COMPREHENSIVE REPORT
+    # ═══════════════════════════════════════════
+    
+    report = (
+        f"╔═══════════════════════════════════╗\n"
+        f"║  📊 FULL OPERATIVE INTELLIGENCE   ║\n"
+        f"╚═══════════════════════════════════╝\n\n"
+        f"**👤 IDENTITY PROFILE**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• **Name:** {user.get('first_name', 'Unknown')}\n"
+        f"• **Username:** {user.get('username', 'None')}\n"
+        f"• **Telegram ID:** `{user_id}`\n"
+        f"• **MSA ID:** `{msa_id}`\n"
+        f"• **Account Status:** {account_status}\n"
+        f"• **Joined:** {joined_date}\n"
+        f"• **Last Active:** {last_active}\n"
+        f"• **Source:** {source}\n"
+        f"• **Reported to Admin:** {'Yes' if has_reported else 'No'}\n"
+        f"• **Previously Unbanned:** {'Yes' if was_unbanned else 'No'}\n\n"
+        f"**📜 TERMS & CONDITIONS**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• **Status:** {terms_status}\n"
+        f"• **Accepted On:** {terms_date}\n\n"
+        f"**⭐ REVIEWS SUBMITTED**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• **Total Reviews:** {reviews_count}\n\n"
     )
-    await message.answer(dossier, reply_markup=back_kb())
+    
+    if reviews_list:
+        report += "**📝 Review History (Last 10):**\n"
+        for review in reviews_list[:10]:
+            report += f"{review}\n\n"
+    else:
+        report += "• No reviews submitted yet\n\n"
+    
+    report += (
+        f"**💬 CUSTOMER SUPPORT**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    for supp in support_history:
+        report += f"{supp}\n\n"
+    
+    report += (
+        f"**🔐 VAULT & BAN STATUS**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• **Vault Access:** {vault_status}\n\n"
+    )
+    for ban in ban_info:
+        report += f"{ban}\n\n"
+    
+    report += (
+        f"**📝 BAN APPEALS**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    for appeal in appeals_info:
+        report += f"{appeal}\n\n"
+    
+    report += (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 **Report Generated:** {datetime.now(IST).strftime('%d-%m-%Y %I:%M %p IST')}\n"
+        f"🔍 **Query:** {clean_q}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    
+    # Send report in chunks if too long
+    if len(report) > 4000:
+        # Split into chunks
+        chunks = [report[i:i+4000] for i in range(0, len(report), 4000)]
+        for chunk in chunks:
+            await message.answer(chunk, reply_markup=None)
+            await asyncio.sleep(0.3)
+        await message.answer("✅ Full report complete.", reply_markup=back_kb())
+    else:
+        await message.answer(report, reply_markup=back_kb())
+    
     await state.clear()
 
 @dp.callback_query(F.data == "btn_shoot_menu")
@@ -5008,83 +5206,106 @@ async def run_diagnosis(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "btn_maint_toggle")
 async def lockdown_menu(callback: types.CallbackQuery):
-    """Enhanced lockdown management dashboard"""
+    """Enhanced MSANODE AGENT maintenance control dashboard"""
     if not is_admin(callback.from_user.id): return
     
     curr = col_settings.find_one({"setting": "maintenance"})
     is_locked = curr and curr.get("value", False)
-    lockdown_time = curr.get("enabled_at") if curr else None
+    lockdown_time = curr.get("started_at") if curr else None
     lockdown_by = curr.get("enabled_by") if curr else None
+    lockdown_reason = curr.get("reason", "System maintenance") if curr else None
+    lockdown_eta = curr.get("eta", "Soon") if curr else None
     
     status_emoji = "🔴" if is_locked else "🟢"
-    status_text = "ENGAGED" if is_locked else "NORMAL"
+    status_text = "OFFLINE" if is_locked else "ONLINE"
     
     text = (
-        f"🔐 **LOCKDOWN CONTROL CENTER**\n"
-        f"━━━━━━━━━━━━━━━━━\n\n"
-        f"{status_emoji} **Current Status:** {status_text}\n"
+        f"╔════════════════════════════╗\n"
+        f"║  🔐 **MAINTENANCE CONTROL**  ║\n"
+        f"╚════════════════════════════╝\n\n"
+        f"**MSANODE AGENT Status:** {status_emoji} {status_text}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     
     if is_locked:
-        text += f"⚠️ **System is in LOCKDOWN mode**\n"
-        if lockdown_time:
-            text += f"🕐 **Since:** {lockdown_time}\n"
-        if lockdown_by:
-            text += f"👤 **Enabled by:** {lockdown_by}\n"
-        text += "\n**Effects:**\n• Bot operations restricted\n• Emergency protocols active\n• User access limited\n"
+        text += (
+            f"⚠️ **BOT IS CURRENTLY OFFLINE**\n\n"
+            f"**📋 Maintenance Details:**\n"
+            f"• Started: {lockdown_time}\n"
+            f"• By: {lockdown_by}\n"
+            f"• Reason: {lockdown_reason}\n"
+            f"• ETA: {lockdown_eta}\n\n"
+            f"**🚫 Effects:**\n"
+            f"• All bot features disabled\n"
+            f"• Users see offline message\n"
+            f"• Emergency mode active\n"
+            f"• Only admins can access bot2\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
     else:
-        text += f"✅ **System operating normally**\n\n"
-        text += "**Lockdown Mode:**\n• Restricts bot operations\n• Activates emergency protocols\n• Limits user access\n• Useful for maintenance\n"
-    
-    text += "\n━━━━━━━━━━━━━━━━━"
+        text += (
+            f"✅ **BOT IS ONLINE & OPERATIONAL**\n\n"
+            f"**💡 Maintenance Mode:**\n"
+            f"• Disables all bot1 features\n"
+            f"• Shows premium offline message\n"
+            f"• Activates emergency protocols\n"
+            f"• Useful for system upgrades\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
     
     kb = InlineKeyboardBuilder()
     if is_locked:
-        kb.row(InlineKeyboardButton(text="🟢 Disable Lockdown", callback_data="lockdown_disable"))
+        kb.row(InlineKeyboardButton(text="🟢 Bring Bot ONLINE", callback_data="lockdown_disable"))
     else:
-        kb.row(InlineKeyboardButton(text="🔴 Enable Lockdown", callback_data="lockdown_enable"))
+        kb.row(InlineKeyboardButton(text="🔴 Take Bot OFFLINE", callback_data="lockdown_enable"))
     
-    kb.row(InlineKeyboardButton(text="📊 Lockdown Status", callback_data="lockdown_status"))
-    kb.row(InlineKeyboardButton(text="📜 Lockdown History", callback_data="lockdown_history"))
-    kb.row(InlineKeyboardButton(text="⚙️ Lockdown Settings", callback_data="lockdown_settings"))
+    kb.row(InlineKeyboardButton(text="⚙️ Set Maintenance Details", callback_data="lockdown_settings"))
+    kb.row(InlineKeyboardButton(text="📊 Check Status", callback_data="lockdown_status"))
     kb.row(InlineKeyboardButton(text="🔙 Back to Hub", callback_data="btn_refresh"))
     
-    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+    await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "lockdown_enable")
 async def enable_lockdown(callback: types.CallbackQuery):
     if callback.from_user.id != OWNER_ID:
-        await callback.answer("🚫 Only owner can enable lockdown!", show_alert=True)
+        await callback.answer("🚫 Only owner can take bot offline!", show_alert=True)
         return
+    
+    now_str = datetime.now(IST).strftime('%d-%m-%Y %I:%M %p IST')
     
     col_settings.update_one(
         {"setting": "maintenance"},
         {"$set": {
             "value": True,
-            "enabled_at": datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S'),
-            "enabled_by": callback.from_user.id
+            "started_at": now_str,
+            "enabled_by": callback.from_user.first_name,
+            "reason": "System upgrades in progress",
+            "eta": "1-2 hours"
         }},
         upsert=True
     )
-    await callback.answer("🔴 LOCKDOWN ENGAGED!", show_alert=True)
+    
+    # Show confirmation
+    await callback.answer("🔴 MSANODE AGENT IS NOW OFFLINE!", show_alert=True)
     await lockdown_menu(callback)
 
 @dp.callback_query(F.data == "lockdown_disable")
 async def disable_lockdown(callback: types.CallbackQuery):
     if callback.from_user.id != OWNER_ID:
-        await callback.answer("🚫 Only owner can disable lockdown!", show_alert=True)
+        await callback.answer("🚫 Only owner can bring bot online!", show_alert=True)
         return
     
     col_settings.update_one(
         {"setting": "maintenance"},
         {"$set": {
             "value": False,
-            "disabled_at": datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S'),
-            "disabled_by": callback.from_user.id
+            "disabled_at": datetime.now(IST).strftime('%d-%m-%Y %I:%M %p IST'),
+            "disabled_by": callback.from_user.first_name
         }},
         upsert=True
     )
-    await callback.answer("🟢 Lockdown Disabled!", show_alert=True)
+    
+    await callback.answer("🟢 MSANODE AGENT IS NOW ONLINE!", show_alert=True)
     await lockdown_menu(callback)
 
 @dp.callback_query(F.data == "lockdown_status")
