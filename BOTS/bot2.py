@@ -4,7 +4,12 @@ import os
 import csv
 import time
 import threading
+import sys
 from aiohttp import web
+
+# Fix Unicode encoding for Windows console (Critical for emojis)
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # Load environment variables
 import functools
@@ -40,9 +45,9 @@ except (TypeError, ValueError):
 if not all([MANAGER_BOT_TOKEN, MAIN_BOT_TOKEN, MONGO_URI, OWNER_ID]):
     print("❌ CRITICAL ERROR: Environment variables missing in Render! Check OWNER_ID, Tokens, and URI.")
 
-# Channel IDs
-BAN_CHANNEL_ID = -1003575487367  # Ban notifications channel
-APPEAL_CHANNEL_ID = int(os.getenv("APPEAL_CHANNEL_ID", -1003354981499))  # Ban appeal channel
+# Channel IDs - Must be set in environment variables (no defaults for security)
+BAN_CHANNEL_ID = int(os.getenv("BAN_CHANNEL_ID", 0))  # Ban notifications channel
+APPEAL_CHANNEL_ID = int(os.getenv("APPEAL_CHANNEL_ID", 0))  # Ban appeal channel
 
 # Timezone for Intelligence Reports
 IST = pytz.timezone('Asia/Kolkata')
@@ -223,6 +228,79 @@ async def initialize_database():
     except Exception as e:
         print(f"❌ Database Connection Failed: {e}")
         return False
+
+# ================= ENTERPRISE FEATURES =================
+START_TIME_BOT2 = time.time()
+DAILY_STATS_BOT2 = {"users_processed": 0, "broadcasts_sent": 0, "bans": 0, "errors": 0, "reports_generated": 0}
+
+async def notify_error_bot2(error_type, details):
+    """Send instant error notification to owner"""
+    try:
+        alert = (
+            f"🚨 <b>BOT 2 INSTANT ALERT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <b>Type:</b> {error_type}\n"
+            f"📝 <b>Details:</b> {str(details)[:500]}\n"
+            f"🕐 <b>Time:</b> {datetime.now(IST).strftime('%H:%M:%S')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await manager_bot.send_message(OWNER_ID, alert, parse_mode="HTML")
+        logging.info(f"🚨 Error Alert Sent: {error_type}")
+    except Exception as e:
+        logging.error(f"Failed to send error alert: {e}")
+
+async def send_daily_summary_bot2():
+    """Send comprehensive daily summary at 8:40 AM"""
+    global DAILY_STATS_BOT2
+    try:
+        # Get comprehensive stats
+        user_count = await asyncio.to_thread(col_users.count_documents, {})
+        banned_count = await asyncio.to_thread(col_banned.count_documents, {})
+        broadcast_logs = await asyncio.to_thread(col_broadcast_logs.count_documents, {})
+        
+        # Calculate uptime
+        uptime_secs = int(time.time() - START_TIME_BOT2)
+        uptime_hours = uptime_secs // 3600
+        uptime_mins = (uptime_secs % 3600) // 60
+        
+        report = (
+            f"📊 <b>BOT 2 - DAILY OPERATIONS SUMMARY</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 Date: {datetime.now(IST).strftime('%Y-%m-%d')} | 8:40 AM\n\n"
+            f"👥 <b>Processed Users:</b> {DAILY_STATS_BOT2['users_processed']}\n"
+            f"📢 <b>Broadcasts Sent:</b> {DAILY_STATS_BOT2['broadcasts_sent']}\n"
+            f"⛔ <b>New Bans:</b> {DAILY_STATS_BOT2['bans']}\n"
+            f"❌ <b>Errors:</b> {DAILY_STATS_BOT2['errors']}\n\n"
+            f"🌍 <b>Total Users:</b> {user_count}\n"
+            f"🚫 <b>Total Banned:</b> {banned_count}\n"
+            f"📜 <b>Broadcast History:</b> {broadcast_logs}\n"
+            f"⏱ <b>Uptime:</b> {uptime_hours}h {uptime_mins}m\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 <i>Bot 2 - Manager Core</i>"
+        )
+        await manager_bot.send_message(OWNER_ID, report, parse_mode="HTML")
+        
+        # Reset daily stats
+        DAILY_STATS_BOT2 = {"users_processed": 0, "broadcasts_sent": 0, "bans": 0, "errors": 0, "reports_generated": 0}
+        
+    except Exception as e:
+        await notify_error_bot2("Daily Report Failed", str(e))
+
+async def daily_summary_scheduler_bot2():
+    """Background task for daily summary at 8:40 AM"""
+    while True:
+        try:
+            now = datetime.now(IST)
+            target = now.replace(hour=8, minute=40, second=0, microsecond=0)
+            if now >= target:
+                target = target + timedelta(days=1)
+            
+            wait_seconds = (target - now).total_seconds()
+            await asyncio.sleep(wait_seconds)
+            await send_daily_summary_bot2()
+        except Exception as e:
+            await notify_error_bot2("Scheduler Error", f"Daily summary scheduler crashed: {e}")
+            await asyncio.sleep(3600)
 
 # ==========================================
 # 🏢 ENTERPRISE CIRCUIT BREAKER PATTERN
@@ -671,9 +749,10 @@ async def supervisor_routine():
             last_health_check = now_time
 
         if now_time - LAST_INVENTORY_CHECK >= 3600: 
-            count = col_active.count_documents({})
-            if count < 5:
-                await send_alert(f"📉 **LOW VAULT INVENTORY**")
+            # Inventory alert disabled by user request
+            # count = col_active.count_documents({})
+            # if count < 5:
+            #     await send_alert(f"📉 **LOW VAULT INVENTORY**")
             LAST_INVENTORY_CHECK = now_time
 
         current_date_str = now_ist.strftime("%Y-%m-%d")
@@ -7226,6 +7305,7 @@ if __name__ == "__main__":
                 asyncio.create_task(scheduled_health_check()) 
                 asyncio.create_task(scheduled_pruning_cleanup())
                 asyncio.create_task(enterprise_health_check())  # 🏢 ENTERPRISE: Health monitoring
+                asyncio.create_task(daily_summary_scheduler_bot2()) # 📊 ENTERPRISE: Daily Stats
                 print("[OK] ENTERPRISE HEALTH MONITORING STARTED")
                 
                 # Start polling with proper timeout settings for Windows
