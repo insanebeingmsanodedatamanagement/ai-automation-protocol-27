@@ -25,6 +25,8 @@ sys.stdout.reconfigure(encoding='utf-8')
 START_TIME = time.time()
 
 
+
+
 # ==========================================
 # ⚡ SECURE CONFIGURATION
 # ==========================================
@@ -408,9 +410,10 @@ async def start_health_server():
         app.router.add_get('/', lambda r: web.Response(text="SINGULARITY_V5_ONLINE", status=200))
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', 10005)
+        port = int(os.environ.get("PORT", 10000))
+        site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        console_out("✅ PORT 10005 BOUND. RENDER SCAN PASSED.")
+        console_out(f"✅ PORT {port} BOUND. RENDER SCAN PASSED.")
     except Exception as e:
         console_out(f"❌ PORT BIND FAILED: {e}")
 
