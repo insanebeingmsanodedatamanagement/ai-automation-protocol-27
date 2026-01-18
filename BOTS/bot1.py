@@ -14,6 +14,7 @@ import pytz
 from datetime import datetime
 
 # Load environment variables from .env file
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject, ChatMemberUpdatedFilter, LEAVE_TRANSITION, JOIN_TRANSITION, Command, StateFilter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, ChatMemberUpdated
@@ -39,9 +40,10 @@ MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_LOG_CHANNEL = os.getenv("ADMIN_LOG_CHANNEL")
 REVIEW_LOG_CHANNEL = os.getenv("REVIEW_LOG_CHANNEL")
 SUPPORT_CHANNEL_ID = os.getenv("SUPPORT_CHANNEL_ID")
-BAN_CHANNEL_ID = -1003575487367  # Ban notifications channel (legacy)
-BAN_REPORT_CHANNEL_ID = int(os.getenv("BAN_REPORT_CHANNEL_ID", -1003575487367))  # New ban report channel
-APPEAL_CHANNEL_ID = int(os.getenv("APPEAL_CHANNEL_ID", -1003354981499))  # Ban appeal channel
+# Channel IDs - Must be set in environment variables (no defaults for security)
+BAN_CHANNEL_ID = int(os.getenv("BAN_CHANNEL_ID", 0))  # Ban notifications channel (legacy)
+BAN_REPORT_CHANNEL_ID = int(os.getenv("BAN_REPORT_CHANNEL_ID", 0))  # New ban report channel
+APPEAL_CHANNEL_ID = int(os.getenv("APPEAL_CHANNEL_ID", 0))  # Ban appeal channel
 
 try:
     OWNER_ID = int(os.getenv("OWNER_ID", 0))
@@ -55,11 +57,12 @@ BOT_USERNAME = os.getenv("BOT_USERNAME")
 YOUTUBE_LINK = os.getenv("YOUTUBE_LINK") 
 INSTAGRAM_LINK = os.getenv("INSTAGRAM_LINK") 
 
-if not BOT_TOKEN or not MONGO_URI or not OWNER_ID:
-    print("❌ CRITICAL ERROR: Environment variables missing!")
-    sys.exit(1)
-
 IST = pytz.timezone('Asia/Kolkata')
+
+# Validate required environment variables (after stdout is configured)
+if not BOT_TOKEN or not MONGO_URI or not OWNER_ID:
+    print("ERROR: Environment variables missing!")
+    sys.exit(1)
 
 # ==========================================
 # ⏱️ TIMING CONFIGURATION - EXACT VALUES
@@ -239,7 +242,7 @@ def run_health_server():
         app.router.add_get('/', handle_health)
         
         # Try to find an available port starting from 10000
-        port = int(os.environ.get("PORT", 10000))
+        port = int(os.environ.get("PORT", 10002))
         max_attempts = 10
         for attempt in range(max_attempts):
             try:
@@ -7972,7 +7975,7 @@ async def main():
     asyncio.create_task(enterprise_health_check())
     print("[OK] ENTERPRISE HEALTH MONITORING STARTED")
     
-    print(f"✅ MSANODE GATEWAY ONLINE - ENTERPRISE MODE (LAKHS-READY)")
+    print(f"[OK] MSANODE GATEWAY ONLINE - ENTERPRISE MODE (LAKHS-READY)")
     # Configure polling with proper timeout settings for Windows
     await dp.start_polling(
         bot,
@@ -7999,6 +8002,6 @@ if __name__ == "__main__":
             print("🛑 Bot stopped by user")
             break
         except Exception as e:
-            print(f"⚠️ Error (attempt {loop_count}): {e}")
+            print(f"[!] Error (attempt {loop_count}): {e}")
             time.sleep(5)  # Wait before retry
  
