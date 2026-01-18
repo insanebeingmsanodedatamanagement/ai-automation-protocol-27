@@ -24,6 +24,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 START_TIME = time.time()
 
+
 # ==========================================
 # ⚡ SECURE CONFIGURATION
 # ==========================================
@@ -2191,6 +2192,17 @@ async def main():
         console_out("📊 Daily Summary scheduled for 8:40 AM IST")
         
         scheduler.start()
+        
+        # Health Check Server for Render
+        app = web.Application()
+        app.router.add_get('/', lambda request: web.Response(text="Bot 5 Online"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = int(os.getenv('PORT', 10000))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        console_out(f"✅ Health Server running on port {port}")
+        
         await bot.send_message(OWNER_ID, f"💎 SINGULARITY v5.0 ONLINE\n🛡️ Gatekeeper: {'ON' if GATEKEEPER_ENABLED else 'OFF'}\n📊 Daily Summary: 8:40 AM")
         console_out("◈ SYSTEM FULLY ARMED. POLLING...")
         await dp.start_polling(bot)
