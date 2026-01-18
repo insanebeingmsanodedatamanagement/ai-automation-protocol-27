@@ -24,9 +24,6 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 START_TIME = time.time()
 
-
-
-
 # ==========================================
 # ⚡ SECURE CONFIGURATION
 # ==========================================
@@ -38,7 +35,9 @@ MONGO_URI = os.getenv("MONGO_URI")
 CHANNEL_ID = int(os.getenv("MAIN_CHANNEL_ID", 0))
 
 IST = pytz.timezone('Asia/Kolkata')
-client = genai.Client(api_key=GEMINI_KEY)
+IST = pytz.timezone('Asia/Kolkata')
+# client = genai.Client(api_key=GEMINI_KEY) # MOVED TO STARTUP
+client = None
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone=IST)
@@ -2155,9 +2154,12 @@ async def main():
                      else:
                          console_out("❌ CRITICAL: No API keys available!")
                  
-                 # Initialize client with first available key
+                 # Initialize client with first available key from DB
                  if API_KEY_POOL:
-                     GEMINI_KEY = API_KEY_POOL[0]
+                     client = genai.Client(api_key=API_KEY_POOL[0])
+                     console_out(f"✅ CLIENT INITIALIZED with Key #{CURRENT_API_INDEX + 1}")
+                 else:
+                     console_out("❌ CLIENT INIT FAILED: No keys in Database")
                      CURRENT_API_INDEX = 0
                      try: 
                          client = genai.Client(api_key=GEMINI_KEY)
