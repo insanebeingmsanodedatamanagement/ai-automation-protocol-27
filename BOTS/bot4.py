@@ -24,8 +24,7 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # Load environment variables from .env file
-from dotenv import load_dotenv
-load_dotenv()
+
 
 # ReportLab & Google Imports
 from reportlab.lib.pagesizes import letter
@@ -48,8 +47,11 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 if not BOT_TOKEN:
     print("❌ Bot 4 Error: BOT_4_TOKEN not found in Render Environment!")
-OWNER_ID = 6988593629 
-PARENT_FOLDER_ID = '1J0iGLcwjTTdQRQJ--A9s8D26a3-gN7IB'
+
+# Load from environment variables for security
+OWNER_ID = int(os.getenv("OWNER_ID", 0))
+PARENT_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")  # Google Drive folder ID for PDF storage
+
 CREDENTIALS_FILE = 'credentials.json'
 TOKEN_FILE = 'token.pickle'
 
@@ -90,7 +92,7 @@ def run_health_server():
     try:
         app = web.Application()
         app.router.add_get('/', handle_health)
-        port = int(os.environ.get("PORT", 10000))
+        port = int(os.environ.get("PORT", 10004))
         web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
         print(f"📡 Health Server Note: {e}")
@@ -153,23 +155,72 @@ async def hourly_pulse():
             await bot.send_message(OWNER_ID, "💓 **PULSE:** All systems ready, Master Sadiq.")
         except: connect_db()
 
+# ENTERPRISE: DAILY STATS TRACKING
+DAILY_STATS_BOT4 = {"pdfs_generated": 0, "pdfs_deleted": 0, "errors": 0, "links_retrieved": 0}
+
+# ENTERPRISE: INSTANT ERROR NOTIFICATION
+async def notify_error_bot4(error_type, details):
+    """Send instant error notification to owner"""
+    try:
+        alert = (
+            f"🚨 <b>BOT 4 INSTANT ALERT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <b>Type:</b> {error_type}\n"
+            f"📝 <b>Details:</b> {str(details)[:500]}\n"
+            f"🕐 <b>Time:</b> {datetime.now().strftime('%H:%M:%S')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await bot.send_message(OWNER_ID, alert, parse_mode="HTML")
+        logging.info(f"🚨 Error Alert Sent: {error_type}")
+    except Exception as e:
+        logging.error(f"Failed to send error alert: {e}")
+
 async def daily_briefing():
+    global DAILY_STATS_BOT4
     while True:
         now = datetime.now()
         target = now.replace(hour=8, minute=40, second=0, microsecond=0)
         if now >= target: target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
         try:
-            count = col_pdfs.count_documents({})
-            await bot.send_message(OWNER_ID, f"☀️ **8:40 AM REPORT**\n\nMaster Sadiq, the system is clean and operational. Current Library: `{count}` guides.")
-        except: pass
+            # Get comprehensive stats
+            pdf_count = col_pdfs.count_documents({})
+            trash_count = col_trash.count_documents({}) if col_trash else 0
+            
+            # Calculate uptime
+            uptime_secs = int(time.time() - START_TIME)
+            uptime_hours = uptime_secs // 3600
+            uptime_mins = (uptime_secs % 3600) // 60
+            
+            report = (
+                f"📊 <b>BOT 4 - DAILY OPERATIONS SUMMARY</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📅 Date: {now.strftime('%Y-%m-%d')} | 8:40 AM\n\n"
+                f"📄 <b>PDFs Generated:</b> {DAILY_STATS_BOT4['pdfs_generated']}\n"
+                f"🔗 <b>Links Retrieved:</b> {DAILY_STATS_BOT4['links_retrieved']}\n"
+                f"🗑 <b>PDFs Deleted:</b> {DAILY_STATS_BOT4['pdfs_deleted']}\n"
+                f"❌ <b>Errors:</b> {DAILY_STATS_BOT4['errors']}\n\n"
+                f"📂 <b>Library Total:</b> {pdf_count} guides\n"
+                f"♻️ <b>Recycle Bin:</b> {trash_count} items\n"
+                f"⏱ <b>Uptime:</b> {uptime_hours}h {uptime_mins}m\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💎 <i>Bot 4 - PDF Infrastructure</i>"
+            )
+            await bot.send_message(OWNER_ID, report, parse_mode="HTML")
+            
+            # Reset daily stats
+            DAILY_STATS_BOT4 = {"pdfs_generated": 0, "pdfs_deleted": 0, "errors": 0, "links_retrieved": 0}
+        except Exception as e:
+            await notify_error_bot4("Daily Report Failed", str(e))
 
 async def system_guardian():
     while True:
         try:
             db_client.server_info()
             get_drive_service()
-        except: connect_db()
+        except Exception as e:
+            await notify_error_bot4("System Guardian Alert", f"DB or Drive connection issue: {e}")
+            connect_db()
         await asyncio.sleep(1800)
 
 async def auto_janitor():
@@ -195,7 +246,8 @@ async def weekly_backup():
                 with open("backup.txt", "w") as f: f.write(content)
                 await bot.send_document(OWNER_ID, FSInputFile("backup.txt"), caption="🛡 **Master Backup for Master Sadiq.**")
                 os.remove("backup.txt")
-        except: pass
+        except Exception as e:
+            await notify_error_bot4("Weekly Backup Failed", str(e))
 
 # ==========================================
 # 🧠 PDF GENERATION - S19 STYLE
@@ -243,13 +295,22 @@ def draw_canvas_extras(canvas_obj, doc):
 def process_inline_formatting(text):
     """
     Process inline formatting markers:
+    - ****** link ****** -> CLICKABLE BLUE LINK
     - ***** text ***** -> DARK BLACK BOLD ALL CAPS
     - **** text **** -> BLUE BOLD ALL CAPS
     - ***text*** -> RED BOLD ALL CAPS
     - *text* -> DARK BLACK BOLD (no caps)
     - Normal text -> standard lowercase (no special formatting)
     """
-    # First, handle ***** text ***** (DARK BLACK BOLD ALL CAPS) - HIGHEST PRIORITY
+    # HIGHEST PRIORITY: Handle ****** link ****** (CLICKABLE LINKS)
+    def create_clickable_link(match):
+        url = match.group(1).strip()  # Extract the URL
+        # Make it a clickable blue link
+        return f'<a href="{url}" color="#1565C0"><u>{url}</u></a>'
+    
+    text = re.sub(r'\*\*\*\*\*\*([^*]+?)\*\*\*\*\*\*', create_clickable_link, text)
+    
+    # Then handle ***** text ***** (DARK BLACK BOLD ALL CAPS)
     def uppercase_black_5star(match):
         content = match.group(1).strip().upper()  # Strip spaces and uppercase
         return f'<font color="#000000"><b>{content}</b></font>'  # Dark black
@@ -882,6 +943,7 @@ async def merge_script(message: types.Message, state: FSMContext):
         asyncio.create_task(auto_finish(message.from_user.id, state))
 
 async def finalize_pdf(user_id, state):
+    global DAILY_STATS_BOT4
     data = await state.get_data()
     code, script = data.get('code'), data.get('raw_script', '').strip()
     if not script or not code: return
@@ -906,6 +968,9 @@ async def finalize_pdf(user_id, state):
             caption=f"✅ **READY**\nCode: `{code}`\n🔗 **Link:** {link}"
         )
         
+        # Track success
+        DAILY_STATS_BOT4["pdfs_generated"] += 1
+        
         await asyncio.sleep(2)
         if os.path.exists(filename):
             try:
@@ -920,6 +985,8 @@ async def finalize_pdf(user_id, state):
                 
     except Exception as e: 
         await bot.send_message(user_id, f"❌ Error: `{e}`")
+        await notify_error_bot4("PDF Generation Failed", f"Code: {code} | Error: {e}")
+        DAILY_STATS_BOT4["errors"] += 1
     
     await state.clear()
 
