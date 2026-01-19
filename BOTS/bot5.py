@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import asyncio, os, html, time, pytz, logging, random, io, psutil, re
+import asyncio, os, html, time, pytz, logging, random, io, psutil, re, threading
 from datetime import datetime, timedelta
 from aiohttp import web
 from google import genai
@@ -401,21 +401,21 @@ async def notify_error(error_type, details):
         console_out(f"❌ Failed to send error alert: {e}")
 
 # ==========================================
-# 📡 HARDCODED PORT BINDER (RENDER SHIELD)
+# 📡 RENDER PORT BINDER (THREAD-BASED)
 # ==========================================
-async def start_health_server():
-    """Immediately binds to port 10000 to satisfy Render's health check."""
+def run_health_server():
+    """Run health server in separate thread to ensure port binds even if bot crashes."""
     try:
         app = web.Application()
-        app.router.add_get('/', lambda r: web.Response(text="SINGULARITY_V5_ONLINE", status=200))
-        runner = web.AppRunner(app)
-        await runner.setup()
+        app.router.add_get('/', lambda request: web.Response(text="SINGULARITY_V5_ONLINE", status=200))
+        
         port = int(os.environ.get("PORT", 10000))
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        console_out(f"✅ PORT {port} BOUND. RENDER SCAN PASSED.")
+        print(f"[HEALTH] Starting health server on port {port}...")
+        
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False, print=None)
     except Exception as e:
-        console_out(f"❌ PORT BIND FAILED: {e}")
+        print(f"[HEALTH] Port bind failed: {e}")
+        # Silently fail - not critical for bot operation
 
 # ==========================================
 # ==========================================
@@ -2097,10 +2097,6 @@ async def manual_fire_confirm(cb: types.CallbackQuery):
 # ==========================================
 async def main():
     global API_USAGE_COUNT, CURRENT_MODEL_INDEX
-    # 1. Start Port FIRST
-    await start_health_server()
-    
-    # 2. Start Subsystems
     try:
         if col_system is not None:
              # Load Gatekeeper
@@ -2196,16 +2192,6 @@ async def main():
         
         scheduler.start()
         
-        # Health Check Server for Render
-        app = web.Application()
-        app.router.add_get('/', lambda request: web.Response(text="Bot 5 Online"))
-        runner = web.AppRunner(app)
-        await runner.setup()
-        port = int(os.getenv('PORT', 10000))
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        console_out(f"✅ Health Server running on port {port}")
-        
         await bot.send_message(OWNER_ID, f"💎 SINGULARITY v5.0 ONLINE\n🛡️ Gatekeeper: {'ON' if GATEKEEPER_ENABLED else 'OFF'}\n📊 Daily Summary: 8:40 AM")
         console_out("◈ SYSTEM FULLY ARMED. POLLING...")
         await dp.start_polling(bot)
@@ -2215,4 +2201,9 @@ async def main():
         while True: await asyncio.sleep(3600)
 
 if __name__ == "__main__":
+    # Start health server in separate thread BEFORE async main
+    threading.Thread(target=run_health_server, daemon=True).start()
+    print("[OK] Health server thread started")
+    
+    # Start bot
     asyncio.run(main())
