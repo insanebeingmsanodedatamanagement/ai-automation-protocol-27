@@ -26,6 +26,7 @@ except (AttributeError, OSError):
 # Network stability is handled by retry logic instead.
 
 START_TIME = time.time()
+
 # ==========================================
 # ⚡ SECURE CONFIGURATION
 # ==========================================
@@ -37,20 +38,38 @@ MONGO_URI = os.getenv("MONGO_URI")
 CHANNEL_ID = int(os.getenv("MAIN_CHANNEL_ID", 0))
 
 IST = pytz.timezone('Asia/Kolkata')
-
-# Initialize bot and dispatcher (matching bot2/bot4 pattern)
+# Initialize bot and dispatcher
 client = None
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone=IST)
 
-# Initialize database (matching bot2/bot4 pattern)
-db_client = pymongo.MongoClient(MONGO_URI) if MONGO_URI else None
-db = db_client["Singularity_V5_Final"] if db_client else None
-col_vault = db["vault"] if db else None
-col_system = db["system_stats"] if db else None
-col_history = db["history_log"] if db else None
-col_api = db["api_ledger"] if db else None
+# Database globals - initialized by connect_db() function
+db_client = None
+db = None
+col_vault = None
+col_system = None
+col_history = None
+col_api = None
+
+def connect_db():
+    """Connect to MongoDB with timeout - matching bot4 pattern"""
+    global db_client, db, col_vault, col_system, col_history, col_api
+    try:
+        db_client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        db = db_client["Singularity_V5_Final"]
+        col_vault = db["vault"]
+        col_system = db["system_stats"]
+        col_history = db["history_log"]
+        col_api = db["api_ledger"]
+        db_client.server_info()  # Test connection
+        print("✅ Database Connected")
+        return True
+    except Exception as e:
+        print(f"❌ DB Connect Error: {e}")
+        return False
+
+connect_db()
 
 # DATABASE CONFIG IDS
 DB_ID_MODELS = "bot5_models"
