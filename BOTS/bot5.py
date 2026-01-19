@@ -16,15 +16,16 @@ from apscheduler.triggers.cron import CronTrigger
 import pymongo
 import sys
 
-# Force UTF-8 stdout
-sys.stdout.reconfigure(encoding='utf-8')
+# Force UTF-8 stdout (Windows compatibility - skip on Linux)
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except (AttributeError, OSError):
+    pass  # Linux/Render doesn't need this
 
 # Note: WindowsSelectorEventLoopPolicy removed - deprecated in Python 3.16
 # Network stability is handled by retry logic instead.
 
 START_TIME = time.time()
-
-
 
 
 # ==========================================
