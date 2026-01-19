@@ -58,7 +58,6 @@ START_TIME = time.time()
 
 
 
-
 # ==========================================
 # ⚡ SECURE CONFIGURATION
 # ==========================================
@@ -413,10 +412,42 @@ def mark_as_fired(content):
     if len(FIRED_CONTENT_HASHES) > 100:
         FIRED_CONTENT_HASHES.pop()
 
+def persist_daily_stats():
+    """Persist current daily stats to database"""
+    if col_system is not None:
+        try:
+            col_system.update_one(
+                {"_id": "current_daily_stats"},
+                {"$set": DAILY_STATS},
+                upsert=True
+            )
+        except: pass
+
 # --- ENTERPRISE: DAILY SUMMARY REPORT ---
 async def send_daily_summary():
-    """Send daily stats report to owner at midnight"""
+    """Send daily stats report to owner at 8:40 AM IST every day"""
     global DAILY_STATS
+    
+    # Save stats to database before reset (override if exists to prevent duplicates)
+    if col_system is not None:
+        try:
+            col_system.update_one(
+                {"_id": f"daily_summary_{datetime.now(IST).strftime('%Y%m%d')}"},
+                {"$set": {
+                    "date": datetime.now(IST).strftime('%Y-%m-%d'),
+                    "breaches_fired": DAILY_STATS['breaches_fired'],
+                    "scheduled_fired": DAILY_STATS['scheduled_fired'],
+                    "duplicates_blocked": DAILY_STATS['duplicates_blocked'],
+                    "errors": DAILY_STATS['errors'],
+                    "prompts_used": PROMPT_INDEX,
+                    "api_usage": API_USAGE_COUNT,
+                    "timestamp": datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
+                }},
+                upsert=True
+            )
+            console_out("📊 Daily stats saved to database (override mode)")
+        except Exception as db_err:
+            console_out(f"[WARN] Failed to save daily stats: {db_err}")
     
     summary = (
         f"📊 <b>DAILY OPERATIONS SUMMARY</b>\n"
@@ -425,11 +456,11 @@ async def send_daily_summary():
         f"🔥 <b>Breaches Fired:</b> {DAILY_STATS['breaches_fired']}\n"
         f"⏰ <b>Scheduled Fires:</b> {DAILY_STATS['scheduled_fired']}\n"
         f"🚫 <b>Duplicates Blocked:</b> {DAILY_STATS['duplicates_blocked']}\n"
-        f"[ERROR] <b>Errors:</b> {DAILY_STATS['errors']}\n"
+        f"❌ <b>Errors:</b> {DAILY_STATS['errors']}\n"
         f"📋 <b>Prompts Used:</b> {PROMPT_INDEX}/{len(CLOUD_PROMPT_PACK)}\n"
         f"🔑 <b>API Usage:</b> {API_USAGE_COUNT}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"[SYSTEM] <i>Bot 5 - SINGULARITY V5.0</i>"
+        f"💎 <i>Bot 5 - SINGULARITY V5.0</i>"
     )
     
     try:
@@ -438,8 +469,21 @@ async def send_daily_summary():
     except Exception as e:
         console_out(f"[ERROR] Daily Summary Error: {e}")
     
-    # Reset daily stats
-    DAILY_STATS = {"breaches_fired": 0, "scheduled_fired": 0, "duplicates_blocked": 0, "errors": 0}
+    # CRITICAL FIX: Properly reset global variable
+    DAILY_STATS["breaches_fired"] = 0
+    DAILY_STATS["scheduled_fired"] = 0
+    DAILY_STATS["duplicates_blocked"] = 0
+    DAILY_STATS["errors"] = 0
+    
+    # Persist reset stats to database
+    if col_system is not None:
+        try:
+            col_system.update_one(
+                {"_id": "current_daily_stats"},
+                {"$set": DAILY_STATS},
+                upsert=True
+            )
+        except: pass
 
 # --- ENTERPRISE: INSTANT ERROR NOTIFICATIONS ---
 async def notify_error(error_type, details):
@@ -485,12 +529,12 @@ def get_system_prompt():
     
     OUTPUT FORMAT (MOBILE-FRIENDLY HTML):
     
-    [START] <b>[POWERFUL COMPELLING TITLE]</b>
+    🚀 <b>[POWERFUL COMPELLING TITLE]</b>
     
     ✨ <i>[2-3 sentence psychological hook. Why the masses miss this. What transformation awaits the chosen few.]</i>
     
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    [SYSTEM] <b>UNLOCKED EXCLUSIVELY FOR MSA NODE VAULT MEMBERS</b>
+    💎 <b>UNLOCKED EXCLUSIVELY FOR MSA NODE VAULT MEMBERS</b>
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     🥇 <b>[Resource Name]</b>
@@ -525,7 +569,7 @@ def get_system_prompt():
     
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
-    [SYSTEM] <b>THE ARCHITECT'S WISDOM</b>
+    💎 <b>THE ARCHITECT'S WISDOM</b>
     <i>"The gap between where you are and where you want to be is bridged by one decision: START. The elite don't wait for permission. They execute. Pick ONE resource above. Complete it in 7 days. Your future self is watching."</i>
     
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -944,6 +988,7 @@ async def fire_exec(cb: types.CallbackQuery, state: FSMContext):
     if "Error" in data.get('c_type', "") or "CRITICAL" in data.get('c_type', ""):
         await cb.answer("[ERROR] BLOCKED: Content contains errors.", show_alert=True)
         DAILY_STATS["errors"] += 1
+        persist_daily_stats()
         return
     
     # FIX HTML TAGS to prevent Telegram parsing errors
@@ -954,6 +999,7 @@ async def fire_exec(cb: types.CallbackQuery, state: FSMContext):
     if is_duplicate(public_content):
         await cb.answer("🚫 BLOCKED: Duplicate content detected. Generate new breach.", show_alert=True)
         DAILY_STATS["duplicates_blocked"] += 1
+        persist_daily_stats()
         console_out("🚫 Duplicate content blocked.")
         return
 
@@ -964,6 +1010,7 @@ async def fire_exec(cb: types.CallbackQuery, state: FSMContext):
         await cb.message.edit_text(f"[ERROR] Failed to post to channel: {e}")
         await notify_error("Channel Post Failed", str(e))
         DAILY_STATS["errors"] += 1
+        persist_daily_stats()
         return
     
     # 2. Forward PUBLIC content (NO ID) to Vault
@@ -976,6 +1023,7 @@ async def fire_exec(cb: types.CallbackQuery, state: FSMContext):
     # Mark as fired for duplicate detection
     mark_as_fired(public_content)
     DAILY_STATS["breaches_fired"] += 1
+    persist_daily_stats()
     
     await cb.message.edit_text("[START] DEPLOYED TO CHANNEL & VAULT.\n(Breach ID visible only to you)")
     await state.clear()
@@ -1010,37 +1058,147 @@ async def t60_preflight(job_id, fire_time):
     await bot.send_message(OWNER_ID, f"[WAIT] T-60 REMINDER: {job_id}\nStatus: {status_icon}{cap_warning}\nTarget: {fire_time}\n\n{admin_content}", reply_markup=kb, parse_mode=ParseMode.HTML)
 
 async def t0_execution(job_id):
+    """Auto-fire scheduled breach at T-0. CRITICAL: Won't fire if generation failed."""
     global DAILY_STATS
-    # CRITICAL FIX: If T-60 didn't run, generate proper content
-    if job_id not in PENDING_FIRE:
-        console_out(f"⚡ IMMEDIATE FIRE: {job_id}")
-        public_content, admin_content, c_type = await generate_content(get_next_prompt())
-        PENDING_FIRE[job_id] = {"public": public_content, "admin": admin_content, "fired": False, "type": c_type}
-
-    # SAFETY CHECK FOR AUTO-FIRE
-    job_data = PENDING_FIRE[job_id]
-    if "Error" in job_data.get("type", "") or "CRITICAL" in job_data.get("type", ""):
-        await bot.send_message(OWNER_ID, f"[ERROR] <b>AUTO-FIRE ABORTED: {job_id}</b>\nReason: Content Error/Limit Reached.\n\n{job_data['admin']}", parse_mode=ParseMode.HTML)
-        await notify_error("Scheduled Fire Failed", f"Job {job_id} aborted due to content error.")
-        console_out(f"🛑 FIRE ABORTED: {job_id} (Error Detected)")
-        DAILY_STATS["errors"] += 1
-    elif is_duplicate(job_data["public"]):
-        # ENTERPRISE: DUPLICATE DETECTION FOR SCHEDULED FIRES
-        await bot.send_message(OWNER_ID, f"🚫 <b>AUTO-FIRE BLOCKED: {job_id}</b>\nReason: Duplicate content detected.", parse_mode=ParseMode.HTML)
-        console_out(f"🚫 Scheduled fire blocked: Duplicate content")
-        DAILY_STATS["duplicates_blocked"] += 1
-    elif not job_data["fired"]:
-        # Send PUBLIC content (NO ID) to both channels
-        await bot.send_message(CHANNEL_ID, job_data["public"], parse_mode=ParseMode.HTML)
-        try:
-            await bot.send_message(DATA_CHANNEL_ID, job_data["public"], parse_mode=ParseMode.HTML)
-        except: pass
-        mark_as_fired(job_data["public"])
-        PENDING_FIRE[job_id]["fired"] = True
-        DAILY_STATS["scheduled_fired"] += 1
-        console_out(f"[START] AUTO-EXECUTED: {job_id} (ID hidden in public)")
     
-    if job_id in PENDING_FIRE: del PENDING_FIRE[job_id]
+    try:
+        # CRITICAL FIX: If T-60 didn't run, generate proper content
+        if job_id not in PENDING_FIRE:
+            console_out(f"⚡ IMMEDIATE FIRE: {job_id} (T-60 skipped, generating now...)")
+            try:
+                public_content, admin_content, c_type = await generate_content(get_next_prompt())
+                PENDING_FIRE[job_id] = {"public": public_content, "admin": admin_content, "fired": False, "type": c_type}
+            except Exception as gen_err:
+                console_out(f"💥 GENERATION FAILED: {job_id} - {gen_err}")
+                await bot.send_message(
+                    OWNER_ID,
+                    f"❌ <b>AUTO-FIRE ABORTED: {job_id}</b>\n"
+                    f"Reason: Generation completely failed.\n"
+                    f"Error: {str(gen_err)[:200]}",
+                    parse_mode=ParseMode.HTML
+                )
+                await notify_error("Scheduled Fire Failed", f"Job {job_id} - Generation error: {gen_err}")
+                DAILY_STATS["errors"] += 1
+                persist_daily_stats()
+                return  # CRITICAL: Abort entire operation
+    
+        # COMPREHENSIVE SAFETY CHECKS
+        job_data = PENDING_FIRE.get(job_id)
+        
+        # Check 1: Job exists
+        if not job_data:
+            console_out(f"🛑 ABORT: {job_id} - No data found")
+            await bot.send_message(OWNER_ID, f"❌ AUTO-FIRE ABORTED: {job_id}\nReason: No content data.", parse_mode=ParseMode.HTML)
+            DAILY_STATS["errors"] += 1
+            persist_daily_stats()
+            return
+        
+        # Check 2: Error in content type
+        if "Error" in job_data.get("type", "") or "CRITICAL" in job_data.get("type", ""):
+            console_out(f"🛑 FIRE ABORTED: {job_id} (Error Detected)")
+            await bot.send_message(
+                OWNER_ID,
+                f"❌ <b>AUTO-FIRE ABORTED: {job_id}</b>\n"
+                f"Reason: Content Error/API Limit Reached.\n\n"
+                f"{job_data.get('admin', 'No content')[:500]}",
+                parse_mode=ParseMode.HTML
+            )
+            await notify_error("Scheduled Fire Failed", f"Job {job_id} aborted due to content error.")
+            DAILY_STATS["errors"] += 1
+            persist_daily_stats()
+            if job_id in PENDING_FIRE: del PENDING_FIRE[job_id]
+            return  # CRITICAL: Don't fire
+        
+        # Check 3: Empty content
+        public_content = job_data.get("public", "").strip()
+        if not public_content or len(public_content) < 50:
+            console_out(f"🛑 ABORT: {job_id} - Content too short or empty")
+            await bot.send_message(
+                OWNER_ID,
+                f"❌ AUTO-FIRE ABORTED: {job_id}\nReason: Generated content is empty or too short.",
+                parse_mode=ParseMode.HTML
+            )
+            DAILY_STATS["errors"] += 1
+            persist_daily_stats()
+            if job_id in PENDING_FIRE: del PENDING_FIRE[job_id]
+            return
+        
+        # Check 4: Duplicate detection
+        if is_duplicate(public_content):
+            console_out(f"🚫 Scheduled fire blocked: Duplicate content")
+            await bot.send_message(
+                OWNER_ID,
+                f"🚫 <b>AUTO-FIRE BLOCKED: {job_id}</b>\nReason: Duplicate content detected.",
+                parse_mode=ParseMode.HTML
+            )
+            DAILY_STATS["duplicates_blocked"] += 1
+            persist_daily_stats()
+            if job_id in PENDING_FIRE: del PENDING_FIRE[job_id]
+            return
+        
+        # Check 5: Already fired
+        if job_data.get("fired", False):
+            console_out(f"⚠️ {job_id} already fired, skipping.")
+            if job_id in PENDING_FIRE: del PENDING_FIRE[job_id]
+            return
+        
+        # ALL CHECKS PASSED - FIRE!
+        try:
+            # Send to main channel
+            await bot.send_message(CHANNEL_ID, public_content, parse_mode=ParseMode.HTML)
+            console_out(f"✅ Posted to MAIN channel: {job_id}")
+            
+            # Send to vault channel
+            try:
+                await bot.send_message(DATA_CHANNEL_ID, public_content, parse_mode=ParseMode.HTML)
+                console_out(f"✅ Posted to VAULT channel: {job_id}")
+            except Exception as vault_err:
+                console_out(f"⚠️ Vault posting failed: {vault_err}")
+            
+            # Mark as fired
+            mark_as_fired(public_content)
+            PENDING_FIRE[job_id]["fired"] = True
+            DAILY_STATS["scheduled_fired"] += 1
+            persist_daily_stats()
+            
+            # Notify owner of success
+            await bot.send_message(
+                OWNER_ID,
+                f"✅ <b>AUTO-FIRE SUCCESS: {job_id}</b>\n"
+                f"Time: {datetime.now(IST).strftime('%I:%M:%S %p')}\n"
+                f"Posted to both channels.",
+                parse_mode=ParseMode.HTML
+            )
+            console_out(f"🔥 AUTO-EXECUTED: {job_id} (ID hidden in public)")
+            
+        except Exception as post_err:
+            console_out(f"💥 POSTING FAILED: {job_id} - {post_err}")
+            await bot.send_message(
+                OWNER_ID,
+                f"❌ <b>POSTING FAILED: {job_id}</b>\n"
+                f"Error: {str(post_err)[:200]}",
+                parse_mode=ParseMode.HTML
+            )
+            await notify_error("Auto-Fire Posting Failed", f"Job {job_id}: {post_err}")
+            DAILY_STATS["errors"] += 1
+            persist_daily_stats()
+        
+    except Exception as e:
+        console_out(f"💥 CRITICAL ERROR in t0_execution: {e}")
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"💥 <b>CRITICAL ERROR: {job_id}</b>\n{str(e)[:200]}",
+                parse_mode=ParseMode.HTML
+            )
+        except: pass
+        DAILY_STATS["errors"] += 1
+        persist_daily_stats()
+    
+    finally:
+        # Always cleanup
+        if job_id in PENDING_FIRE:
+            del PENDING_FIRE[job_id]
 
 @dp.message(F.text == "🗓 SCHEDULE")
 async def sched_start(message: types.Message, state: FSMContext):
@@ -2221,11 +2379,23 @@ async def main():
                  else:
                      console_out(f"ℹ️ No saved model index, using default: {MODEL_POOL[CURRENT_MODEL_INDEX] if MODEL_POOL else 'NONE'}")
                  
+        # Load API usage stats from database
         if col_api is not None:
             ledger = col_api.find_one({"_id": "global_ledger"})
             if ledger:
                 API_USAGE_COUNT = ledger.get("usage", 0)
                 TOTAL_TOKENS = ledger.get("tokens", 0)
+                console_out(f"📊 API Stats loaded: {API_USAGE_COUNT} requests, {TOTAL_TOKENS} tokens")
+        
+        # Load current daily stats from database (in case of restart mid-day)
+        if col_system is not None:
+            current_stats = col_system.find_one({"_id": "current_daily_stats"})
+            if current_stats:
+                DAILY_STATS["breaches_fired"] = current_stats.get("breaches_fired", 0)
+                DAILY_STATS["scheduled_fired"] = current_stats.get("scheduled_fired", 0)
+                DAILY_STATS["duplicates_blocked"] = current_stats.get("duplicates_blocked", 0)
+                DAILY_STATS["errors"] = current_stats.get("errors", 0)
+                console_out(f"📊 Daily stats loaded: Breaches={DAILY_STATS['breaches_fired']}, Scheduled={DAILY_STATS['scheduled_fired']}, Errors={DAILY_STATS['errors']}")
         
         # ENTERPRISE: Daily Summary Report at 8:40 AM IST
         scheduler.add_job(send_daily_summary, 'cron', hour=8, minute=40, timezone=IST, id="daily_summary", replace_existing=True)
