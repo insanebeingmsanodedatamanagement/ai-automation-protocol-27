@@ -26,8 +26,6 @@ except (AttributeError, OSError):
 # Network stability is handled by retry logic instead.
 
 START_TIME = time.time()
-
-
 # ==========================================
 # ⚡ SECURE CONFIGURATION
 # ==========================================
@@ -40,18 +38,19 @@ CHANNEL_ID = int(os.getenv("MAIN_CHANNEL_ID", 0))
 
 IST = pytz.timezone('Asia/Kolkata')
 
-# CRITICAL: Initialize as None to prevent import-time crashes
-# These will be initialized inside main() after health server starts
+# Initialize bot and dispatcher (matching bot2/bot4 pattern)
 client = None
-bot = None
-dp = None
-scheduler = None
-db_client = None
-db = None
-col_vault = None
-col_system = None
-col_history = None
-col_api = None
+bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+dp = Dispatcher(storage=MemoryStorage())
+scheduler = AsyncIOScheduler(timezone=IST)
+
+# Initialize database (matching bot2/bot4 pattern)
+db_client = pymongo.MongoClient(MONGO_URI) if MONGO_URI else None
+db = db_client["Singularity_V5_Final"] if db_client else None
+col_vault = db["vault"] if db else None
+col_system = db["system_stats"] if db else None
+col_history = db["history_log"] if db else None
+col_api = db["api_ledger"] if db else None
 
 # DATABASE CONFIG IDS
 DB_ID_MODELS = "bot5_models"
@@ -404,18 +403,13 @@ async def notify_error(error_type, details):
 # 📡 RENDER PORT BINDER (THREAD-BASED)
 # ==========================================
 def run_health_server():
-    """Run health server in separate thread to ensure port binds even if bot crashes."""
     try:
         app = web.Application()
-        app.router.add_get('/', lambda request: web.Response(text="SINGULARITY_V5_ONLINE", status=200))
-        
+        app.router.add_get('/', lambda request: web.Response(text="SINGULARITY_V5_ONLINE"))
         port = int(os.environ.get("PORT", 10000))
-        print(f"[HEALTH] Starting health server on port {port}...")
-        
-        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False, print=None)
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
     except Exception as e:
-        print(f"[HEALTH] Port bind failed: {e}")
-        # Silently fail - not critical for bot operation
+        print(f"📡 Health Server Note: {e}")
 
 # ==========================================
 # ==========================================
@@ -2096,32 +2090,7 @@ async def manual_fire_confirm(cb: types.CallbackQuery):
 # 🚀 SUPREME BOOTLOADER
 # ==========================================
 async def main():
-    global API_USAGE_COUNT, CURRENT_MODEL_INDEX, bot, dp, scheduler, db_client, db, col_vault, col_system, col_history, col_api
-    
-    # Initialize Bot and Database (deferred from module import)
-    print("[INIT] Initializing Bot and Database...", flush=True)
-    try:
-        if not BOT_TOKEN:
-            raise ValueError("BOT_5_TOKEN environment variable not set")
-        if not MONGO_URI:
-            raise ValueError("MONGO_URI environment variable not set")
-        
-        bot = Bot(token=BOT_TOKEN)
-        dp = Dispatcher(storage=MemoryStorage())
-        scheduler = AsyncIOScheduler(timezone=IST)
-        
-        db_client = pymongo.MongoClient(MONGO_URI)
-        db = db_client["Singularity_V5_Final"]
-        col_vault = db["vault"]
-        col_system = db["system_stats"]
-        col_history = db["history_log"]
-        col_api = db["api_ledger"]
-        
-        print("[OK] Bot and Database initialized successfully", flush=True)
-    except Exception as init_error:
-        print(f"[CRITICAL] Initialization failed: {init_error}", flush=True)
-        raise
-    
+    global API_USAGE_COUNT, CURRENT_MODEL_INDEX
     try:
         if col_system is not None:
              # Load Gatekeeper
@@ -2226,25 +2195,11 @@ async def main():
         while True: await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    import sys
+    print("🚀 STARTING SINGULARITY V5")
     
-    # Start health server in separate thread BEFORE async main
     threading.Thread(target=run_health_server, daemon=True).start()
-    print("[OK] Health server thread started", flush=True)
     
-    # Give health server time to bind port
-    time.sleep(2)
-    print("[OK] Starting bot initialization...", flush=True)
-    
-    # Start bot with error handling
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        print("[OK] Bot stopped by user")
-        sys.exit(0)
-    except Exception as e:
-        print(f"[ERROR] Bot crashed: {e}", flush=True)
-        # Keep process alive for Render health checks
-        print("[OK] Keeping health server alive...", flush=True)
-        while True:
-            time.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        print("◈ Bot 5 Shutdown.")
