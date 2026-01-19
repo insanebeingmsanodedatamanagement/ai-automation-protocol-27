@@ -38,20 +38,19 @@ MONGO_URI = os.getenv("MONGO_URI")
 CHANNEL_ID = int(os.getenv("MAIN_CHANNEL_ID", 0))
 
 IST = pytz.timezone('Asia/Kolkata')
-IST = pytz.timezone('Asia/Kolkata')
-# client = genai.Client(api_key=GEMINI_KEY) # MOVED TO STARTUP
-client = None
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-scheduler = AsyncIOScheduler(timezone=IST)
 
-db_client = pymongo.MongoClient(MONGO_URI)
-db = db_client["Singularity_V5_Final"]
-col_vault = db["vault"]
-col_system = db["system_stats"]
-col_history = db["history_log"]
-col_api = db["api_ledger"]
-col_api = db["api_ledger"]
+# CRITICAL: Initialize as None to prevent import-time crashes
+# These will be initialized inside main() after health server starts
+client = None
+bot = None
+dp = None
+scheduler = None
+db_client = None
+db = None
+col_vault = None
+col_system = None
+col_history = None
+col_api = None
 
 # DATABASE CONFIG IDS
 DB_ID_MODELS = "bot5_models"
@@ -2096,7 +2095,32 @@ async def manual_fire_confirm(cb: types.CallbackQuery):
 # 🚀 SUPREME BOOTLOADER
 # ==========================================
 async def main():
-    global API_USAGE_COUNT, CURRENT_MODEL_INDEX
+    global API_USAGE_COUNT, CURRENT_MODEL_INDEX, bot, dp, scheduler, db_client, db, col_vault, col_system, col_history, col_api
+    
+    # Initialize Bot and Database (deferred from module import)
+    print("[INIT] Initializing Bot and Database...", flush=True)
+    try:
+        if not BOT_TOKEN:
+            raise ValueError("BOT_5_TOKEN environment variable not set")
+        if not MONGO_URI:
+            raise ValueError("MONGO_URI environment variable not set")
+        
+        bot = Bot(token=BOT_TOKEN)
+        dp = Dispatcher(storage=MemoryStorage())
+        scheduler = AsyncIOScheduler(timezone=IST)
+        
+        db_client = pymongo.MongoClient(MONGO_URI)
+        db = db_client["Singularity_V5_Final"]
+        col_vault = db["vault"]
+        col_system = db["system_stats"]
+        col_history = db["history_log"]
+        col_api = db["api_ledger"]
+        
+        print("[OK] Bot and Database initialized successfully", flush=True)
+    except Exception as init_error:
+        print(f"[CRITICAL] Initialization failed: {init_error}", flush=True)
+        raise
+    
     try:
         if col_system is not None:
              # Load Gatekeeper
@@ -2201,9 +2225,25 @@ async def main():
         while True: await asyncio.sleep(3600)
 
 if __name__ == "__main__":
+    import sys
+    
     # Start health server in separate thread BEFORE async main
     threading.Thread(target=run_health_server, daemon=True).start()
-    print("[OK] Health server thread started")
+    print("[OK] Health server thread started", flush=True)
     
-    # Start bot
-    asyncio.run(main())
+    # Give health server time to bind port
+    time.sleep(2)
+    print("[OK] Starting bot initialization...", flush=True)
+    
+    # Start bot with error handling
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("[OK] Bot stopped by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"[ERROR] Bot crashed: {e}", flush=True)
+        # Keep process alive for Render health checks
+        print("[OK] Keeping health server alive...", flush=True)
+        while True:
+            time.sleep(3600)
