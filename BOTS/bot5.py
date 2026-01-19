@@ -1,7 +1,20 @@
 # -*- coding: utf-8 -*-
-import asyncio, os, html, time, pytz, logging, random, io, psutil, re, threading
-from datetime import datetime, timedelta
+import os, threading
 from aiohttp import web
+
+# Simple health server
+def _health():
+    app = web.Application()
+    app.router.add_get('/', lambda r: web.Response(text="OK"))
+    web.run_app(app, host='0.0.0.0', port=int(os.environ.get("PORT", 10000)), handle_signals=False)
+
+threading.Thread(target=_health, daemon=True).start()
+
+# ==============================================================
+# NOW IMPORT EVERYTHING ELSE (these imports may block/take time)
+# ==============================================================
+import asyncio, html, time, pytz, logging, random, io, psutil, re
+from datetime import datetime, timedelta
 from google import genai
 from google.genai import types as ai_types
 from aiogram import Bot, Dispatcher, types, F
@@ -418,19 +431,7 @@ async def notify_error(error_type, details):
     except Exception as e:
         console_out(f"❌ Failed to send error alert: {e}")
 
-# ==========================================
-# 📡 RENDER PORT BINDER (THREAD-BASED)
-# ==========================================
-def run_health_server():
-    try:
-        app = web.Application()
-        app.router.add_get('/', lambda request: web.Response(text="SINGULARITY_V5_ONLINE"))
-        port = int(os.environ.get("PORT", 10000))
-        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
-    except Exception as e:
-        print(f"📡 Health Server Note: {e}")
 
-# ==========================================
 # ==========================================
 # 📊 GLOBAL METRICS & SPECS
 # ==========================================
@@ -2214,10 +2215,8 @@ async def main():
         while True: await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    print("🚀 STARTING SINGULARITY V5")
-    
-    threading.Thread(target=run_health_server, daemon=True).start()
-    
+    # Health server already started at top of file
+    print("🚀 STARTING SINGULARITY V5 MAIN")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
