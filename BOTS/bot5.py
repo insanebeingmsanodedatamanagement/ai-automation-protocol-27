@@ -1,6 +1,17 @@
 # -*- coding: utf-8 -*-
-# BULLETPROOF HEALTH SERVER - Runs in main event loop (no threading)
-import os
+import os, threading
+from aiohttp import web
+
+# HEALTH SERVER (Copied from working BOT 4 pattern)
+def run_health_server():
+    """Synchronous health server that runs in a separate thread"""
+    try:
+        app = web.Application()
+        app.router.add_get('/', lambda r: web.Response(text="BOT 5 SINGULARITY V5 ACTIVE"))
+        port = int(os.environ.get("PORT", 10000))
+        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
+    except Exception as e:
+        print(f"📡 Health Server Error: {e}")
 
 # ==============================================================
 # NOW IMPORT EVERYTHING ELSE (these imports may block/take time)
@@ -31,6 +42,8 @@ except (AttributeError, OSError):
 # Network stability is handled by retry logic instead.
 
 START_TIME = time.time()
+
+
 
 
 # ==========================================
@@ -2213,54 +2226,13 @@ async def main():
         while True: 
             await asyncio.sleep(3600)
 
-async def run_health_server():
-    """Bulletproof health server that never dies"""
-    from aiohttp import web
-    
-    async def health_check(request):
-        return web.Response(text="OK")
-    
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    
-    try:
-        await site.start()
-        print(f"✅ Health server running on port {port}")
-        # Keep server running forever
-        while True:
-            await asyncio.sleep(3600)
-    except Exception as e:
-        print(f"❌ Health server error: {e}")
-        # Even if server fails, keep process alive
-        while True:
-            await asyncio.sleep(3600)
-
-async def main_combined():
-    """Run health server and bot together in the same event loop"""
-    # Start health server as background task
-    health_task = asyncio.create_task(run_health_server())
-    
-    # Small delay to ensure health server binds first
-    await asyncio.sleep(2)
-    
-    # Start bot (non-blocking if it fails)
-    try:
-        await main()
-    except Exception as e:
-        print(f"⚠️ Bot failed to start: {e}")
-        # Keep health server alive even if bot crashes
-        await health_task
-
 if __name__ == "__main__":
-    print("🚀 STARTING SINGULARITY V5 - BULLETPROOF MODE")
+    print("🚀 STARTING SINGULARITY V5")
+    
+    # Start health server in separate thread (bot4 pattern)
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
     try:
-        asyncio.run(main_combined())
+        asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("◈ Bot 5 Shutdown.")
+        print("◈ Bot 5 Shutdown.") 
