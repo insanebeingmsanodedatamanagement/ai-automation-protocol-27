@@ -13,14 +13,20 @@ def run_health_server():
     except Exception as e:
         print(f"📡 Health Server Error: {e}")
 
+print("✅ Step 1: Basic imports done")
+
 # ==============================================================
 # NOW IMPORT EVERYTHING ELSE (these imports may block/take time)
 # ==============================================================
+print("⏳ Step 2: Starting heavy imports...")
 import asyncio, html, time, pytz, logging, random, io, psutil, re
+print("✅ Step 3: asyncio imports done")
 from datetime import datetime, timedelta
 from google import genai
+print("✅ Step 4: google.genai imported")
 from google.genai import types as ai_types
 from aiogram import Bot, Dispatcher, types, F
+print("✅ Step 5: aiogram imported")
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -31,6 +37,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pymongo
 import sys
+print("✅ Step 6: All imports completed")
 
 # Force UTF-8 stdout (Windows compatibility - skip on Linux)
 try:
@@ -42,8 +49,6 @@ except (AttributeError, OSError):
 # Network stability is handled by retry logic instead.
 
 START_TIME = time.time()
-
-
 
 
 # ==========================================
@@ -88,12 +93,15 @@ def connect_db():
         print(f"❌ DB Connect Error: {e}")
         return False
 
+print("✅ Step 7: Attempting database connection...")
 # Initialize database connection (non-blocking - errors logged but don't crash)
 try:
     connect_db()
-    console_out("✅ Database initialization attempted")
+    print("✅ Step 8: Database connection attempted")
 except Exception as e:
     print(f"⚠️ Database connection failed (bot will continue): {e}")
+
+print("✅ Step 9: Loading configuration...")
 
 # DATABASE CONFIG IDS
 DB_ID_MODELS = "bot5_models"
@@ -2228,11 +2236,17 @@ async def main():
 
 if __name__ == "__main__":
     print("🚀 STARTING SINGULARITY V5")
+    print("✅ Step 10: Starting health server thread...")
     
     # Start health server in separate thread (bot4 pattern)
     threading.Thread(target=run_health_server, daemon=True).start()
     
+    print("✅ Step 11: Health server thread started, waiting 1 second...")
+    import time
+    time.sleep(1)  # Give health server time to bind
+    print("✅ Step 12: Starting main bot loop...")
+    
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("◈ Bot 5 Shutdown.") 
+        print("◈ Bot 5 Shutdown.")  
