@@ -13,7 +13,6 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import StateFilter
-from dotenv import load_dotenv
 import pymongo
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure
@@ -24,9 +23,6 @@ from bson.objectid import ObjectId
 import pytz
 from logging.handlers import RotatingFileHandler
 from aiohttp import web
-
-# Load environment variables from BOT9.env
-load_dotenv("BOT9.env")
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
@@ -7649,3 +7645,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("\n📝 Check bot9_errors.log for details")
         sys.exit(1)
+
