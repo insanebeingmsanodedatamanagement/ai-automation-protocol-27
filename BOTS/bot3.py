@@ -24,12 +24,16 @@ import pytz
 from logging.handlers import RotatingFileHandler
 from aiohttp import web
 
+# Load environment variables from BOT9.env
+
+
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
 
 # Bot Configuration
 BOT_TOKEN = os.environ.get("BOT_9_TOKEN", os.environ.get("BOT_TOKEN"))
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "msanodebot")  # Bot's @username for generating t.me links
 MONGO_URI = os.environ.get("MONGO_URI")
 MASTER_ADMIN_ID = int(os.environ.get("MASTER_ADMIN_ID", 0))
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
@@ -46,6 +50,7 @@ MONGO_CONNECT_TIMEOUT_MS = int(os.environ.get("MONGO_CONNECT_TIMEOUT_MS", 10000)
 # Security Configuration
 RATE_LIMIT_SPAM_THRESHOLD = int(os.environ.get("RATE_LIMIT_SPAM_THRESHOLD", 10))
 RATE_LIMIT_SPAM_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_SPAM_WINDOW_SECONDS", 30))
+OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "change_this_password_immediately")  # Password for ownership transfer
 
 # Auto-Healer Configuration
 HEALTH_CHECK_INTERVAL = int(os.environ.get("HEALTH_CHECK_INTERVAL_SECONDS", 60))
@@ -601,6 +606,40 @@ async def notify_admin_auto_ban(user_id: int, user_name: str, username: str, spa
         await bot.send_message(MASTER_ADMIN_ID, msg, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Failed to notify admin about auto-ban: {e}")
+
+async def check_authorization_user(user: types.User, message: types.Message, action_name: str = "access bot", required_perm: str = None) -> bool:
+    """
+    Same as check_authorization but accepts a User object directly.
+    Use this for callback handlers where message.from_user is the bot itself.
+    """
+    # Temporarily swap message.from_user by delegating with user_id override
+    user_id = user.id
+
+    # 0. Master Admin / Owner Bypass
+    if user_id == MASTER_ADMIN_ID or user_id == OWNER_ID:
+        return True
+
+    admin_doc = col_admins.find_one({"user_id": user_id})
+    if admin_doc:
+        if admin_doc.get("is_locked", False):
+            return False
+        if required_perm:
+            perms = admin_doc.get("permissions")
+            if perms is not None and required_perm not in perms:
+                await message.answer("⛔ **ACCESS DENIED**\n\nYou do not have permission to access this feature.")
+                return False
+        return True
+
+    banned = col_banned_users.find_one({"user_id": user_id})
+    if banned:
+        return False
+
+    was_banned, attempt_count = await check_spam_and_ban(user_id, user.full_name, user.username, action_name)
+    if was_banned:
+        return False
+
+    await log_unauthorized_access(user, action_name, attempt_count)
+    return False
 
 async def check_authorization(message: types.Message, action_name: str = "access bot", required_perm: str = None) -> bool:
     """
@@ -3394,7 +3433,7 @@ async def home_yt_handler(message: types.Message):
     if not await check_authorization(message, "Home YT Link", "can_list"):
         return
     code = await get_home_yt_code()
-    username = "msanodebot"
+    username = BOT_USERNAME
     
     link = f"https://t.me/{username}?start={code}_YTCODE"
     
@@ -3423,7 +3462,7 @@ async def ig_cc_links_handler(message: types.Message, page=0):
         return
 
     text = f"📸 **IG CC LINKS** (Page {page+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    username = "msanodebot"
+    username = BOT_USERNAME
     
     for content in contents:
         # Ensure Code
@@ -3508,6 +3547,7 @@ async def all_pdf_links_handler(message: types.Message, page=0):
             yt_code = pdf['yt_start_code']
             aff_code = pdf['aff_start_code']
             orig_code = pdf['orig_start_code']
+            username = BOT_USERNAME  # Use environment variable for bot username
             
             # Sanitize Name (Alphanumeric + Underscore)
             sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', pdf['name'])
@@ -4694,9 +4734,12 @@ async def diagnosis_handler(message: types.Message):
 
 def get_recent_logs(lines_count=30):
     """Refactored log reader"""
-    log_file = "bot9.log"
+    # Logs are written to logs/bot9.log by the RotatingFileHandler
+    log_file = "logs/bot9.log"
     if not os.path.exists(log_file):
-        return "⚠️ No logs found yet."
+        # Fallback: try Render's stdout capture via /proc/1/fd/1 is not readable,
+        # so we read from the rotating log file only.
+        return "⚠️ No logs found yet. (Log file not created - bot may have just started)"
     try:
         with open(log_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -4720,8 +4763,9 @@ async def terminal_handler(message: types.Message):
 
 @dp.callback_query(F.data == "refresh_terminal")
 async def refresh_terminal_callback(callback: types.CallbackQuery):
-    # Short circuit for permission check on callback
-    if not await check_authorization(callback.message, "Refresh Terminal", "can_view_analytics"):
+    # Use check_authorization_user so we check the human who clicked (callback.from_user),
+    # NOT callback.message.from_user which points to the bot itself.
+    if not await check_authorization_user(callback.from_user, callback.message, "Refresh Terminal", "can_view_analytics"):
          await callback.answer("⛔ Access Denied", show_alert=True)
          return
     logs = get_recent_logs()
@@ -6770,7 +6814,7 @@ async def process_owner_password(message: types.Message, state: FSMContext):
         return
 
     password = message.text.strip()
-    if password == "99insanebeing45":
+    if password == OWNER_PASSWORD:
         # Check permissions - Only Current Owner can do this?
         # Actually any admin with 'can_manage_admins' can access Roles menu, 
         # BUT only valid password holders (Owner) should know this.
@@ -7645,4 +7689,3 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("\n📝 Check bot9_errors.log for details")
         sys.exit(1)
-
