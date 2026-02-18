@@ -13,6 +13,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import StateFilter
+from dotenv import load_dotenv
 import pymongo
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure
@@ -25,7 +26,7 @@ from logging.handlers import RotatingFileHandler
 from aiohttp import web
 
 # Load environment variables from BOT9.env
-
+load_dotenv("BOT9.env")
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
@@ -129,12 +130,29 @@ logger = logging.getLogger(__name__)
 class HealthMonitor:
     """Enterprise-grade health monitoring and auto-healing system"""
     
+    # Per-level alert cooldown (seconds): how long to suppress duplicate alerts of the same type
+    ALERT_COOLDOWNS = {
+        "SUCCESS":  0,      # Never suppressed
+        "INFO":     300,    # 5 min between same INFO alert
+        "WARNING":  1800,   # 30 min between same WARNING alert
+        "ERROR":    600,    # 10 min between same ERROR alert
+        "CRITICAL": 120,    # 2 min between same CRITICAL alert
+    }
+    # Consecutive high readings required before firing a WARNING (avoids transient spikes)
+    CPU_SUSTAINED_THRESHOLD = 3   # 3 × 60 s = 3 minutes sustained
+    MEM_SUSTAINED_THRESHOLD = 2   # 2 × 60 s = 2 minutes sustained
+
     def __init__(self):
         self.health_checks_failed = 0
         self.last_health_check = datetime.now()
         self.error_count = 0
         self.warning_count = 0
         self.last_error_notification = None
+        # Cooldown tracking: {alert_key: last_sent_datetime}
+        self.last_alert_sent: dict = {}
+        # Consecutive high-resource counters
+        self.consecutive_cpu_high: int = 0
+        self.consecutive_mem_high: int = 0
         self.system_metrics = {
             "uptime_start": datetime.now(),
             "total_requests": 0,
@@ -151,18 +169,26 @@ class HealthMonitor:
             # Check memory usage
             memory_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
             if memory_mb > ALERT_HIGH_MEMORY_MB:
-                await self.send_alert(
-                    "WARNING",
-                    f"High Memory Usage: {memory_mb:.2f} MB (Threshold: {ALERT_HIGH_MEMORY_MB} MB)"
-                )
+                self.consecutive_mem_high += 1
+                if self.consecutive_mem_high >= self.MEM_SUSTAINED_THRESHOLD:
+                    await self.send_alert(
+                        "WARNING",
+                        f"High Memory Usage: {memory_mb:.2f} MB (Threshold: {ALERT_HIGH_MEMORY_MB} MB)"
+                    )
+            else:
+                self.consecutive_mem_high = 0
             
-            # Check CPU usage
+            # Check CPU usage — only alert after N consecutive high readings (sustained spike)
             cpu_percent = psutil.cpu_percent(interval=1)
             if cpu_percent > ALERT_HIGH_CPU_PERCENT:
-                await self.send_alert(
-                    "WARNING",
-                    f"High CPU Usage: {cpu_percent}% (Threshold: {ALERT_HIGH_CPU_PERCENT}%)"
-                )
+                self.consecutive_cpu_high += 1
+                if self.consecutive_cpu_high >= self.CPU_SUSTAINED_THRESHOLD:
+                    await self.send_alert(
+                        "WARNING",
+                        f"High CPU Usage: {cpu_percent:.1f}% (Threshold: {ALERT_HIGH_CPU_PERCENT}%)"
+                    )
+            else:
+                self.consecutive_cpu_high = 0
             
             # Check database connection
             try:
@@ -235,11 +261,28 @@ class HealthMonitor:
             )
     
     async def send_alert(self, level: str, message: str):
-        """Send alert notification to admin"""
+        """Send alert notification to admin, with per-type cooldown to prevent spam"""
         try:
             if not ERROR_NOTIFICATION_ENABLED:
                 return
-            
+
+            # --- Cooldown / deduplication ---
+            cooldown_secs = self.ALERT_COOLDOWNS.get(level, 1800)
+            if cooldown_secs > 0:
+                # Use first 80 chars of message as part of key so the same alert type
+                # is deduplicated but different messages of the same level still fire
+                alert_key = f"{level}:{message[:80]}"
+                last_sent = self.last_alert_sent.get(alert_key)
+                if last_sent:
+                    elapsed = (datetime.now() - last_sent).total_seconds()
+                    if elapsed < cooldown_secs:
+                        logger.debug(
+                            f"[HealthMonitor] Suppressing {level} alert (cooldown {cooldown_secs - elapsed:.0f}s left)"
+                        )
+                        return
+                self.last_alert_sent[alert_key] = datetime.now()
+            # --- end cooldown ---
+
             emoji_map = {
                 "INFO": "ℹ️",
                 "WARNING": "⚠️",
@@ -4779,17 +4822,205 @@ async def refresh_terminal_callback(callback: types.CallbackQuery):
     
     await callback.answer("Refreshing logs...")
 
+GUIDE_PAGES = [
+    # ── PAGE 1 ── Overview + Main Menu buttons
+    (
+        "📚 **BOT 9 — COMPLETE GUIDE**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📄 *Page 1 / 4 — Overview & Main Menu*\n\n"
+
+        "🤖 **WHAT IS BOT 9?**\n"
+        "Bot 9 is the **content management & analytics hub**.\n"
+        "It stores PDFs, IG content, affiliate links, YT links, and\n"
+        "generates unique tracking links for Bot 8 users.\n\n"
+
+        "🏠 **MAIN MENU BUTTONS**\n"
+        "┌─────────────────────────────\n"
+        "│ 📋 LIST       — Browse all stored content\n"
+        "│ ➕ ADD        — Add new content (PDF/IG/YT/Code)\n"
+        "│ 🔍 SEARCH     — Search content by keyword/code\n"
+        "│ 🔗 LINKS      — Generate & view tracking links\n"
+        "│ 📊 ANALYTICS  — View click stats & performance\n"
+        "│ 🩺 DIAGNOSIS  — System health & DB diagnostics\n"
+        "│ 🖥️ TERMINAL    — Run shell commands (Master only)\n"
+        "│ 💾 BACKUP DATA — Export/backup the database\n"
+        "│ 👥 ADMINS     — Manage admin accounts\n"
+        "│ ⚠️ RESET BOT DATA — Wipe data (Master only)\n"
+        "│ 📚 BOT GUIDE  — This guide\n"
+        "└─────────────────────────────\n\n"
+
+        "🔐 **ACCESS LEVELS**\n"
+        "• **Master Admin** — Full access to all features\n"
+        "• **Admin** — Access based on assigned permissions\n"
+        "• **Unauthorized** — Blocked, only sees Bot Guide\n\n"
+
+        "⬇️ *Use the buttons below to navigate pages*"
+    ),
+
+    # ── PAGE 2 ── ADD / LIST / SEARCH / LINKS
+    (
+        "📚 **BOT 9 — COMPLETE GUIDE**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📄 *Page 2 / 4 — Content Management*\n\n"
+
+        "➕ **ADD MENU** *(Add new content)*\n"
+        "├ 📄 **PDF** — Add / Edit / Delete / List PDFs\n"
+        "│   └ Each PDF gets a unique link for Bot 8 users\n"
+        "│   └ Supports: name, link, MSA code, IG code, YT link\n"
+        "├ 💸 **AFFILIATE** — Manage affiliate links per PDF\n"
+        "│   └ Add / Edit / Delete / List affiliate links\n"
+        "│   └ Tracks affiliate clicks separately\n"
+        "├ 🔑 **CODE** — YT Code management\n"
+        "│   └ Add / Edit / Delete / List YT access codes\n"
+        "│   └ Used for YTCODE tracking links\n"
+        "├ ▶️ **YT** — YouTube link management\n"
+        "│   └ Add / Edit / Delete / List YT links\n"
+        "│   └ Links YT content to PDFs for tracking\n"
+        "└ 📸 **IG** — Instagram content management\n"
+        "    └ Add / Edit / Delete / List IG content\n"
+        "    └ Supports IG CC codes & click tracking\n\n"
+
+        "📋 **LIST MENU** *(Browse stored content)*\n"
+        "├ 📚 ALL      — Show all PDFs with full details\n"
+        "├ 📸 IG CONTENT — Show all IG content\n"
+        "└ Paginated with ⬅️ PREV / NEXT ➡️ buttons\n\n"
+
+        "🔍 **SEARCH MENU** *(Find content fast)*\n"
+        "├ 🔍 SEARCH PDF    — Search PDFs by name/code\n"
+        "└ 🔍 SEARCH IG CC  — Search IG content by code\n\n"
+
+        "🔗 **LINKS MENU** *(Generate tracking links)*\n"
+        "├ 🏠 HOME YT   — YT homepage tracking link\n"
+        "├ 📑 ALL PDF   — Direct PDF tracking links\n"
+        "├ 📸 IG CC     — IG CC tracking links\n"
+        "└ All links auto-route users through Bot 8"
+    ),
+
+    # ── PAGE 3 ── Analytics / Diagnosis / Backup / Terminal
+    (
+        "📚 **BOT 9 — COMPLETE GUIDE**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📄 *Page 3 / 4 — Analytics, Diagnosis & Tools*\n\n"
+
+        "📊 **ANALYTICS MENU** *(Click tracking & stats)*\n"
+        "├ 📊 OVERVIEW         — Full dashboard: total clicks,\n"
+        "│                        top performers, content counts\n"
+        "├ 📄 PDF Clicks        — Per-PDF click breakdown\n"
+        "├ 💸 Affiliate Clicks  — Per-affiliate click stats\n"
+        "├ 📸 IG Start Clicks   — IG start link clicks\n"
+        "├ ▶️ YT Start Clicks   — YT start link clicks\n"
+        "├ 📸 IG CC Start Clicks— IG CC link clicks\n"
+        "└ 🔑 YT Code Clicks   — YT Code link clicks\n\n"
+
+        "🩺 **DIAGNOSIS MENU** *(System health checks)*\n"
+        "├ Checks MongoDB connection & collection sizes\n"
+        "├ Detects orphaned records & broken references\n"
+        "├ Reports missing MSA codes, empty fields\n"
+        "└ Validates PDF links & IG content integrity\n\n"
+
+        "💾 **BACKUP MENU** *(Data safety tools)*\n"
+        "├ 💾 FULL BACKUP      — Export entire DB to JSON file\n"
+        "├ 📋 VIEW AS JSON     — Preview backup in chat\n"
+        "├ 📊 BACKUP STATS     — Show DB collection sizes\n"
+        "└ 📜 BACKUP HISTORY   — View past backup records\n\n"
+
+        "🖥️ **TERMINAL** *(Master Admin only)*\n"
+        "├ Run any shell command directly from Telegram\n"
+        "├ Output streamed back to chat\n"
+        "└ Use with caution — no restrictions applied\n\n"
+
+        "⚠️ **RESET BOT DATA** *(Master Admin only)*\n"
+        "└ Wipes selected collections — irreversible!\n"
+        "   Requires double confirmation before executing"
+    ),
+
+    # ── PAGE 4 ── Admins / Permissions / Ban / Roles
+    (
+        "📚 **BOT 9 — COMPLETE GUIDE**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📄 *Page 4 / 4 — Admin & Permission System*\n\n"
+
+        "👥 **ADMINS MENU** *(Manage admin accounts)*\n"
+        "├ ➕ NEW ADMIN     — Add a new admin by user ID\n"
+        "├ ➖ REMOVE ADMIN  — Remove an admin\n"
+        "├ 📋 LIST ADMINS   — Show all admins with roles\n"
+        "├ 🔐 PERMISSIONS   — Set per-admin permissions\n"
+        "├ 👔 ROLES         — Assign role presets\n"
+        "├ 🔒 LOCK/UNLOCK   — Temporarily disable an admin\n"
+        "└ 🚫 BAN CONFIG    — Ban/unban users from Bot 8\n\n"
+
+        "🔐 **PERMISSION FLAGS** *(Per-admin access control)*\n"
+        "├ can_list         — View content lists\n"
+        "├ can_add          — Add/edit/delete content\n"
+        "├ can_search       — Use search feature\n"
+        "├ can_links        — Access link generator\n"
+        "├ can_analytics    — View analytics data\n"
+        "├ can_diagnosis    — Run system diagnostics\n"
+        "├ can_terminal     — Use terminal (⚠️ powerful)\n"
+        "├ can_backup       — Access backup tools\n"
+        "├ can_manage_admins— Add/remove other admins\n"
+        "└ can_reset        — Reset bot data (⚠️ dangerous)\n\n"
+
+        "🚫 **BAN SYSTEM**\n"
+        "├ 🚫 BAN USER    — Block a user from Bot 8\n"
+        "├ ✅ UNBAN USER  — Remove a ban\n"
+        "└ 📋 LIST BANNED — See all currently banned users\n\n"
+
+        "📎 **ADD AFFILIATE** *(Quick inline affiliate tool)*\n"
+        "└ Shortcut to attach affiliate links to PDFs\n\n"
+
+        "💡 **TIPS**\n"
+        "• All actions are logged to console\n"
+        "• Unauthorized access is auto-blocked & logged\n"
+        "• Bot 9 feeds content to Bot 8 in real-time\n"
+        "• Back buttons always available to navigate safely"
+    ),
+]
+
+def get_guide_nav_keyboard(page: int) -> ReplyKeyboardMarkup:
+    """Navigation keyboard for bot guide pages"""
+    total = len(GUIDE_PAGES)
+    row = []
+    if page > 0:
+        row.append(KeyboardButton(text=f"⬅️ GUIDE PREV"))
+    if page < total - 1:
+        row.append(KeyboardButton(text=f"GUIDE NEXT ➡️"))
+    keyboard = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([KeyboardButton(text="🏠 MAIN MENU")])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
 @dp.message(F.text == "📚 BOT GUIDE")
-async def guide_handler(message: types.Message):
+async def guide_handler(message: types.Message, state: FSMContext):
+    await state.update_data(guide_page=0)
     await message.answer(
-        "📚 **BOT 9 GUIDE**\n\n"
-        "This bot manages:\n"
-        "- PDF Management\n"
-        "- IG Content Management\n"
-        "- Link Generation\n"
-        "- Click Analytics\n\n"
-        "Use the main menu to navigate.",
-        reply_markup=get_main_menu(message.from_user.id),
+        GUIDE_PAGES[0],
+        reply_markup=get_guide_nav_keyboard(0),
+        parse_mode="Markdown"
+    )
+
+@dp.message(F.text == "GUIDE NEXT ➡️")
+async def guide_next_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = data.get("guide_page", 0)
+    page = min(page + 1, len(GUIDE_PAGES) - 1)
+    await state.update_data(guide_page=page)
+    await message.answer(
+        GUIDE_PAGES[page],
+        reply_markup=get_guide_nav_keyboard(page),
+        parse_mode="Markdown"
+    )
+
+@dp.message(F.text == "⬅️ GUIDE PREV")
+async def guide_prev_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = data.get("guide_page", 0)
+    page = max(page - 1, 0)
+    await state.update_data(guide_page=page)
+    await message.answer(
+        GUIDE_PAGES[page],
+        reply_markup=get_guide_nav_keyboard(page),
         parse_mode="Markdown"
     )
 
@@ -7689,3 +7920,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("\n📝 Check bot9_errors.log for details")
         sys.exit(1)
+
