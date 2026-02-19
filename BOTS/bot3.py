@@ -13,7 +13,6 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import StateFilter
-from dotenv import load_dotenv
 import pymongo
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure
@@ -26,8 +25,6 @@ from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 from aiohttp import web
 
-# Load environment variables from BOT9.env
-load_dotenv("BOT9.env")
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
@@ -7822,7 +7819,27 @@ async def cleanup_on_shutdown():
             print("✅ Final state saved")
     except Exception as e:
         logger.error(f"Error saving final state: {e}")
-    
+
+    # 🔴 SHUTDOWN NOTIFICATION TO OWNER
+    try:
+        if MASTER_ADMIN_ID and MASTER_ADMIN_ID != 0:
+            uptime = now_local() - health_monitor.system_metrics["uptime_start"]
+            h = int(uptime.total_seconds() // 3600)
+            m = int((uptime.total_seconds() % 3600) // 60)
+            await bot.send_message(
+                MASTER_ADMIN_ID,
+                f"🔴 **BOT 9 — OFFLINE**\n\n"
+                f"**Status:** Shutting down\n"
+                f"**Uptime:** {h}h {m}m\n"
+                f"**Errors:** {health_monitor.error_count}\n"
+                f"**Warnings:** {health_monitor.warning_count}\n\n"
+                f"**Time:** {now_local().strftime('%B %d, %Y — %I:%M:%S %p')}\n\n"
+                f"_Bot 9 has stopped. It will resume when restarted._",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Failed to send shutdown notification: {e}")
+
     print("👋 Shutdown complete!\n")
 
 async def main():
