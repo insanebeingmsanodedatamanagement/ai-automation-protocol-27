@@ -55,11 +55,6 @@ if sys.platform == 'win32':
 # Redirect Streams
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
-
-# Load environment variables from .env file
-from dotenv import load_dotenv
-load_dotenv()
-
 # Timezone support
 try:
     import pytz as _pytz
@@ -5935,17 +5930,35 @@ async def main():
     except Exception as e:
         print(f"Startup notify failed: {e}")
 
-    # 🔄 Polling Loop (Robust)
-    while True:
+    try:
+        # 🔄 Polling Loop (Robust)
+        while True:
+            try:
+                await dp.start_polling(bot, skip_updates=True)
+                print("⚠️ Polling loop returned. Restarting...")
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                raise  # bubble up to finally
+            except Exception as e:
+                logging.error(f"Polling Network Error: {e}. Retrying in 5s...")
+                await asyncio.sleep(5)
+    finally:
+        # 🔴 SHUTDOWN NOTIFICATION
         try:
-            await dp.start_polling(bot, skip_updates=True)
-            print("⚠️ Polling loop returned. Restarting...")
-            await asyncio.sleep(5)
-        except Exception as e:
-             logging.error(f"Polling Network Error: {e}. Retrying in 5s...")
-             await asyncio.sleep(5)
-    
-    await bot.session.close()
+            await bot.send_message(
+                OWNER_ID,
+                f"🔴 **BOT 4 — GOING OFFLINE**\n\n"
+                f"🟠 **Status:** Shutting down\n"
+                f"📅 **Time:** {datetime.now().strftime('%B %d, %Y — %I:%M:%S %p')}\n\n"
+                f"_Bot 4 has stopped. Restart me if needed._",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
 
 # ==========================================
 # 🗄️ DATABASE HANDLERS (Main Bot)
