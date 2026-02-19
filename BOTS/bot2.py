@@ -11,7 +11,6 @@ from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from dotenv import load_dotenv
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -56,7 +55,6 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     raise last_exception
 
 # Load environment variables
-load_dotenv(".env")
 BOT_TOKEN = os.getenv("BOT_10_TOKEN")
 BOT_8_TOKEN = os.getenv("BOT_8_TOKEN")  # Bot 8 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
