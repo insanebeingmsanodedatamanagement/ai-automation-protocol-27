@@ -22,6 +22,7 @@ import string
 import random
 from bson.objectid import ObjectId
 import pytz
+from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 from aiohttp import web
 
@@ -65,6 +66,17 @@ DAILY_REPORT_ENABLED = os.environ.get("DAILY_REPORT_ENABLED", "true").lower() ==
 DAILY_REPORT_TIME_1 = os.environ.get("DAILY_REPORT_TIME_1", "08:40")
 DAILY_REPORT_TIME_2 = os.environ.get("DAILY_REPORT_TIME_2", "20:40")
 DAILY_REPORT_TIMEZONE = os.environ.get("DAILY_REPORT_TIMEZONE", "Asia/Kolkata")
+
+# ---- Local timezone helper ----
+try:
+    _BOT9_TZ = ZoneInfo(DAILY_REPORT_TIMEZONE)
+except Exception:
+    _BOT9_TZ = ZoneInfo("Asia/Kolkata")
+
+def now_local() -> datetime:
+    """Return current time as a naive datetime in the configured local timezone."""
+    return datetime.now(_BOT9_TZ).replace(tzinfo=None)
+# --------------------------------
 
 # State Persistence Configuration
 STATE_BACKUP_ENABLED = os.environ.get("STATE_BACKUP_ENABLED", "true").lower() == "true"
@@ -144,7 +156,7 @@ class HealthMonitor:
 
     def __init__(self):
         self.health_checks_failed = 0
-        self.last_health_check = datetime.now()
+        self.last_health_check = now_local()
         self.error_count = 0
         self.warning_count = 0
         self.last_error_notification = None
@@ -154,7 +166,7 @@ class HealthMonitor:
         self.consecutive_cpu_high: int = 0
         self.consecutive_mem_high: int = 0
         self.system_metrics = {
-            "uptime_start": datetime.now(),
+            "uptime_start": now_local(),
             "total_requests": 0,
             "total_errors": 0,
             "db_errors": 0,
@@ -206,7 +218,7 @@ class HealthMonitor:
                     )
                     await self.auto_heal_database()
             
-            self.last_health_check = datetime.now()
+            self.last_health_check = now_local()
             
         except Exception as e:
             logger.error(f"Health check error: {e}")
@@ -274,13 +286,13 @@ class HealthMonitor:
                 alert_key = f"{level}:{message[:80]}"
                 last_sent = self.last_alert_sent.get(alert_key)
                 if last_sent:
-                    elapsed = (datetime.now() - last_sent).total_seconds()
+                    elapsed = (now_local() - last_sent).total_seconds()
                     if elapsed < cooldown_secs:
                         logger.debug(
                             f"[HealthMonitor] Suppressing {level} alert (cooldown {cooldown_secs - elapsed:.0f}s left)"
                         )
                         return
-                self.last_alert_sent[alert_key] = datetime.now()
+                self.last_alert_sent[alert_key] = now_local()
             # --- end cooldown ---
 
             emoji_map = {
@@ -292,7 +304,7 @@ class HealthMonitor:
             }
             
             emoji = emoji_map.get(level, "📢")
-            timestamp = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+            timestamp = now_local().strftime("%Y-%m-%d %I:%M:%S %p")
             
             alert_msg = f"{emoji} **BOT 9 HEALTH ALERT**\n\n"
             alert_msg += f"**Level:** {level}\n"
@@ -312,7 +324,7 @@ class HealthMonitor:
                 return
             
             # Rate limit error notifications (max 1 per minute for same error)
-            now = datetime.now()
+            now = now_local()
             if self.last_error_notification:
                 time_diff = (now - self.last_error_notification).total_seconds()
                 if time_diff < 60:
@@ -343,7 +355,7 @@ class HealthMonitor:
     async def log_system_metrics(self):
         """Log system metrics periodically"""
         try:
-            uptime = datetime.now() - self.system_metrics["uptime_start"]
+            uptime = now_local() - self.system_metrics["uptime_start"]
             memory_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
             cpu_percent = psutil.cpu_percent(interval=1)
             
@@ -378,16 +390,16 @@ class StatePersistence:
                 return
             
             state_data = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": now_local().isoformat(),
                 "health_metrics": health_monitor.system_metrics,
                 "error_count": health_monitor.error_count,
-                "last_backup": datetime.now().isoformat()
+                "last_backup": now_local().isoformat()
             }
             
             with open(self.state_file, 'wb') as f:
                 pickle.dump(state_data, f)
             
-            logger.debug(f"State saved at {datetime.now()}")
+            logger.debug(f"State saved at {now_local()}")
             
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
@@ -537,7 +549,7 @@ def ban_user(user_id: int, user_name: str, username: str, reason: str):
             "user_name": user_name,
             "username": username,
             "banned_by": "SYSTEM",
-            "banned_at": datetime.now(),
+            "banned_at": now_local(),
             "reason": reason,
             "status": "banned"
         })
@@ -546,7 +558,7 @@ def ban_user(user_id: int, user_name: str, username: str, reason: str):
         logger.error(f"Failed to ban user {user_id}: {e}")
 
 def format_datetime_12h(dt: datetime) -> str:
-    """Format datetime to 12-hour AM/PM format"""
+    """Format datetime to 12-hour AM/PM format in local timezone"""
     if not dt:
         return "N/A"
     return dt.strftime("%b %d, %Y %I:%M %p")
@@ -563,12 +575,12 @@ async def check_spam_and_ban(user_id: int, user_name: str, username: str, action
         # Record this attempt
         col_user_activity.insert_one({
             "user_id": user_id,
-            "timestamp": datetime.now(),
+            "timestamp": now_local(),
             "action": action
         })
         
         # Count attempts in configured window
-        window_ago = datetime.now() - timedelta(seconds=RATE_LIMIT_SPAM_WINDOW_SECONDS)
+        window_ago = now_local() - timedelta(seconds=RATE_LIMIT_SPAM_WINDOW_SECONDS)
         attempt_count = col_user_activity.count_documents({
             "user_id": user_id,
             "timestamp": {"$gte": window_ago}
@@ -611,7 +623,7 @@ async def log_unauthorized_access(user, action: str, attempt_count: int):
 async def notify_admin_unauthorized_access(user, action: str, attempt_count: int):
     """Send unauthorized access report to master admin"""
     try:
-        timestamp = format_datetime_12h(datetime.now())
+        timestamp = format_datetime_12h(now_local())
         username = user.username or "No username"
         full_name = user.full_name or "Unknown"
         
@@ -633,7 +645,7 @@ async def notify_admin_unauthorized_access(user, action: str, attempt_count: int
 async def notify_admin_auto_ban(user_id: int, user_name: str, username: str, spam_count: int):
     """Notify admin about auto-ban"""
     try:
-        timestamp = format_datetime_12h(datetime.now())
+        timestamp = format_datetime_12h(now_local())
         
         msg = (
             f"🚫 **AUTO-BAN TRIGGERED**\n\n"
@@ -722,7 +734,7 @@ async def check_authorization(message: types.Message, action_name: str = "access
                     {"$set": {
                         "full_name": message.from_user.full_name,
                         "username": message.from_user.username,
-                        "last_active": datetime.now()
+                        "last_active": now_local()
                     }}
                 )
             except Exception as e:
@@ -1768,7 +1780,7 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
     col_admins.insert_one({
         "user_id": new_admin_id,
         "added_by": message.from_user.id,
-        "added_at": datetime.now(),
+        "added_at": now_local(),
         "permissions": DEFAULT_SAFE_PERMISSIONS, # Set safe defaults explicitly
         "full_name": admin_name,
         "username": admin_username,
@@ -2027,7 +2039,7 @@ async def process_add_pdf_link(message: types.Message, state: FSMContext):
         "index": idx,
         "name": name,
         "link": link,
-        "created_at": datetime.now(),
+        "created_at": now_local(),
         # Initialize click tracking fields
         "clicks": 0,
         "affiliate_clicks": 0,
@@ -3668,7 +3680,7 @@ async def process_ig_content_name(message: types.Message, state: FSMContext):
         "cc_code": cc_code,
         "cc_number": cc_number,
         "name": content_name,
-        "created_at": datetime.now(),
+        "created_at": now_local(),
         # Initialize click tracking field
         "ig_cc_clicks": 0,
         "last_ig_cc_click": None
@@ -4221,7 +4233,7 @@ async def process_pdf_search(message: types.Message, state: FSMContext):
     
     # Format creation time
     from datetime import datetime
-    creation_time = pdf.get('created_at', datetime.now())
+    creation_time = pdf.get('created_at', now_local())
     time_12h = creation_time.strftime("%I:%M %p")
     date_str = creation_time.strftime("%A, %B %d, %Y")
     
@@ -4346,7 +4358,7 @@ async def process_ig_search(message: types.Message, state: FSMContext):
     
     # Format creation time
     from datetime import datetime
-    creation_time = content.get('created_at', datetime.now())
+    creation_time = content.get('created_at', now_local())
     time_12h = creation_time.strftime("%I:%M %p")
     date_str = creation_time.strftime("%A, %B %d, %Y")
     
@@ -4395,9 +4407,9 @@ async def diagnosis_handler(message: types.Message):
     # --- 1. DATABASE CONNECTION CHECK ---
     total_checks += 1
     try:
-        start_t = datetime.now()
+        start_t = now_local()
         client.admin.command('ping')
-        ping_ms = (datetime.now() - start_t).microseconds / 1000
+        ping_ms = (now_local() - start_t).microseconds / 1000
         
         if ping_ms > 100:
             warnings.append(f"⚠️ Database latency high: {ping_ms:.1f}ms (>100ms)")
@@ -4405,7 +4417,7 @@ async def diagnosis_handler(message: types.Message):
             checks_passed += 1
             
         # Test write operation
-        test_doc = {"test": True, "timestamp": datetime.now()}
+        test_doc = {"test": True, "timestamp": now_local()}
         col_logs.insert_one(test_doc)
         col_logs.delete_one({"_id": test_doc["_id"]})
         checks_passed += 1
@@ -4770,7 +4782,7 @@ async def diagnosis_handler(message: types.Message):
             report += "• Rebuild database indexes\n"
     
     report += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    report += f"_Diagnostic completed at {datetime.now().strftime('%I:%M:%S %p')}_"
+    report += f"_Diagnostic completed at {now_local().strftime('%I:%M:%S %p')}_"
     
     await status_msg.edit_text(report, parse_mode="Markdown")
     log_user_action(message.from_user, "Ran System Diagnosis", f"Score: {health_score:.1f}%")
@@ -5312,7 +5324,7 @@ async def send_analytics_view(message: types.Message, category: str, page: int =
         
         if last_clicked:
             from datetime import datetime, timedelta
-            now = datetime.now()
+            now = now_local()
             time_diff = now - last_clicked
             
             if time_diff.days > 0:
@@ -5948,7 +5960,7 @@ col_backups = db["bot9_backups"]
 
 def get_month_year_name():
     """Get current month and year in format: 2026_February"""
-    now = datetime.now()
+    now = now_local()
     month_name = now.strftime("%B")  # Full month name
     year = now.year
     return f"{year}_{month_name}"
@@ -6005,9 +6017,9 @@ async def create_backup_file(auto=False):
         # Create metadata
         metadata = {
             "backup_type": "auto" if auto else "manual",
-            "created_at": datetime.now(),
-            "month": datetime.now().strftime("%B"),
-            "year": datetime.now().year,
+            "created_at": now_local(),
+            "month": now_local().strftime("%B"),
+            "year": now_local().year,
             "filename": filename,
             "pdfs_count": len(all_pdfs),
             "ig_count": len(all_ig_content),
@@ -6065,7 +6077,7 @@ async def auto_backup_task():
     """Background task that creates monthly backups automatically"""
     while True:
         try:
-            now = datetime.now()
+            now = now_local()
             
             # Run on 1st of month at 2 AM
             if now.day == 1 and now.hour == 2:
@@ -6118,7 +6130,7 @@ async def auto_backup_task():
                     MASTER_ADMIN_ID,
                     f"🚨 **BACKUP SYSTEM ERROR!**\n\n"
                     f"❌ Error: `{str(e)}`\n"
-                    f"🕐 Time: {datetime.now().strftime('%I:%M %p')}\n\n"
+                    f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
                     f"The auto-backup system encountered an error.",
                     parse_mode="Markdown"
                 )
@@ -6169,8 +6181,8 @@ async def full_backup_handler(message: types.Message):
                     MASTER_ADMIN_ID,
                     f"🚨 **MANUAL BACKUP FAILED!**\n\n"
                     f"⚠️ User: {message.from_user.first_name or 'Unknown'} (ID: {message.from_user.id})\n"
-                    f"📅 Date: {datetime.now().strftime('%B %d, %Y')}\n"
-                    f"🕐 Time: {datetime.now().strftime('%I:%M %p')}\n\n"
+                    f"📅 Date: {now_local().strftime('%B %d, %Y')}\n"
+                    f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
                     f"Please investigate the backup system!",
                     parse_mode="Markdown"
                 )
@@ -6180,7 +6192,7 @@ async def full_backup_handler(message: types.Message):
             return
         
         # Get timestamp
-        now = datetime.now()
+        now = now_local()
         timestamp_12h = now.strftime("%Y-%m-%d %I:%M:%S %p")
         
         # Build backup summary
@@ -6219,7 +6231,7 @@ async def full_backup_handler(message: types.Message):
                 f"🚨 **BACKUP EXCEPTION!**\n\n"
                 f"❌ Error: `{str(e)}`\n"
                 f"👤 User: {message.from_user.first_name or 'Unknown'} (ID: {message.from_user.id})\n"
-                f"🕐 Time: {datetime.now().strftime('%I:%M %p')}\n\n"
+                f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
                 f"Check the backup system immediately!",
                 parse_mode="Markdown"
             )
@@ -6238,7 +6250,7 @@ async def view_json_backup_handler(message: types.Message):
         processing_msg = await message.answer("⏳ Generating JSON backup...")
         
         # Get current timestamp
-        now = datetime.now()
+        now = now_local()
         timestamp_12h = now.strftime("%Y-%m-%d %I:%M:%S %p")
         filename_timestamp = now.strftime("%Y-%m-%d_%I-%M-%S_%p")
         
@@ -6349,15 +6361,15 @@ async def backup_stats_handler(message: types.Message):
         stats_text += f"└ IG Content: {ig_index_count} indexes\n\n"
         
         # Recent activity
-        recent_pdfs = col_pdfs.count_documents({"created_at": {"$gte": datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)}})
-        recent_ig = col_ig_content.count_documents({"created_at": {"$gte": datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)}})
+        recent_pdfs = col_pdfs.count_documents({"created_at": {"$gte": now_local().replace(hour=0, minute=0, second=0, microsecond=0)}})
+        recent_ig = col_ig_content.count_documents({"created_at": {"$gte": now_local().replace(hour=0, minute=0, second=0, microsecond=0)}})
         
         stats_text += f"📈 **TODAY'S ACTIVITY:**\n"
         stats_text += f"├ New PDFs: {recent_pdfs}\n"
         stats_text += f"└ New IG Content: {recent_ig}\n\n"
         
         stats_text += f"═══════════════════════════\n"
-        stats_text += f"🕐 **Updated:** {datetime.now().strftime('%I:%M:%S %p')}"
+        stats_text += f"🕐 **Updated:** {now_local().strftime('%I:%M:%S %p')}"
         
         await message.answer(stats_text, parse_mode="Markdown")
         
@@ -6393,7 +6405,7 @@ async def backup_history_handler(message: types.Message):
         # Group by year for better organization
         backups_by_year = {}
         for backup in all_backups:
-            year = backup.get('year', datetime.now().year)
+            year = backup.get('year', now_local().year)
             if year not in backups_by_year:
                 backups_by_year[year] = []
             backups_by_year[year].append(backup)
@@ -7456,7 +7468,7 @@ async def analytics_handler(message: types.Message, state: FSMContext):
     # Recent activity
     msg += "⏰ **RECENT ACTIVITY**\\n"
     from datetime import datetime, timedelta
-    now = datetime.now()
+    now = now_local()
     
     if last_ig_pdf and last_ig_pdf.get('last_ig_click'):
         time_diff = now - last_ig_pdf['last_ig_click']
@@ -7559,9 +7571,8 @@ async def generate_daily_report():
     try:
         logger.info("📊 Generating daily report...")
         
-        # Get timezone
-        tz = pytz.timezone(DAILY_REPORT_TIMEZONE)
-        now = datetime.now(tz)
+        # Use now_local() so arithmetic with uptime_start (also naive) works correctly
+        now = now_local()
         timestamp = now.strftime("%B %d, %Y %I:%M %p")
         
         # Get statistics
@@ -7683,8 +7694,7 @@ async def daily_report_task():
     while True:
         try:
             # Get current time in configured timezone
-            tz = pytz.timezone(DAILY_REPORT_TIMEZONE)
-            now = datetime.now(tz)
+            now = now_local()
             current_time = now.strftime("%H:%M")
             
             # Check if it's time for report
@@ -7740,13 +7750,13 @@ async def state_persistence_task():
 async def health_check_endpoint(request):
     """Health check endpoint for uptime monitoring and hosting platforms"""
     try:
-        uptime = datetime.now() - health_monitor.system_metrics["uptime_start"]
+        uptime = now_local() - health_monitor.system_metrics["uptime_start"]
         memory_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
         
         return web.json_response({
             "status": "healthy",
             "bot": "Bot 9 Enterprise",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_local().isoformat(),
             "uptime_seconds": int(uptime.total_seconds()),
             "uptime_formatted": str(uptime),
             "memory_mb": round(memory_mb, 2),
@@ -7857,7 +7867,7 @@ async def main():
             startup_msg = (
                 "🚀 **BOT 9 ENTERPRISE EDITION**\n\n"
                 "✅ **Status:** ONLINE\n"
-                f"📅 **Started:** {datetime.now().strftime('%B %d, %Y %I:%M %p')}\n\n"
+                f"📅 **Started:** {now_local().strftime('%B %d, %Y %I:%M %p')}\n\n"
                 "🔧 **Active Systems:**\n"
                 "├ Auto-Healer: ✅ Active\n"
                 "├ Health Monitor: ✅ Active\n"
@@ -7920,4 +7930,3 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("\n📝 Check bot9_errors.log for details")
         sys.exit(1)
-
