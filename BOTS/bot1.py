@@ -11,7 +11,6 @@ import traceback
 import sys
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
 from aiohttp import web as aiohttp_web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -22,8 +21,6 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError
 
-# Load environment variables
-load_dotenv()
 
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
@@ -5741,6 +5738,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.critical(f"💥 Unhandled top-level crash: {e}\n{traceback.format_exc()}")
             logger.info(f"♻️ Auto-restarting in {_restart_delay} seconds...")
-            # Exponential backoff on crash (cap at 60 s)
             time.sleep(_restart_delay)
             _restart_delay = min(_restart_delay * 2, 60)
+            # Replace the entire process to get a clean event loop
+            os.execv(sys.executable, [sys.executable] + sys.argv)
