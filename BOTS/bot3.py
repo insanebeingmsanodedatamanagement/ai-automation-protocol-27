@@ -32,8 +32,6 @@ from logging.handlers import RotatingFileHandler
 from aiohttp import web
 import html as _html
 
-# Load environment variables from BOT9.env
-
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -43,7 +41,7 @@ BOT_TOKEN = os.environ.get("BOT_9_TOKEN", os.environ.get("BOT_TOKEN"))
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "msanodebot")  # Bot's @username for generating t.me links
 MONGO_URI = os.environ.get("MONGO_URI")
 MASTER_ADMIN_ID = int(os.environ.get("MASTER_ADMIN_ID", 0))
-OWNER_ID = int(os.iron.get("OWNER_ID", 0))
+OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
 # Global variable for health server cleanup
 health_server_runner = None
