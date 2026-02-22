@@ -2,17 +2,23 @@ import logging
 import asyncio
 import os
 import sys
+
+# Force UTF-8 output — prevents UnicodeEncodeError on Windows cp1252 console
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import psutil
 import json
 import traceback
 import pickle
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command, StateFilter
+from aiogram.types import ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import StateFilter
 import pymongo
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure
@@ -24,7 +30,9 @@ import pytz
 from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 from aiohttp import web
+import html as _html
 
+# Load environment variables from BOT9.env
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
@@ -35,7 +43,7 @@ BOT_TOKEN = os.environ.get("BOT_9_TOKEN", os.environ.get("BOT_TOKEN"))
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "msanodebot")  # Bot's @username for generating t.me links
 MONGO_URI = os.environ.get("MONGO_URI")
 MASTER_ADMIN_ID = int(os.environ.get("MASTER_ADMIN_ID", 0))
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+OWNER_ID = int(os.iron.get("OWNER_ID", 0))
 
 # Global variable for health server cleanup
 health_server_runner = None
@@ -50,6 +58,10 @@ MONGO_CONNECT_TIMEOUT_MS = int(os.environ.get("MONGO_CONNECT_TIMEOUT_MS", 10000)
 RATE_LIMIT_SPAM_THRESHOLD = int(os.environ.get("RATE_LIMIT_SPAM_THRESHOLD", 10))
 RATE_LIMIT_SPAM_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_SPAM_WINDOW_SECONDS", 30))
 OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "change_this_password_immediately")  # Password for ownership transfer
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")   # Set on Render; never hardcode here
+
+# In-memory set of owner IDs that have completed password auth this session
+_admin_authenticated: set = set()
 
 # Auto-Healer Configuration
 HEALTH_CHECK_INTERVAL = int(os.environ.get("HEALTH_CHECK_INTERVAL_SECONDS", 60))
@@ -303,13 +315,13 @@ class HealthMonitor:
             emoji = emoji_map.get(level, "📢")
             timestamp = now_local().strftime("%Y-%m-%d %I:%M:%S %p")
             
-            alert_msg = f"{emoji} **BOT 9 HEALTH ALERT**\n\n"
-            alert_msg += f"**Level:** {level}\n"
-            alert_msg += f"**Time:** {timestamp}\n\n"
-            alert_msg += f"**Message:**\n{message}\n\n"
-            alert_msg += f"🤖 **Source:** Bot 9 Auto-Healer"
+            alert_msg = f"{emoji} <b>BOT 9 HEALTH ALERT</b>\n\n"
+            alert_msg += f"<b>Level:</b> {level}\n"
+            alert_msg += f"<b>Time:</b> {timestamp}\n\n"
+            alert_msg += f"<b>Message:</b>\n{message}\n\n"
+            alert_msg += f"🤖 <b>Source:</b> Bot 9 Auto-Healer"
             
-            await bot.send_message(MASTER_ADMIN_ID, alert_msg, parse_mode="Markdown")
+            await bot.send_message(MASTER_ADMIN_ID, alert_msg, parse_mode="HTML")
             
         except Exception as e:
             logger.error(f"Failed to send alert: {e}")
@@ -332,19 +344,19 @@ class HealthMonitor:
             
             timestamp = now.strftime("%Y-%m-%d %I:%M:%S %p")
             
-            error_msg = f"🚨 **BOT 9 ERROR ALERT**\n\n"
-            error_msg += f"**Error #{self.error_count}**\n"
-            error_msg += f"**Time:** {timestamp}\n\n"
-            error_msg += f"**Title:** {error_title}\n\n"
-            error_msg += f"**Message:**\n`{error_message[:500]}`\n\n"
+            error_msg = f"🚨 <b>BOT 9 ERROR ALERT</b>\n\n"
+            error_msg += f"<b>Error #{self.error_count}</b>\n"
+            error_msg += f"<b>Time:</b> {timestamp}\n\n"
+            error_msg += f"<b>Title:</b> {error_title}\n\n"
+            error_msg += f"<b>Message:</b>\n`{error_message[:500]}`\n\n"
             
             if stack_trace and CRITICAL_ERROR_NOTIFY_IMMEDIATELY:
-                error_msg += f"**Stack Trace:**\n```\n{stack_trace[:500]}\n```\n\n"
+                error_msg += f"<b>Stack Trace:</b>\n```\n{stack_trace[:500]}\n```\n\n"
             
-            error_msg += f"💡 **System Status:** {'Healthy' if self.is_healthy else 'Degraded'}\n"
-            error_msg += f"📊 **Total Errors:** {self.error_count}"
+            error_msg += f"💡 <b>System Status:</b> {'Healthy' if self.is_healthy else 'Degraded'}\n"
+            error_msg += f"📊 <b>Total Errors:</b> {self.error_count}"
             
-            await bot.send_message(MASTER_ADMIN_ID, error_msg, parse_mode="Markdown")
+            await bot.send_message(MASTER_ADMIN_ID, error_msg, parse_mode="HTML")
             
         except Exception as e:
             logger.error(f"Failed to send error notification: {e}")
@@ -625,17 +637,17 @@ async def notify_admin_unauthorized_access(user, action: str, attempt_count: int
         full_name = user.full_name or "Unknown"
         
         msg = (
-            f"🚨 **UNAUTHORIZED ACCESS ATTEMPT**\n\n"
-            f"👤 **User ID**: `{user.id}`\n"
-            f"📝 **Username**: @{username}\n"
-            f"👨 **Name**: {full_name}\n"
-            f"🕐 **Time**: {timestamp}\n"
-            f"🎯 **Action**: {action}\n"
-            f"🔢 **Attempt**: #{attempt_count}\n\n"
-            f"⚠️ **Status**: Access denied (non-admin)"
+            f"🚨 <b>UNAUTHORIZED ACCESS ATTEMPT</b>\n\n"
+            f"👤 <b>User ID</b>: `{user.id}`\n"
+            f"📝 <b>Username</b>: @{username}\n"
+            f"👨 <b>Name</b>: {full_name}\n"
+            f"🕐 <b>Time</b>: {timestamp}\n"
+            f"🎯 <b>Action</b>: {action}\n"
+            f"🔢 <b>Attempt</b>: #{attempt_count}\n\n"
+            f"⚠️ <b>Status</b>: Access denied (non-admin)"
         )
         
-        await bot.send_message(MASTER_ADMIN_ID, msg, parse_mode="Markdown")
+        await bot.send_message(MASTER_ADMIN_ID, msg, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Failed to notify admin about unauthorized access: {e}")
 
@@ -645,17 +657,17 @@ async def notify_admin_auto_ban(user_id: int, user_name: str, username: str, spa
         timestamp = format_datetime_12h(now_local())
         
         msg = (
-            f"🚫 **AUTO-BAN TRIGGERED**\n\n"
-            f"👤 **User ID**: `{user_id}`\n"
-            f"📝 **Username**: @{username or 'None'}\n"
-            f"👨 **Name**: {user_name or 'Unknown'}\n"
-            f"🕐 **Time**: {timestamp}\n"
-            f"⚠️ **Reason**: Spam detected\n"
-            f"📊 **Attempts**: {spam_count} in 30 seconds\n\n"
+            f"🚫 <b>AUTO-BAN TRIGGERED</b>\n\n"
+            f"👤 <b>User ID</b>: `{user_id}`\n"
+            f"📝 <b>Username</b>: @{username or 'None'}\n"
+            f"👨 <b>Name</b>: {user_name or 'Unknown'}\n"
+            f"🕐 <b>Time</b>: {timestamp}\n"
+            f"⚠️ <b>Reason</b>: Spam detected\n"
+            f"📊 <b>Attempts</b>: {spam_count} in 30 seconds\n\n"
             f"🔇 User will receive NO responses (silent ban)"
         )
         
-        await bot.send_message(MASTER_ADMIN_ID, msg, parse_mode="Markdown")
+        await bot.send_message(MASTER_ADMIN_ID, msg, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Failed to notify admin about auto-ban: {e}")
 
@@ -678,7 +690,7 @@ async def check_authorization_user(user: types.User, message: types.Message, act
         if required_perm:
             perms = admin_doc.get("permissions")
             if perms is not None and required_perm not in perms:
-                await message.answer("⛔ **ACCESS DENIED**\n\nYou do not have permission to access this feature.")
+                await message.answer("⛔ <b>ACCESS DENIED</b>\n\nYou do not have permission to access this feature.", parse_mode="HTML")
                 return False
         return True
 
@@ -742,7 +754,7 @@ async def check_authorization(message: types.Message, action_name: str = "access
             # If permissions not set, allow all (backward compatibility)
             perms = admin_doc.get("permissions")
             if perms is not None and required_perm not in perms:
-                await message.answer("⛔ **ACCESS DENIED**\n\nYou do not have permission to access this feature.")
+                await message.answer("⛔ <b>ACCESS DENIED</b>\n\nYou do not have permission to access this feature.", parse_mode="HTML")
                 logger.warning(f"Admin {user_id} denied access to {action_name} (Missing: {required_perm})")
                 return False
         
@@ -982,6 +994,11 @@ class IGAffiliateDeleteStates(StatesGroup):
     waiting_for_selection = State()      # Select IG content to delete affiliate
     waiting_for_confirm = State()        # Confirm deletion
 
+class TutorialPKStates(StatesGroup):
+    waiting_for_link = State()           # ADD: waiting for YT link to save
+    waiting_for_edit_link = State()      # EDIT: waiting for new/updated YT link
+    waiting_for_delete_confirm = State() # DELETE: waiting for CONFIRM keyword
+
 
 class ListStates(StatesGroup):
     viewing_all = State()  # For viewing ALL PDFs
@@ -1024,6 +1041,12 @@ class AdminRoleStates(StatesGroup):
     waiting_for_role_selection = State()
     waiting_for_owner_password = State() # For Ownership Transfer
     waiting_for_owner_confirm = State() # For Ownership Transfer Confirm
+    waiting_for_owner_second_confirm = State() # For Double Confirmation
+
+class AdminAuthStates(StatesGroup):
+    """Password gate states — used once per session when owner sends /start"""
+    pw_first  = State()   # First password entry
+    pw_second = State()   # Confirmation entry
 
 # --- Helpers ---
 def get_cancel_keyboard():
@@ -1084,6 +1107,14 @@ def is_msa_code_duplicate(code, exclude_pdf_id=None):
     
     return col_pdfs.find_one(query) is not None
 
+def generate_unique_msa_code():
+    """Generates a random MSAXXXX code and ensures it's completely unique in the DB."""
+    import random
+    while True:
+        code = f"MSA{random.randint(1000, 9999)}"
+        if not is_msa_code_duplicate(code):
+            return code
+
 def get_next_cc_code():
     """
     Generate next CC code (CC1, CC2, CC3...) with no gaps
@@ -1135,27 +1166,27 @@ async def send_ig_list_view(message: types.Message, page=0, mode="list"):
     
     # Header & Keyboard Setup
     if mode == "edit":
-        title = "✏️ **EDIT IG CONTENT** - Select by Index or CC Code"
+        title = "✏️ <b>EDIT IG CONTENT</b> - Select by Index or CC Code"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "delete":
-        title = "🗑️ **DELETE IG CONTENT** - Select by Index or CC Code"
+        title = "🗑️ <b>DELETE IG CONTENT</b> - Select by Index or CC Code"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "ig_affiliate_select":
-        title = "📎 **SELECT IG FOR AFFILIATE** - Select by Index or CC Code"
+        title = "📎 <b>SELECT IG FOR AFFILIATE</b> - Select by Index or CC Code"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "ig_affiliate_edit":
-        title = "✏️ **EDIT AFFILIATE LINK** - Select by Index or CC Code"
+        title = "✏️ <b>EDIT AFFILIATE LINK</b> - Select by Index or CC Code"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "ig_affiliate_delete":
-        title = "🗑️ **DELETE AFFILIATE LINK** - Select by Index or CC Code"
+        title = "🗑️ <b>DELETE AFFILIATE LINK</b> - Select by Index or CC Code"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     else:
-        title = "📸 **IG CONTENT LIST**"
+        title = "📸 <b>IG CONTENT LIST</b>"
         cancel_btn = KeyboardButton(text="⬅️ BACK TO IG MENU")
     
     if not contents:
-        msg = "⚠️ **No IG Content found.**\nAdd one first!"
-        await message.answer(msg, reply_markup=ReplyKeyboardMarkup(keyboard=[[cancel_btn]], resize_keyboard=True), parse_mode="Markdown")
+        msg = "⚠️ <b>No IG Content found.</b>\nAdd one first!"
+        await message.answer(msg, reply_markup=ReplyKeyboardMarkup(keyboard=[[cancel_btn]], resize_keyboard=True), parse_mode="HTML")
         return
     
     text = f"{title} (Page {page+1})\nResult {skip+1}-{min(skip+len(contents), total)} of {total}\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -1197,9 +1228,9 @@ async def send_ig_list_view(message: types.Message, page=0, mode="list"):
     if len(text) > 4000:
         parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for part in parts:
-             await message.answer(part, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+             await message.answer(part, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
     else:
-        await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+        await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
 
 async def send_pdf_list_view(message: types.Message, page=0, mode="list"):
     """
@@ -1223,15 +1254,18 @@ async def send_pdf_list_view(message: types.Message, page=0, mode="list"):
             {"affiliate_link": ""}
         ]}
     elif mode == "msa_add_select":
-        # PDFs that DO NOT have MSA code
-        query = {"$or": [
-            {"msa_code": {"$exists": False}},
-            {"msa_code": None},
-            {"msa_code": ""}
-        ]}
+        # Since all PDFs now auto-generate MSA codes, we display ALL PDFs so users can Replace/Override them.
+        query = {}
     elif mode == "msa_edit_select" or mode == "msa_delete" or mode == "list_msa":
         # PDFs that HAVE MSA code
         query = {"msa_code": {"$exists": True, "$ne": ""}}
+    elif mode == "yt_add_select":
+        # PDFs that DO NOT have YT data
+        query = {"$or": [
+            {"yt_title": {"$exists": False}},
+            {"yt_title": None},
+            {"yt_title": ""}
+        ]}
     elif mode == "yt_add_select":
         # PDFs that DO NOT have YT data
         query = {"$or": [
@@ -1250,74 +1284,77 @@ async def send_pdf_list_view(message: types.Message, page=0, mode="list"):
     
     # Header & Keyboard Setup
     if mode == "edit":
-        title = "✏️ **EDIT PDF** - Select by Index or Name"
+        title = "✏️ <b>EDIT PDF</b> - Select by Index or Name"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "delete":
-        title = "🗑️ **DELETE PDF** - Select by Index or Name"
+        title = "🗑️ <b>DELETE PDF</b> - Select by Index or Name"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "affiliate_add_select":
-        title = "💸 **ADD AFFILIATE LINK** - Select PDF (No Link)"
+        title = "💸 <b>ADD AFFILIATE LINK</b> - Select PDF (No Link)"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "affiliate_edit_select":
-        title = "✏️ **EDIT AFFILIATE LINK** - Select PDF"
+        title = "✏️ <b>EDIT AFFILIATE LINK</b> - Select PDF"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "affiliate_delete":
-        title = "🗑️ **DELETE AFFILIATE LINK** - Select PDF"
+        title = "🗑️ <b>DELETE AFFILIATE LINK</b> - Select PDF"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "list_affiliate":
-        title = "💸 **AFFILIATE LINKS LIST**"
+        title = "💸 <b>AFFILIATE LINKS LIST</b>"
         cancel_btn = KeyboardButton(text="⬅️ BACK TO AFFILIATE MENU")
     elif mode == "msa_add_select":
-        title = "🔑 **ADD MSA CODE** - Select PDF (No Code)"
+        title = "🔑 <b>REPLACE MSA CODE</b> - Select PDF to Override"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "msa_edit_select":
-        title = "✏️ **EDIT MSA CODE** - Select PDF"
+        title = "✏️ <b>EDIT MSA CODE</b> - Select PDF"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "msa_delete":
-        title = "🗑️ **DELETE MSA CODE** - Select PDF"
+        title = "🗑️ <b>DELETE MSA CODE</b> - Select PDF"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "list_msa":
-        title = "🔑 **MSA CODES LIST**"
+        title = "🔑 <b>MSA CODES LIST</b>"
         cancel_btn = KeyboardButton(text="⬅️ BACK TO CODE MENU")
     elif mode == "yt_add_select":
-        title = "▶️ **ADD YT LINK** - Select PDF (No YT)"
+        title = "▶️ <b>ADD YT LINK</b> - Select PDF (No YT)"
+        cancel_btn = KeyboardButton(text="❌ CANCEL")
+    elif mode == "yt_add_select":
+        title = "▶️ <b>ADD YT LINK</b> - Select PDF (No YT)"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "yt_edit_select":
-        title = "✏️ **EDIT YT LINK** - Select PDF"
+        title = "✏️ <b>EDIT YT LINK</b> - Select PDF"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "yt_delete":
-        title = "🗑️ **DELETE YT LINK** - Select PDF"
+        title = "🗑️ <b>DELETE YT LINK</b> - Select PDF"
         cancel_btn = KeyboardButton(text="❌ CANCEL")
     elif mode == "list_yt":
-        title = "▶️ **YT LINKS LIST**"
+        title = "▶️ <b>YT LINKS LIST</b>"
         cancel_btn = KeyboardButton(text="⬅️ BACK TO YT MENU")
     else:
-        title = "📂 **PDF LIST**"
+        title = "📂 <b>PDF LIST</b>"
         cancel_btn = KeyboardButton(text="⬅️ BACK TO PDF MENU")
 
     if not pdfs:
         msg = f"📂 No PDFs found matching criteria.\nTotal: {total}"
         if mode == "affiliate_add_select":
-            msg = "⚠️ **All existing PDFs already have Affiliate Links!**\nPlease add a new PDF first."
+            msg = "⚠️ <b>All existing PDFs already have Affiliate Links!</b>\nPlease add a new PDF first."
         elif mode == "affiliate_edit_select":
-            msg = "⚠️ **No Affiliate Links found to edit.**\nAdd one first!"
+            msg = "⚠️ <b>No Affiliate Links found to edit.</b>\nAdd one first!"
         elif mode == "msa_add_select":
-            msg = "⚠️ **All existing PDFs already have MSA Codes!**\nPlease add a new PDF first."
+            msg = "⚠️ <b>All existing PDFs already have MSA Codes!</b>\nPlease add a new PDF first."
         elif mode == "msa_edit_select":
-            msg = "⚠️ **No MSA Codes found to edit.**\nAdd one first!"
+            msg = "⚠️ <b>No MSA Codes found to edit.</b>\nAdd one first!"
         elif mode == "msa_delete" or mode == "list_msa":
-            msg = "⚠️ **No MSA Codes found.**\nAdd one first!"
+            msg = "⚠️ <b>No MSA Codes found.</b>\nAdd one first!"
         elif mode == "yt_add_select":
-            msg = "⚠️ **All existing PDFs already have YT Links!**\nPlease add a new PDF first."
+            msg = "⚠️ <b>All existing PDFs already have YT Links!</b>\nPlease add a new PDF first."
         elif mode == "yt_edit_select":
-            msg = "⚠️ **No YT Links found to edit.**\nAdd one first!"
+            msg = "⚠️ <b>No YT Links found to edit.</b>\nAdd one first!"
         elif mode == "yt_delete" or mode == "list_yt":
-            msg = "⚠️ **No YT Links found.**\nAdd one first!"
+            msg = "⚠️ <b>No YT Links found.</b>\nAdd one first!"
             
-        await message.answer(msg, reply_markup=ReplyKeyboardMarkup(keyboard=[[cancel_btn]], resize_keyboard=True), parse_mode="Markdown")
+        await message.answer(msg, reply_markup=ReplyKeyboardMarkup(keyboard=[[cancel_btn]], resize_keyboard=True), parse_mode="HTML")
         return
 
-    text = f"{title} (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"<b>{title} (Page {page+1})</b>\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
     
     # Use sequential numbering for list modes, actual index for others
     use_sequential = mode in ["list_affiliate", "list_msa", "list_yt", "yt_delete"]
@@ -1326,7 +1363,8 @@ async def send_pdf_list_view(message: types.Message, page=0, mode="list"):
         # Display index: sequential for list modes, actual for operation modes
         display_index = skip + idx if use_sequential else pdf['index']
         
-        text += f"{display_index}. {pdf['name']}\n"
+        clean_name = pdf['name'].replace('<', '&lt;').replace('>', '&gt;')
+        text += f"<b>{display_index}.</b> <code>{clean_name}</code>\n"
         text += f"🔗 Link: {pdf['link']}\n"
         
         # Show different fields based on mode
@@ -1371,7 +1409,7 @@ async def send_pdf_list_view(message: types.Message, page=0, mode="list"):
     if buttons: keyboard.append(buttons)
     keyboard.append([cancel_btn])
     
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown", disable_web_page_preview=True)
+    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML", disable_web_page_preview=True)
 
 
 
@@ -1449,7 +1487,7 @@ def get_add_menu():
     keyboard = [
         [KeyboardButton(text="📄 PDF"), KeyboardButton(text="💸 AFFILIATE")],
         [KeyboardButton(text="🔑 CODE"), KeyboardButton(text="▶️ YT")],
-        [KeyboardButton(text="📸 IG")],
+        [KeyboardButton(text="📸 IG"), KeyboardButton(text="🎬 TUTORIAL")],
         [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -1475,17 +1513,16 @@ def get_affiliate_menu():
 def get_code_menu():
     """Code Submenu Structure"""
     keyboard = [
-        [KeyboardButton(text="➕ ADD CODE"), KeyboardButton(text="✏️ EDIT CODE")],
-        [KeyboardButton(text="🗑️ DELETE CODE"), KeyboardButton(text="📋 LIST CODE")],
-        [KeyboardButton(text="⬅️ BACK TO ADD MENU")]
+        [KeyboardButton(text="✏️ EDIT CODE"), KeyboardButton(text="🗑️ DELETE CODE")],
+        [KeyboardButton(text="📋 LIST CODE"), KeyboardButton(text="⬅️ BACK TO ADD MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_yt_menu():
     """YT Submenu Structure"""
     keyboard = [
-        [KeyboardButton(text="➕ ADD YT LINK"), KeyboardButton(text="✏️ EDIT YT")],
-        [KeyboardButton(text="🗑️ DELETE YT"), KeyboardButton(text="📋 LIST YT")],
+        [KeyboardButton(text="➕ ADD YT LINK"), KeyboardButton(text="✏️ EDIT YT LINK")],
+        [KeyboardButton(text="🗑️ DELETE YT LINK"), KeyboardButton(text="📋 LIST YT LINK")],
         [KeyboardButton(text="⬅️ BACK TO ADD MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -1522,20 +1559,14 @@ def get_ban_config_menu():
 def get_roles_menu():
     """Roles Menu Structure"""
     keyboard = [
-        [KeyboardButton(text="👑 OWNER"), KeyboardButton(text="👨‍💼 MANAGER")],
-        [KeyboardButton(text="👔 ADMIN"), KeyboardButton(text="🛡️ MODERATOR")],
-        [KeyboardButton(text="👨‍💻 SUPPORT")],
+        [KeyboardButton(text="👑 OWNER")],
+        [KeyboardButton(text="👨‍💼 MANAGER"), KeyboardButton(text="👔 ADMIN")],
+        [KeyboardButton(text="🛡️ MODERATOR"), KeyboardButton(text="👨‍💻 SUPPORT")],
         [KeyboardButton(text="❌ CANCEL")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
-def get_lock_menu():
-    """Lock/Unlock Menu Structure"""
-    keyboard = [
-        [KeyboardButton(text="🔒 LOCK"), KeyboardButton(text="🔓 UNLOCK")],
-        [KeyboardButton(text="❌ CANCEL")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
 
 def get_analytics_menu():
     """Analytics Menu Structure"""
@@ -1544,6 +1575,7 @@ def get_analytics_menu():
         [KeyboardButton(text="📄 PDF Clicks"), KeyboardButton(text="💸 Affiliate Clicks")],
         [KeyboardButton(text="📸 IG Start Clicks"), KeyboardButton(text="▶️ YT Start Clicks")],
         [KeyboardButton(text="📸 IG CC Start Clicks"), KeyboardButton(text="🔑 YT Code Start Clicks")],
+        [KeyboardButton(text="🆔 MSA ID POOL")],
         [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -1617,6 +1649,15 @@ def get_ig_affiliate_menu():
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
+def get_tutorial_pk_menu():
+    """Tutorial Submenu — universal tutorial link management."""
+    keyboard = [
+        [KeyboardButton(text="➕ ADD TUTORIAL"), KeyboardButton(text="✏️ EDIT TUTORIAL")],
+        [KeyboardButton(text="🗑️ DELETE TUTORIAL"), KeyboardButton(text="📋 LIST TUTORIAL")],
+        [KeyboardButton(text="⬅️ BACK TO ADD MENU")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
 
 # --- Handlers ---
 
@@ -1631,20 +1672,20 @@ async def global_return_back(message: types.Message, state: FSMContext):
         
     await state.clear()
     await message.answer(
-        "🔐 **Admin Management**\nSelect an option below:",
+        "🔐 <b>Admin Management</b>\nSelect an option below:",
         reply_markup=get_admin_config_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     """Start command handler - ADMIN ONLY"""
     user_id = message.from_user.id
     
     # 1. Check ban status - SILENT ignore
     if is_banned(user_id):
         return  # No response at all
-    
+
     # 2. Check if user is admin
     if not is_admin(user_id):
         # Non-admin attempting to access bot9
@@ -1669,11 +1710,76 @@ async def cmd_start(message: types.Message):
     log_user_action(message.from_user, "Started Bot")
     
     await message.answer(
-        "🤖 **BOT 9 ONLINE**\n"
+        "🤖 <b>BOT 9 ONLINE</b>\n"
         "System Authorized. Accessing Mainframe...",
         reply_markup=get_main_menu(message.from_user.id),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🔐 ADMIN PASSWORD GATE (owner only, once per session, double confirmation)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dp.message(AdminAuthStates.pw_first)
+async def admin_pw_first(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if message.text and message.text.strip() in ("❌ CANCEL", "❌ Cancel"):
+        await state.clear()
+        await message.answer("❌ Authentication cancelled.", reply_markup=ReplyKeyboardRemove())
+        return
+    try: await message.delete()
+    except: pass
+    data = await state.get_data()
+    attempts = data.get("pw_attempts", 0)
+    if not ADMIN_PASSWORD:
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    if message.text == ADMIN_PASSWORD:
+        await state.update_data(pw_first_ok=True, pw_attempts=0)
+        await state.set_state(AdminAuthStates.pw_second)
+        await message.answer("✅ Password accepted.\n\nEnter password again to confirm:", parse_mode="HTML")
+    else:
+        attempts += 1
+        remaining = 3 - attempts
+        if remaining <= 0:
+            await state.clear()
+            await message.answer(
+                "❌ Too many failed attempts. Use /start to try again.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            await state.update_data(pw_attempts=attempts)
+            await message.answer(
+                f"❌ Incorrect password. <b>{remaining}</b> attempt(s) remaining.",
+                parse_mode="HTML",
+            )
+
+
+@dp.message(AdminAuthStates.pw_second)
+async def admin_pw_second(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if message.text and message.text.strip() in ("❌ CANCEL", "❌ Cancel"):
+        # Cancel = skip auth for this session (owner ID already verified)
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    try: await message.delete()
+    except: pass
+    if message.text == ADMIN_PASSWORD:
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await cmd_start(message, state)
+    else:
+        await state.clear()
+        await message.answer(
+            "❌ Passwords did not match. Authentication failed.\n\nUse /start to try again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
 
 @dp.message(F.text == "⬅️ BACK TO MAIN MENU")
 async def back_to_main_handler(message: types.Message, state: FSMContext):
@@ -1682,25 +1788,17 @@ async def back_to_main_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("🏠 Main Menu", reply_markup=get_main_menu(message.from_user.id))
 
-@dp.message(F.text == "👥 ADMINS")
-async def admins_handler(message: types.Message):
-    """Show admin configuration menu"""
-    if not await check_authorization(message, "Admins Menu"):
-        return
-    await message.answer(
-        "👥 **ADMIN CONFIGURATION**\n\n"
-        "Manage bot administrators and permissions:",
-        reply_markup=get_admin_config_menu(),
-        parse_mode="Markdown"
-    )
-
 @dp.message(F.text == "🏠 MAIN MENU")
 async def main_menu_from_admin_handler(message: types.Message, state: FSMContext):
-    """Return to main menu from admin config"""
+    """Return to Main Menu (globally available for admins)"""
     if not await check_authorization(message, "Main Menu"):
         return
     await state.clear()
-    await message.answer("🏠 Main Menu", reply_markup=get_main_menu(message.from_user.id))
+    await message.answer(
+        "👋 <b>Welcome Back!</b>\nSelect an option from the menu below:",
+        reply_markup=get_main_menu(message.from_user.id),
+        parse_mode="HTML"
+    )
 
 @dp.message(F.text == "➕ NEW ADMIN")
 async def new_admin_handler(message: types.Message, state: FSMContext):
@@ -1709,8 +1807,8 @@ async def new_admin_handler(message: types.Message, state: FSMContext):
         return
     await state.set_state(AdminManagementStates.waiting_for_new_admin_id)
     await message.answer(
-        "➕ **ADD NEW ADMIN**\n\n"
-        "Please send the **Telegram User ID** of the user you want to add as admin.\n\n"
+        "➕ <b>ADD NEW ADMIN</b>\n\n"
+        "Please send the <b>Telegram User ID</b> of the user you want to add as admin.\n\n"
         "Example: `123456789`",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[
@@ -1718,7 +1816,7 @@ async def new_admin_handler(message: types.Message, state: FSMContext):
             ],
             resize_keyboard=True
         ),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminManagementStates.waiting_for_new_admin_id)
@@ -1732,9 +1830,9 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
     # Validate input
     if not message.text.isdigit():
         await message.answer(
-            "⚠️ **Invalid Input**\n\n"
+            "⚠️ <b>Invalid Input</b>\n\n"
             "Please send a valid numeric Telegram User ID.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
     
@@ -1743,11 +1841,12 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
     # Check if Banned
     if is_banned(new_admin_id):
         await message.answer(
-            f"⛔ **User {new_admin_id} is BANNED.**\n\n"
-            f"You cannot add a banned user as an Admin.\n"
-            f"Please Unban them first from the Ban Menu.",
+            f"⛔ <b>ACTION DENIED</b>\n\n"
+            f"User `{new_admin_id}` is currently <b>BANNED</b>.\n"
+            f"You cannot add a banned user as an Admin.\n\n"
+            f"<i>Please unban them first from the Ban Config menu.</i>",
             reply_markup=get_admin_config_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         await state.clear()
         return
@@ -1756,9 +1855,9 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
     existing = col_admins.find_one({"user_id": new_admin_id})
     if existing:
         await message.answer(
-            f"⚠️ **Admin Already Exists**\n\n"
+            f"⚠️ <b>Admin Already Exists</b>\n\n"
             f"User ID `{new_admin_id}` is already an admin.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
     
@@ -1778,21 +1877,21 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
         "user_id": new_admin_id,
         "added_by": message.from_user.id,
         "added_at": now_local(),
-        "permissions": DEFAULT_SAFE_PERMISSIONS, # Set safe defaults explicitly
+        "permissions": [],      # LOCKED by default — NO permissions until unlocked by owner
         "full_name": admin_name,
         "username": admin_username,
-        "is_locked": True # Locked by default
+        "is_locked": True       # Must be explicitly unlocked before they can use bot
     })
     
     await state.clear()
     await message.answer(
-        f"✅ **Admin Added Successfully!**\n\n"
+        f"✅ <b>Admin Added Successfully!</b>\n\n"
         f"User ID: `{new_admin_id}`\n"
         f"Added by: {message.from_user.id}\n\n"
-        f"⚠️ **NOTE: New Admins are LOCKED by default.**\n"
+        f"⚠️ <b>NOTE: New Admins are LOCKED by default.</b>\n"
         f"Use the Lock Menu to unlock them.",
         reply_markup=get_admin_config_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "➖ REMOVE ADMIN")
@@ -1800,14 +1899,15 @@ async def remove_admin_handler(message: types.Message, state: FSMContext):
     """Show list of admins with pagination"""
     if not await check_authorization(message, "Remove Admin"):
         return
-    admins = list(col_admins.find({}))
+    # Exclude Master Admin
+    admins = list(col_admins.find({"user_id": {"$ne": MASTER_ADMIN_ID}}))
     
     if not admins:
         await message.answer(
-            "⚠️ **No Admins Found**\n\n"
+            "⚠️ <b>No Other Admins Found</b>\n\n"
             "There are no admins to remove.\n"
-            "Use **➕ NEW ADMIN** to add administrators.",
-            parse_mode="Markdown"
+            "Use <b>➕ NEW ADMIN</b> to add administrators.",
+            parse_mode="HTML"
         )
         return
     
@@ -1820,8 +1920,12 @@ async def remove_admin_handler(message: types.Message, state: FSMContext):
 
 async def show_admin_list_page(message: types.Message, admins: list, page: int):
     """Display admin list with pagination"""
-    ADMINS_PER_PAGE = 10
-    total_pages = (len(admins) - 1) // ADMINS_PER_PAGE + 1
+    ADMINS_PER_PAGE = 5
+    total_pages = max(1, (len(admins) + ADMINS_PER_PAGE - 1) // ADMINS_PER_PAGE)
+    
+    # Cap page just in case
+    page = min(page, max(0, total_pages - 1))
+    
     start_idx = page * ADMINS_PER_PAGE
     end_idx = min(start_idx + ADMINS_PER_PAGE, len(admins))
     
@@ -1837,7 +1941,7 @@ async def show_admin_list_page(message: types.Message, admins: list, page: int):
         status_icon = "🔒" if is_locked else "🔓"
         
         # Add to text list
-        admin_list_text += f"{i+1}. **{name}** (`{user_id}`) [{status_icon}]\n"
+        admin_list_text += f"{i+1}. <b>{name}</b> (`{user_id}`) [{status_icon}]\n"
         
         # Add button
         btn_text = f"❌ Remove: {name} ({user_id})"
@@ -1846,9 +1950,9 @@ async def show_admin_list_page(message: types.Message, admins: list, page: int):
     # Add navigation buttons if needed
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
+        nav_buttons.append(KeyboardButton(text="⬅️ PREV ADMINS"))
     if page < total_pages - 1:
-        nav_buttons.append(KeyboardButton(text="➡️ NEXT"))
+        nav_buttons.append(KeyboardButton(text="➡️ NEXT ADMINS"))
     
     if nav_buttons:
         keyboard.append(nav_buttons)
@@ -1856,12 +1960,12 @@ async def show_admin_list_page(message: types.Message, admins: list, page: int):
     keyboard.append([KeyboardButton(text="⬅️ RETURN BACK"), KeyboardButton(text="🏠 MAIN MENU")])
     
     await message.answer(
-        f"➖ **REMOVE ADMIN**\n\n"
+        f"➖ <b>REMOVE ADMIN</b>\n\n"
         f"Click on an admin to remove them:\n\n"
         f"{admin_list_text}\n"
         f"📊 Page {page + 1}/{total_pages} | Total: {len(admins)} admins",
         reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminManagementStates.viewing_admin_list)
@@ -1871,17 +1975,21 @@ async def process_admin_removal(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer("🏠 Main Menu", reply_markup=get_main_menu(message.from_user.id))
         return
-    
+    elif message.text in ["⬅️ RETURN BACK", "⬅️ BACK TO ADMIN MENU", "/cancel"]:
+        await state.clear()
+        await message.answer("⚙️ <b>Admin Management Menu</b>", reply_markup=get_admin_config_menu(), parse_mode="HTML")
+        return
+        
     data = await state.get_data()
     current_page = data.get("page", 0)
-    admins = list(col_admins.find({}))
+    admins = list(col_admins.find({"user_id": {"$ne": MASTER_ADMIN_ID}}))
     
     # Handle pagination
-    if message.text == "➡️ NEXT":
+    if message.text == "➡️ NEXT ADMINS":
         await state.update_data(page=current_page + 1)
         await show_admin_list_page(message, admins, current_page + 1)
         return
-    elif message.text == "⬅️ PREV":
+    elif message.text == "⬅️ PREV ADMINS":
         await state.update_data(page=current_page - 1)
         await show_admin_list_page(message, admins, current_page - 1)
         return
@@ -1902,6 +2010,11 @@ async def process_admin_removal(message: types.Message, state: FSMContext):
             target_id = None
             
     if target_id:
+        # Extra safety check to prevent removing Master Admin
+        if target_id == MASTER_ADMIN_ID:
+            await message.answer("🚫 <b>You cannot remove the Master Admin.</b>", parse_mode="HTML")
+            return
+            
         try:
             # Remove from database
             result = col_admins.delete_one({"user_id": target_id})
@@ -1909,11 +2022,11 @@ async def process_admin_removal(message: types.Message, state: FSMContext):
             if result.deleted_count > 0:
                 await state.clear()
                 await message.answer(
-                    f"✅ **Admin Removed**\n\n"
+                    f"✅ <b>Admin Removed</b>\n\n"
                     f"User ID `{target_id}` is no longer an admin.\n"
                     f"They cannot access Bot 9 anymore.",
                     reply_markup=get_admin_config_menu(),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
             else:
                 await message.answer("⚠️ Admin not found in database.")
@@ -1924,8 +2037,9 @@ async def process_admin_removal(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Invalid selection.")
 
 @dp.message(F.text == "⬅️ BACK TO ADD MENU")
-async def back_to_add_handler(message: types.Message):
-    await message.answer("➕ **SELECT ADD COMPONENT:**", reply_markup=get_add_menu(), parse_mode="Markdown")
+async def back_to_add_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("➕ <b>SELECT ADD COMPONENT:</b>", reply_markup=get_add_menu(), parse_mode="HTML")
 
 @dp.message(F.text == "➕ ADD")
 async def add_menu_handler(message: types.Message):
@@ -1933,16 +2047,16 @@ async def add_menu_handler(message: types.Message):
     if not await check_authorization(message, "Access Add Menu", "can_add"):
         return
     await message.answer(
-        "➕ **SELECT ADD COMPONENT:**",
+        "➕ <b>SELECT ADD COMPONENT:</b>",
         reply_markup=get_add_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "📄 PDF")
 async def pdf_menu_handler(message: types.Message):
     if not await check_authorization(message, "PDF Menu", "can_add"):
         return
-    await message.answer("📄 **PDF MANAGEMENT**", reply_markup=get_pdf_menu(), parse_mode="Markdown")
+    await message.answer("📄 <b>PDF MANAGEMENT</b>", reply_markup=get_pdf_menu(), parse_mode="HTML")
 
 def is_pdf_name_duplicate(name, exclude_id=None):
     """Check if PDF name already exists (case-insensitive). Returns conflicting PDF or None"""
@@ -1988,38 +2102,38 @@ async def start_add_pdf(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "Add PDF", "can_add"):
         return
     await state.set_state(PDFStates.waiting_for_add_name)
-    await message.answer("📄 **Enter PDF Name:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+    await message.answer("📄 <b>Enter PDF Name:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 @dp.message(PDFStates.waiting_for_add_name)
 async def process_add_pdf_name(message: types.Message, state: FSMContext):
     if message.text == "❌ CANCEL":
         await state.clear()
-        return await message.answer("📄 **PDF MANAGEMENT**", reply_markup=get_pdf_menu(), parse_mode="Markdown")
+        return await message.answer("📄 <b>PDF MANAGEMENT</b>", reply_markup=get_pdf_menu(), parse_mode="HTML")
     
     name = message.text.strip()
     
     # Validation: Check duplicate name
     conflict_pdf = is_pdf_name_duplicate(name)
     if conflict_pdf:
-        await message.answer(f"⚠️ **Name Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different name:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(f"⚠️ <b>Name Already Exists!</b>\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different name:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
         
     await state.update_data(name=name)
     await state.set_state(PDFStates.waiting_for_add_link)
-    await message.answer(f"✅ Name set to: **{name}**\n\n🔗 **Enter PDF Link:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+    await message.answer(f"✅ Name set to: <b>{name}</b>\n\n🔗 <b>Enter PDF Link:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 @dp.message(PDFStates.waiting_for_add_link)
 async def process_add_pdf_link(message: types.Message, state: FSMContext):
     if message.text == "❌ CANCEL":
         await state.clear()
-        return await message.answer("📄 **PDF MANAGEMENT**", reply_markup=get_pdf_menu(), parse_mode="Markdown")
+        return await message.answer("📄 <b>PDF MANAGEMENT</b>", reply_markup=get_pdf_menu(), parse_mode="HTML")
     
     link = message.text.strip()
     
     # Validation: Check duplicate link
     conflict_pdf = is_pdf_link_duplicate(link)
     if conflict_pdf:
-        await message.answer(f"⚠️ **Link Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different link:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(f"⚠️ <b>Link Already Exists!</b>\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different link:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
 
     data = await state.get_data()
@@ -2048,7 +2162,8 @@ async def process_add_pdf_link(message: types.Message, state: FSMContext):
         "last_affiliate_click": None,
         "last_ig_click": None,
         "last_yt_click": None,
-        "last_yt_code_click": None
+        "last_yt_code_click": None,
+        "msa_code": generate_unique_msa_code()
     }
     col_pdfs.insert_one(doc)
     
@@ -2056,7 +2171,7 @@ async def process_add_pdf_link(message: types.Message, state: FSMContext):
     log_user_action(message.from_user, "Added PDF", f"Name: {name}, Index: {idx}")
 
     await state.clear()
-    await message.answer(f"✅ **PDF Added!**\n\n🆔 Index: `{idx}`\n📄 Name: `{name}`\n🔗 Link: `{link}`", reply_markup=get_pdf_menu(), parse_mode="Markdown")
+    await message.answer(f"✅ <b>PDF Added!</b>\n\n🆔 Index: `{idx}`\n📄 Name: `{name}`\n🔗 Link: `{link}`", reply_markup=get_pdf_menu(), parse_mode="HTML")
 
 # 2. LIST PDF
 @dp.message(F.text == "📋 LIST PDF")
@@ -2069,7 +2184,7 @@ async def list_pdfs(message: types.Message, state: FSMContext, page=0):
 @dp.message(F.text == "⬅️ BACK TO PDF MENU")
 async def back_to_pdf_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("📄 **PDF MANAGEMENT**", reply_markup=get_pdf_menu(), parse_mode="Markdown")
+    await message.answer("📄 <b>PDF MANAGEMENT</b>", reply_markup=get_pdf_menu(), parse_mode="HTML")
 
 @dp.message(lambda m: m.text and (m.text.startswith("⬅️ PREV ") or m.text.startswith("➡️ NEXT ")))
 async def pdf_pagination_handler(message: types.Message, state: FSMContext):
@@ -2147,14 +2262,15 @@ async def process_edit_search(message: types.Message, state: FSMContext):
     ], resize_keyboard=True)
     
     await state.set_state(PDFStates.waiting_for_edit_field)
+    clean_name = pdf['name'].replace('<', '&lt;').replace('>', '&gt;')
     await message.answer(
-        f"📄 **PDF FOUND**\n"
-        f"🆔 Index: `{pdf['index']}`\n"
-        f"📛 Name: {pdf['name']}\n"
+        f"📄 <b>PDF FOUND</b>\n"
+        f"🆔 Index: <code>{pdf['index']}</code>\n"
+        f"📛 Name: {clean_name}\n"
         f"🔗 Link: {pdf['link']}\n\n"
-        "⬇️ **Select what to edit:**",
+        "⬇️ <b>Select what to edit:</b>",
         reply_markup=kb,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True
     )
 
@@ -2167,11 +2283,11 @@ async def process_edit_field(message: types.Message, state: FSMContext):
     if message.text == "📝 EDIT NAME":
         await state.update_data(field="name")
         await state.set_state(PDFStates.waiting_for_edit_value)
-        await message.answer("⌨️ **Enter New Name:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer("⌨️ <b>Enter New Name:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
     elif message.text == "🔗 EDIT LINK":
         await state.update_data(field="link")
         await state.set_state(PDFStates.waiting_for_edit_value)
-        await message.answer("⌨️ **Enter New Link:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer("⌨️ <b>Enter New Link:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
     else:
         await message.answer("⚠️ Invalid Option.")
 
@@ -2190,29 +2306,31 @@ async def process_edit_value(message: types.Message, state: FSMContext):
     if field == "name":
         # Check if same as current
         if new_value.lower() == data['current_name'].lower():
-            await message.answer(f"⚠️ **Same Name!**\nYou entered the exact same name.\nPlease enter a different name:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+            await message.answer(f"⚠️ <b>Same Name!</b>\nYou entered the exact same name.\nPlease enter a different name:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
             return
 
         # Check duplicate name (exclude current PDF)
         conflict_pdf = is_pdf_name_duplicate(new_value, exclude_id=data['edit_id'])
         if conflict_pdf:
-            await message.answer(f"⚠️ **Name Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nTry another name:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+            clean_name = conflict_pdf['name'].replace('<', '&lt;').replace('>', '&gt;')
+            await message.answer(f"⚠️ <b>Name Already Exists!</b>\nUsed by:\n🆔 Index: <code>{conflict_pdf['index']}</code>\n📄 Name: <code>{clean_name}</code>\n\nTry another name:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
             return
             
         col_pdfs.update_one({"_id": ObjectId(data['edit_id'])}, {"$set": {"name": new_value}})
-        msg = f"✅ **PDF Name Updated!**\nOld: {data['current_name']}\nNew: {new_value}"
+        msg = f"✅ <b>PDF Name Updated!</b>\nOld: {data['current_name']}\nNew: {new_value}"
         log_user_action(message.from_user, "Edited PDF Name", f"ID: {data['edit_id']}, New: {new_value}")
     
     elif field == "link":
         # Check if same as current
         if new_value == data['current_link']:
-            await message.answer(f"⚠️ **Same Link!**\nYou entered the exact same link.\nPlease enter a different link:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+            await message.answer(f"⚠️ <b>Same Link!</b>\nYou entered the exact same link.\nPlease enter a different link:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
             return
 
         # Check duplicate link (exclude current PDF)
         conflict_pdf = is_pdf_link_duplicate(new_value, exclude_id=data['edit_id'])
         if conflict_pdf:
-            await message.answer(f"⚠️ **Link Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nTry another link:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+            clean_name = conflict_pdf['name'].replace('<', '&lt;').replace('>', '&gt;')
+            await message.answer(f"⚠️ <b>Link Already Exists!</b>\nUsed by:\n🆔 Index: <code>{conflict_pdf['index']}</code>\n📄 Name: <code>{clean_name}</code>\n\nTry another link:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
             return
             
         # Basic Validation
@@ -2221,13 +2339,13 @@ async def process_edit_value(message: types.Message, state: FSMContext):
             return
 
         col_pdfs.update_one({"_id": ObjectId(data['edit_id'])}, {"$set": {"link": new_value}})
-        msg = f"✅ **PDF Link Updated!**\nOld: {data['current_link']}\nNew: {new_value}"
+        msg = f"✅ <b>PDF Link Updated!</b>\nOld: {data['current_link']}\nNew: {new_value}"
         log_user_action(message.from_user, "Edited PDF Link", f"ID: {data['edit_id']}, New: {new_value}")
     else:
         msg = "⚠️ An unexpected error occurred."
 
     await state.clear()
-    await message.answer(msg, reply_markup=get_pdf_menu(), parse_mode="Markdown")
+    await message.answer(msg, reply_markup=get_pdf_menu(), parse_mode="HTML")
 
 # 4. DELETE PDF
 @dp.message(F.text == "🗑️ DELETE PDF")
@@ -2278,10 +2396,10 @@ async def process_delete_search(message: types.Message, state: FSMContext):
     
     # Handle no results
     if not found_pdfs:
-        msg = "❌ **No PDFs Found**\n\n"
+        msg = "❌ <b>No PDFs Found</b>\n\n"
         if not_found:
             msg += "Not found:\n" + "\n".join(f"• `{q}`" for q in not_found)
-        await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
     
     # Store delete IDs
@@ -2296,15 +2414,16 @@ async def process_delete_search(message: types.Message, state: FSMContext):
     await state.set_state(PDFStates.waiting_for_delete_confirm)
     
     # Show what will be deleted
-    msg = f"⚠️ **CONFIRM BULK DELETION**\n\n"
-    msg += f"📊 **Total to delete: {len(found_pdfs)} PDF(s)**\n\n"
+    msg = f"⚠️ <b>CONFIRM BULK DELETION</b>\n\n"
+    msg += f"📊 <b>Total to delete: {len(found_pdfs)} PDF(s)</b>\n\n"
     
     for idx, pdf in enumerate(found_pdfs, 1):
-        msg += f"{idx}. `{pdf['index']}` - {pdf['name']}\n"
+        clean_name = pdf['name'].replace('<', '&lt;').replace('>', '&gt;')
+        msg += f"{idx}. <code>{pdf['index']}</code> - {clean_name}\n"
     
     if not_found:
-        msg += f"\n⚠️ **Not Found ({len(not_found)}):**\n"
-        msg += "\n".join(f"• `{q}`" for q in not_found[:5])  # Limit to 5
+        msg += f"\n⚠️ <b>Not Found ({len(not_found)}):</b>\n"
+        msg += "\n".join(f"• <code>{q}</code>" for q in not_found[:5])  # Limit to 5
         if len(not_found) > 5:
             msg += f"\n...and {len(not_found) - 5} more"
     
@@ -2313,7 +2432,7 @@ async def process_delete_search(message: types.Message, state: FSMContext):
     await message.answer(
         msg,
         reply_markup=kb,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True
     )
 
@@ -2337,11 +2456,11 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
             
             await state.clear()
             await message.answer(
-                f"🗑️ **Bulk Deletion Complete**\n\n"
-                f"✅ Successfully deleted **{deleted_count} PDF(s)**\n"
+                f"🗑️ <b>Bulk Deletion Complete</b>\n\n"
+                f"✅ Successfully deleted <b>{deleted_count} PDF(s)</b>\n"
                 f"📊 Indices automatically reorganized",
                 reply_markup=get_pdf_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             
             # Log action
@@ -2357,10 +2476,10 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
                 
                 await state.clear()
                 await message.answer(
-                    "🗑️ **PDF Deleted Successfully.**\n"
+                    "🗑️ <b>PDF Deleted Successfully.</b>\n"
                     "📊 Indices automatically reorganized",
                     reply_markup=get_pdf_menu(),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
                 log_user_action(message.from_user, "Delete PDF", f"ID: {delete_id}")
             else:
@@ -2376,7 +2495,7 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "💸 AFFILIATE")
 async def affiliate_menu_handler(message: types.Message):
-    await message.answer("💸 **AFFILIATE MANAGEMENT**", reply_markup=get_affiliate_menu(), parse_mode="Markdown")
+    await message.answer("💸 <b>AFFILIATE MANAGEMENT</b>", reply_markup=get_affiliate_menu(), parse_mode="HTML")
 
 # --- AFFILIATE HANDLERS ---
 
@@ -2406,7 +2525,7 @@ async def process_affiliate_pdf_selection(message: types.Message, state: FSMCont
     # Catch Back Button Here too just in case state is active
     if message.text == "⬅️ BACK TO AFFILIATE MENU":
         await state.clear()
-        return await message.answer("💸 **AFFILIATE MANAGEMENT**", reply_markup=get_affiliate_menu(), parse_mode="Markdown")
+        return await message.answer("💸 <b>AFFILIATE MANAGEMENT</b>", reply_markup=get_affiliate_menu(), parse_mode="HTML")
 
     # Handle Pagination
     if message.text.startswith("⬅️ PREV") or message.text.startswith("➡️ NEXT"):
@@ -2466,10 +2585,10 @@ async def process_affiliate_pdf_selection(message: types.Message, state: FSMCont
     
     # Handle no results
     if not found_pdfs:
-        msg = "❌ **No PDFs Found**\n\n"
+        msg = "❌ <b>No PDFs Found</b>\n\n"
         if not_found:
             msg += "Not found:\n" + "\n".join(f"• `{q}`" for q in not_found)
-        await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
     
     # Store selected PDF IDs and names for bulk operation
@@ -2497,28 +2616,28 @@ async def process_affiliate_pdf_selection(message: types.Message, state: FSMCont
     
     # Build confirmation message
     if len(found_pdfs) > 1:
-        msg = f"💸 **MULTIPLE PDFs SELECTED ({len(found_pdfs)})**\n\n"
+        msg = f"💸 <b>MULTIPLE PDFs SELECTED ({len(found_pdfs)})</b>\n\n"
         for idx, pdf in enumerate(found_pdfs, 1):
             msg += f"{idx}. `{pdf['index']}` - {pdf['name']}\n"
         
         if not_found:
-            msg += f"\n⚠️ **Not Found ({len(not_found)}):**\n"
+            msg += f"\n⚠️ <b>Not Found ({len(not_found)}):</b>\n"
             msg += "\n".join(f"• `{q}`" for q in not_found[:5])
             if len(not_found) > 5:
                 msg += f"\n...and {len(not_found) - 5} more"
         
-        msg += "\n\n📝 **Enter affiliate link to apply to ALL selected PDFs:**"
+        msg += "\n\n📝 <b>Enter affiliate link to apply to ALL selected PDFs:</b>"
     else:
         # Single selection
         pdf = found_pdfs[0]
         current_aff = pdf.get("affiliate_link", "None")
         msg = (
-            f"💸 **SELECTED PDF:**\n`{pdf['index']}`. {pdf['name']}\n"
+            f"💸 <b>SELECTED PDF:</b>\n`{pdf['index']}`. {pdf['name']}\n"
             f"Current Affiliate Link: `{current_aff}`\n\n"
-            "📝 **Enter new affiliate link:**"
+            "📝 <b>Enter new affiliate link:</b>"
         )
     
-    await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+    await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 @dp.message(AffiliateStates.waiting_for_link)
 async def process_affiliate_link(message: types.Message, state: FSMContext):
@@ -2553,11 +2672,11 @@ async def process_affiliate_link(message: types.Message, state: FSMContext):
         
         await state.clear()
         await message.answer(
-            f"✅ **Bulk Affiliate Link Assignment Complete!**\n\n"
-            f"📊 Successfully set affiliate link for **{updated_count} PDF(s)**\n"
+            f"✅ <b>Bulk Affiliate Link Assignment Complete!</b>\n\n"
+            f"📊 Successfully set affiliate link for <b>{updated_count} PDF(s)</b>\n"
             f"🔗 Link: `{link}`",
             reply_markup=get_affiliate_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         
         # Log action
@@ -2571,9 +2690,9 @@ async def process_affiliate_link(message: types.Message, state: FSMContext):
         current_aff = data.get('current_aff')
         if current_aff and link == current_aff:
             await message.answer(
-                f"⚠️ **Same Link!**\nYou entered the exact same affiliate link.\nPlease enter a different link:",
+                f"⚠️ <b>Same Link!</b>\nYou entered the exact same affiliate link.\nPlease enter a different link:",
                 reply_markup=get_cancel_keyboard(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             return
         
@@ -2584,9 +2703,9 @@ async def process_affiliate_link(message: types.Message, state: FSMContext):
         
         await state.clear()
         await message.answer(
-            f"✅ **Affiliate Link Set for {pdf_name}!**",
+            f"✅ <b>Affiliate Link Set for {pdf_name}!</b>",
             reply_markup=get_affiliate_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
 # 2. LIST AFFILIATE
@@ -2609,7 +2728,7 @@ async def affiliate_pagination_handler(message: types.Message):
 @dp.message(F.text == "⬅️ BACK TO AFFILIATE MENU")
 async def back_to_affiliate_menu(message: types.Message, state: FSMContext):
     await state.clear() # Clear any lingering state
-    await message.answer("💸 **AFFILIATE MANAGEMENT**", reply_markup=get_affiliate_menu(), parse_mode="Markdown")
+    await message.answer("💸 <b>AFFILIATE MANAGEMENT</b>", reply_markup=get_affiliate_menu(), parse_mode="HTML")
 
 # 3. DELETE AFFILIATE
 
@@ -2670,10 +2789,10 @@ async def process_aff_delete_select(message: types.Message, state: FSMContext):
     
     # Handle no results
     if not found_pdfs:
-        msg = "❌ **No PDFs Found**\n\n"
+        msg = "❌ <b>No PDFs Found</b>\n\n"
         if not_found:
             msg += "Not found or no affiliate link:\n" + "\n".join(f"• `{q}`" for q in not_found)
-        await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
     
     # Store selected PDF IDs and names
@@ -2703,13 +2822,13 @@ async def process_aff_delete_select(message: types.Message, state: FSMContext):
     await state.set_state(AffiliateDeleteStates.waiting_for_confirm)
     
     if len(found_pdfs) > 1:
-        msg = f"⚠️ **CONFIRM BULK AFFILIATE DELETE**\n\n"
-        msg += f"📊 **Total to delete: {len(found_pdfs)} affiliate link(s)**\n\n"
+        msg = f"⚠️ <b>CONFIRM BULK AFFILIATE DELETE</b>\n\n"
+        msg += f"📊 <b>Total to delete: {len(found_pdfs)} affiliate link(s)</b>\n\n"
         for idx, pdf in enumerate(found_pdfs, 1):
             msg += f"{idx}. `{pdf['index']}` - {pdf['name']}\n"
         
         if not_found:
-            msg += f"\n⚠️ **Not Found ({len(not_found)}):**\n"
+            msg += f"\n⚠️ <b>Not Found ({len(not_found)}):</b>\n"
             msg += "\n".join(f"• `{q}`" for q in not_found[:5])
             if len(not_found) > 5:
                 msg += f"\n...and {len(not_found) - 5} more"
@@ -2717,9 +2836,9 @@ async def process_aff_delete_select(message: types.Message, state: FSMContext):
         msg += "\n\n❓ Remove affiliate links from all selected PDFs?"
     else:
         pdf = found_pdfs[0]
-        msg = f"⚠️ Remove Affiliate Link from **{pdf['name']}**?"
+        msg = f"⚠️ Remove Affiliate Link from <b>{pdf['name']}</b>?"
     
-    await message.answer(msg, reply_markup=kb, parse_mode="Markdown")
+    await message.answer(msg, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(AffiliateDeleteStates.waiting_for_confirm)
 async def process_aff_delete_confirm(message: types.Message, state: FSMContext):
@@ -2743,10 +2862,10 @@ async def process_aff_delete_confirm(message: types.Message, state: FSMContext):
             
             await state.clear()
             await message.answer(
-                f"🗑️ **Bulk Affiliate Delete Complete!**\n\n"
-                f"✅ Removed affiliate links from **{deleted_count} PDF(s)**",
+                f"🗑️ <b>Bulk Affiliate Delete Complete!</b>\n\n"
+                f"✅ Removed affiliate links from <b>{deleted_count} PDF(s)</b>",
                 reply_markup=get_affiliate_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             
             # Log action
@@ -2763,9 +2882,9 @@ async def process_aff_delete_confirm(message: types.Message, state: FSMContext):
             
             await state.clear()
             await message.answer(
-                f"🗑️ Affiliate Link Removed from **{pdf_name}**.",
+                f"🗑️ Affiliate Link Removed from <b>{pdf_name}</b>.",
                 reply_markup=get_affiliate_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
     else:
         await state.clear()
@@ -2775,91 +2894,9 @@ async def process_aff_delete_confirm(message: types.Message, state: FSMContext):
 async def code_menu_handler(message: types.Message):
     if not await check_authorization(message, "Code Menu", "can_add"):
         return
-    await message.answer("🔑 **CODE MANAGEMENT**", reply_markup=get_code_menu(), parse_mode="Markdown")
+    await message.answer("🔑 <b>CODE MANAGEMENT</b>", reply_markup=get_code_menu(), parse_mode="HTML")
 
 # --- MSA CODE HANDLERS ---
-
-# 1. ADD MSA CODE
-@dp.message(F.text == "➕ ADD CODE")
-async def start_add_msa_code(message: types.Message, state: FSMContext):
-    if not await check_authorization(message, "Add Code", "can_add"):
-        return
-    await state.set_state(MSACodeStates.waiting_for_pdf_selection)
-    await state.update_data(selection_mode="msa_add_select")
-    await send_pdf_list_view(message, page=0, mode="msa_add_select")
-
-@dp.message(MSACodeStates.waiting_for_pdf_selection)
-async def process_msa_code_pdf_selection(message: types.Message, state: FSMContext):
-    if message.text == "❌ CANCEL":
-        await state.clear()
-        return await message.answer("❌ Cancelled.", reply_markup=get_code_menu())
-    
-    # Handle Pagination
-    if message.text.startswith("⬅️ PREV") or message.text.startswith("➡️ NEXT"):
-        try:
-            page = int(message.text.split()[-1]) - 1
-            data = await state.get_data()
-            mode = data.get('selection_mode', 'msa_add_select')
-            await send_pdf_list_view(message, page=page, mode=mode)
-            return
-        except: pass
-
-    query = message.text
-    pdf = None
-    if query.isdigit():
-        pdf = col_pdfs.find_one({"index": int(query)})
-    else:
-        pdf = col_pdfs.find_one({"name": {"$regex": query, "$options": "i"}})
-    
-    if not pdf:
-        await message.answer("❌ PDF Not Found. Try again or Cancel.", reply_markup=get_cancel_keyboard())
-        return
-    
-    # Check if PDF already has MSA code (shouldn't happen if mode is correct, but double check)
-    if pdf.get("msa_code"):
-        await message.answer("⚠️ This PDF already has an MSA Code allocated.\nUse Edit to change it.", reply_markup=get_cancel_keyboard())
-        return
-
-    await state.update_data(pdf_id=str(pdf["_id"]), pdf_name=pdf["name"])
-    await state.set_state(MSACodeStates.waiting_for_code)
-    
-    await message.answer(
-        f"🔑 **SELECTED PDF:**\n`{pdf['index']}`. {pdf['name']}\n\n"
-        "⌨️ **Enter MSA Code** (Format: MSA12345):",
-        reply_markup=get_cancel_keyboard(),
-        parse_mode="Markdown"
-    )
-
-@dp.message(MSACodeStates.waiting_for_code)
-async def process_msa_code(message: types.Message, state: FSMContext):
-    if message.text == "❌ CANCEL":
-        await state.clear()
-        return await message.answer("❌ Cancelled.", reply_markup=get_code_menu())
-    
-    code = message.text.strip().upper()
-    
-    # Validate format
-    is_valid, error_msg = validate_msa_code(code)
-    if not is_valid:
-        await message.answer(error_msg, reply_markup=get_cancel_keyboard())
-        return
-    
-    # Check for duplicates
-    conflict_pdf = is_msa_code_duplicate(code)
-    if conflict_pdf:
-        await message.answer(f"⚠️ **MSA Code Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a unique code.", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
-        return
-
-    data = await state.get_data()
-    from bson.objectid import ObjectId
-    
-    col_pdfs.update_one(
-        {"_id": ObjectId(data['pdf_id'])},
-        {"$set": {"msa_code": code}}
-    )
-    
-    await state.clear()
-    await message.answer(f"✅ **MSA Code `{code}` assigned to {data['pdf_name']}!**", reply_markup=get_code_menu(), parse_mode="Markdown")
 
 # 2. EDIT MSA CODE
 @dp.message(F.text == "✏️ EDIT CODE")
@@ -2902,12 +2939,12 @@ async def process_msa_edit_select(message: types.Message, state: FSMContext):
     
     await state.set_state(MSACodeEditStates.waiting_for_new_code)
     await message.answer(
-        f"✏️ **EDITING MSA CODE**\n"
+        f"✏️ <b>EDITING MSA CODE</b>\n"
         f"📄 PDF: {pdf['name']}\n"
         f"🔑 Current Code: `{pdf['msa_code']}`\n\n"
-        "⌨️ **Enter New MSA Code** (Format: MSA12345):",
+        "⌨️ <b>Enter New MSA Code</b> (Format: MSA12345):",
         reply_markup=get_cancel_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(MSACodeEditStates.waiting_for_new_code)
@@ -2927,13 +2964,14 @@ async def process_msa_edit_new_code(message: types.Message, state: FSMContext):
     # Check if same as current
     data = await state.get_data()
     if code == data['old_code']:
-        await message.answer(f"⚠️ **Same Code!**\nYou entered the exact same MSA code.\nPlease enter a different code:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(f"⚠️ <b>Same Code!</b>\nYou entered the exact same MSA code.\nPlease enter a different code:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
 
     # Check for duplicates (exclude current PDF)
-    conflict_pdf = is_msa_code_duplicate(code, exclude_id=data['pdf_id'])
+    conflict_pdf = is_msa_code_duplicate(code, exclude_pdf_id=data['pdf_id'])
     if conflict_pdf:
-        await message.answer(f"⚠️ **MSA Code Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a unique code.", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        clean_name = conflict_pdf['name'].replace('<', '&lt;').replace('>', '&gt;')
+        await message.answer(f"⚠️ <b>MSA Code Already Exists!</b>\nUsed by:\n🆔 Index: <code>{conflict_pdf['index']}</code>\n📄 Name: <code>{clean_name}</code>\n\nPlease enter a unique code.", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
 
     from bson.objectid import ObjectId
@@ -2948,11 +2986,11 @@ async def process_msa_edit_new_code(message: types.Message, state: FSMContext):
     
     await state.clear()
     await message.answer(
-        f"✅ **MSA Code Updated for {pdf_name}!**\n\n"
+        f"✅ <b>MSA Code Updated for {pdf_name}!</b>\n\n"
         f"🔴 Old Code: `{old_code}`\n"
         f"🟢 New Code: `{code}`",
         reply_markup=get_code_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # 3. DELETE MSA CODE
@@ -3020,27 +3058,27 @@ async def process_msa_delete_select(message: types.Message, state: FSMContext):
     )
     
     # Build Confirmation Message
-    msg = "⚠️ **CONFIRM BULK DELETION** ⚠️\n\n" if len(pdf_ids) > 1 else "⚠️ **CONFIRM DELETION**\n\n"
+    msg = "⚠️ <b>CONFIRM BULK DELETION</b> ⚠️\n\n" if len(pdf_ids) > 1 else "⚠️ <b>CONFIRM DELETION</b>\n\n"
     msg += "You are about to remove MSA Codes from:\n"
     
     for p in found_pdfs:
-        msg += f"• `{p['index']}`. **{p['name']}** (Code: `{p.get('msa_code', 'N/A')}`)\n"
+        msg += f"• `{p['index']}`. <b>{p['name']}</b> (Code: `{p.get('msa_code', 'N/A')}`)\n"
         
     if not_found or no_code:
-        msg += "\n⚠️ **SKIPPED ITEMS (Ignored):**\n"
+        msg += "\n⚠️ <b>SKIPPED ITEMS (Ignored):</b>\n"
         for q in not_found:
             msg += f"• `{q}`: Not Found\n"
         for name in no_code:
             msg += f"• `{name}`: No MSA Code assigned\n"
         
-    msg += "\n**Are you sure?**"
+    msg += "\n<b>Are you sure?</b>"
     
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="✅ CONFIRM DELETE"), KeyboardButton(text="❌ CANCEL")]
     ], resize_keyboard=True)
     
     await state.set_state(MSACodeDeleteStates.waiting_for_confirm)
-    await message.answer(msg, reply_markup=kb, parse_mode="Markdown")
+    await message.answer(msg, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(MSACodeDeleteStates.waiting_for_confirm)
 async def process_msa_delete_confirm(message: types.Message, state: FSMContext):
@@ -3062,9 +3100,9 @@ async def process_msa_delete_confirm(message: types.Message, state: FSMContext):
             count = result.modified_count
             await state.clear()
             await message.answer(
-                f"🗑️ **Deletion Complete**\nRemoved MSA Codes from {count} PDF(s).",
+                f"🗑️ <b>Deletion Complete</b>\nRemoved MSA Codes from {count} PDF(s).",
                 reply_markup=get_code_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         else:
             await state.clear()
@@ -3093,14 +3131,14 @@ async def msa_pagination_handler(message: types.Message):
 @dp.message(F.text == "⬅️ BACK TO CODE MENU")
 async def back_to_code_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("🔑 **CODE MANAGEMENT**", reply_markup=get_code_menu(), parse_mode="Markdown")
+    await message.answer("🔑 <b>CODE MANAGEMENT</b>", reply_markup=get_code_menu(), parse_mode="HTML")
 
 
 @dp.message(F.text == "▶️ YT")
 async def yt_menu_handler(message: types.Message):
     if not await check_authorization(message, "YT Menu", "can_add"):
         return
-    await message.answer("▶️ **YT MANAGEMENT**", reply_markup=get_yt_menu(), parse_mode="Markdown")
+    await message.answer("▶️ <b>YT MANAGEMENT</b>", reply_markup=get_yt_menu(), parse_mode="HTML")
 
 # --- YT HANDLERS ---
 
@@ -3146,10 +3184,10 @@ async def process_yt_pdf_selection(message: types.Message, state: FSMContext):
     await state.update_data(pdf_id=str(pdf["_id"]), pdf_name=pdf["name"])
     await state.set_state(YTStates.waiting_for_title)
     await message.answer(
-        f"▶️ **Selected PDF:** {pdf['name']}\n\n"
-        "⌨️ **Enter YouTube Video Title:**",
+        f"▶️ <b>Selected PDF:</b> {pdf['name']}\n\n"
+        "⌨️ <b>Enter YouTube Video Title:</b>",
         reply_markup=get_cancel_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(YTStates.waiting_for_title)
@@ -3163,11 +3201,11 @@ async def process_yt_title(message: types.Message, state: FSMContext):
     # Check duplicate title
     conflict_pdf = is_yt_title_duplicate(message.text.strip())
     if conflict_pdf:
-         await message.answer(f"⚠️ **YT Title Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different title:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+         await message.answer(f"⚠️ <b>YT Title Already Exists!</b>\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different title:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
          return
 
     await state.set_state(YTStates.waiting_for_link)
-    await message.answer("🔗 **Enter YouTube Short Link:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+    await message.answer("🔗 <b>Enter YouTube Short Link:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 @dp.message(YTStates.waiting_for_link)
 async def process_yt_link(message: types.Message, state: FSMContext):
@@ -3181,11 +3219,11 @@ async def process_yt_link(message: types.Message, state: FSMContext):
     # Validation: Check duplicate YT link
     conflict_pdf = is_yt_link_duplicate(link)
     if conflict_pdf:
-        await message.answer(f"⚠️ **YT Link Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different link:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(f"⚠️ <b>YT Link Already Exists!</b>\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different link:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
 
     if "http" not in link and "youtu" not in link:
-        await message.answer("⚠️ **Invalid YouTube Link.** Try again:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer("⚠️ <b>Invalid YouTube Link.</b> Try again:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
         
     data = await state.get_data()
@@ -3198,15 +3236,15 @@ async def process_yt_link(message: types.Message, state: FSMContext):
     
     await state.clear()
     await message.answer(
-        f"✅ **YT Link added to {data['pdf_name']}!**\n\n"
+        f"✅ <b>YT Link added to {data['pdf_name']}!</b>\n\n"
         f"▶️ Title: {data['yt_title']}\n"
         f"🔗 Link: {link}",
         reply_markup=get_yt_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # 2. EDIT YT
-@dp.message(F.text == "✏️ EDIT YT")
+@dp.message(F.text == "✏️ EDIT YT LINK")
 async def start_edit_yt(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "Edit YT", "can_add"):
         return
@@ -3257,12 +3295,12 @@ async def process_yt_edit_select(message: types.Message, state: FSMContext):
 
     await state.set_state(YTEditStates.waiting_for_field)
     await message.answer(
-        f"▶️ **YT DATA FOR: {pdf['name']}**\n"
+        f"▶️ <b>YT DATA FOR: {pdf['name']}</b>\n"
         f"Title: {current_title}\n"
         f"Link: {current_link}\n\n"
-        "⬇️ **Select what to edit:**",
+        "⬇️ <b>Select what to edit:</b>",
         reply_markup=kb,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True
     )
 
@@ -3275,11 +3313,11 @@ async def process_yt_edit_field(message: types.Message, state: FSMContext):
     if message.text == "▶️ EDIT TITLE":
         await state.update_data(field="yt_title")
         await state.set_state(YTEditStates.waiting_for_value)
-        await message.answer("⌨️ **Enter New Title:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer("⌨️ <b>Enter New Title:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
     elif message.text == "🔗 EDIT LINK":
         await state.update_data(field="yt_link")
         await state.set_state(YTEditStates.waiting_for_value)
-        await message.answer("⌨️ **Enter New Link:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer("⌨️ <b>Enter New Link:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
     else:
         await message.answer("⚠️ Invalid Option.")
 
@@ -3299,11 +3337,11 @@ async def process_yt_edit_value(message: types.Message, state: FSMContext):
         # Validation: Check duplicate YT link (exclude current PDF)
         conflict_pdf = is_yt_link_duplicate(new_value, exclude_id=data['pdf_id'])
         if conflict_pdf:
-            await message.answer(f"⚠️ **YT Link Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different link:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+            await message.answer(f"⚠️ <b>YT Link Already Exists!</b>\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different link:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
             return
             
         if "http" not in new_value and "youtu" not in new_value:
-             await message.answer("⚠️ **Invalid YouTube Link.** Try again:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+             await message.answer("⚠️ <b>Invalid YouTube Link.</b> Try again:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
              return
 
     elif data['field'] == "yt_title":
@@ -3312,7 +3350,7 @@ async def process_yt_edit_value(message: types.Message, state: FSMContext):
         # Validation: Check duplicate YT title (exclude current PDF)
         conflict_pdf = is_yt_title_duplicate(new_value, exclude_id=data['pdf_id'])
         if conflict_pdf:
-            await message.answer(f"⚠️ **YT Title Already Exists!**\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different title:", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+            await message.answer(f"⚠️ <b>YT Title Already Exists!</b>\nUsed by:\n🆔 Index: `{conflict_pdf['index']}`\n📄 Name: `{conflict_pdf['name']}`\n\nPlease enter a different title:", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
             return
 
     col_pdfs.update_one(
@@ -3322,10 +3360,10 @@ async def process_yt_edit_value(message: types.Message, state: FSMContext):
     
     await state.clear()
     field_name = "Title" if data['field'] == "yt_title" else "Link"
-    await message.answer(f"✅ **YT {field_name} Updated for {data['pdf_name']}!**", reply_markup=get_yt_menu(), parse_mode="Markdown")
+    await message.answer(f"✅ <b>YT {field_name} Updated for {data['pdf_name']}!</b>", reply_markup=get_yt_menu(), parse_mode="HTML")
 
 # 3. DELETE YT
-@dp.message(F.text == "🗑️ DELETE YT")
+@dp.message(F.text == "🗑️ DELETE YT LINK")
 async def start_delete_yt(message: types.Message, state: FSMContext):
     await state.set_state(YTDeleteStates.waiting_for_selection)
     await send_pdf_list_view(message, page=0, mode="yt_delete")
@@ -3398,26 +3436,26 @@ async def process_yt_delete_select(message: types.Message, state: FSMContext):
     )
     
     # Build Confirmation Message
-    msg = "⚠️ **CONFIRM BULK DELETION** ⚠️\n\n" if len(pdf_ids) > 1 else "⚠️ **CONFIRM DELETION**\n\n"
+    msg = "⚠️ <b>CONFIRM BULK DELETION</b> ⚠️\n\n" if len(pdf_ids) > 1 else "⚠️ <b>CONFIRM DELETION</b>\n\n"
     msg += "You are about to remove YT Data from:\n"
     
     for p in found_pdfs:
         # Show both sequential position? No, show actual Name and Title
-        msg += f"• **{p['name']}** (YT: {p.get('yt_title', 'N/A')})\n"
+        msg += f"• <b>{p['name']}</b> (YT: {p.get('yt_title', 'N/A')})\n"
         
     if not_found:
-        msg += "\n⚠️ **SKIPPED ITEMS (Ignored):**\n"
+        msg += "\n⚠️ <b>SKIPPED ITEMS (Ignored):</b>\n"
         for q in not_found:
             msg += f"• `{q}`: Not valid sequential ID\n"
         
-    msg += "\n**Are you sure?**"
+    msg += "\n<b>Are you sure?</b>"
     
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="✅ CONFIRM DELETE"), KeyboardButton(text="❌ CANCEL")]
     ], resize_keyboard=True)
     
     await state.set_state(YTDeleteStates.waiting_for_confirm)
-    await message.answer(msg, reply_markup=kb, parse_mode="Markdown")
+    await message.answer(msg, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(YTDeleteStates.waiting_for_confirm)
 async def process_yt_delete_confirm(message: types.Message, state: FSMContext):
@@ -3438,9 +3476,9 @@ async def process_yt_delete_confirm(message: types.Message, state: FSMContext):
             count = result.modified_count
             await state.clear()
             await message.answer(
-                f"🗑️ **Deletion Complete**\nRemoved YT Data from {count} PDF(s).",
+                f"🗑️ <b>Deletion Complete</b>\nRemoved YT Data from {count} PDF(s).",
                 reply_markup=get_yt_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         else:
             await state.clear()
@@ -3450,7 +3488,7 @@ async def process_yt_delete_confirm(message: types.Message, state: FSMContext):
         await message.answer("❌ Cancelled", reply_markup=get_yt_menu())
 
 # 4. LIST YT
-@dp.message(F.text == "📋 LIST YT")
+@dp.message(F.text == "📋 LIST YT LINK")
 async def list_yt_handler(message: types.Message, state: FSMContext):
     await state.set_state(YTStates.viewing_list)
     await send_pdf_list_view(message, page=0, mode="list_yt")
@@ -3467,18 +3505,13 @@ async def yt_pagination_handler(message: types.Message):
 @dp.message(F.text == "⬅️ BACK TO YT MENU")
 async def back_to_yt_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("▶️ **YT MANAGEMENT**", reply_markup=get_yt_menu(), parse_mode="Markdown")
-
-@dp.message(F.text == "⬅️ BACK TO ADD MENU")
-async def back_to_add_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("➕ **SELECT ADD COMPONENT:**", reply_markup=get_add_menu(), parse_mode="Markdown")
+    await message.answer("▶️ <b>YT MANAGEMENT</b>", reply_markup=get_yt_menu(), parse_mode="HTML")
 
 @dp.message(F.text == "🔗 LINKS")
 async def links_menu_handler(message: types.Message):
     if not await check_authorization(message, "Links Menu", "can_list"):
         return
-    await message.answer("🔗 **DEEP LINKS MANAGER**\nSelect a category to generate links:", reply_markup=get_links_menu(), parse_mode="Markdown")
+    await message.answer("🔗 <b>DEEP LINKS MANAGER</b>\nSelect a category to generate links:", reply_markup=get_links_menu(), parse_mode="HTML")
 
 @dp.message(F.text == "🏠 HOME YT")
 async def home_yt_handler(message: types.Message):
@@ -3490,14 +3523,14 @@ async def home_yt_handler(message: types.Message):
     link = f"https://t.me/{username}?start={code}_YTCODE"
     
     text = (
-        "🏠 **HOME YT LINK**\n"
+        "🏠 <b>HOME YT LINK</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 Link: `{link}`\n"
-        f"🔑 Code: `{code}`\n"
+        f"🔗 Link: <code>{link}</code>\n"
+        f"🔑 Code: <code>{code}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         " This link is permanent and unique."
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "📸 IG CC")
 async def ig_cc_links_handler(message: types.Message, page=0):
@@ -3513,7 +3546,7 @@ async def ig_cc_links_handler(message: types.Message, page=0):
         await message.answer("⚠️ No IG CC Content found.", reply_markup=get_links_menu())
         return
 
-    text = f"📸 **IG CC LINKS** (Page {page+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    text = f"📸 <b>IG CC LINKS</b> (Page {page+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
     username = BOT_USERNAME
     
     for content in contents:
@@ -3525,9 +3558,9 @@ async def ig_cc_links_handler(message: types.Message, page=0):
         link = f"https://t.me/{username}?start={code}_igcc_{cc_code}"
         
         text += (
-            f"🆔 **{cc_code}**\n"
-            f"🔗 `{link}`\n"
-            f"🔑 Start Code: `{code}`\n"
+            f"🆔 <b>{cc_code}</b>\n"
+            f"🔗 <code>{link}</code>\n"
+            f"🔑 Start Code: <code>{code}</code>\n"
             "────────────────────\n"
         )
     
@@ -3540,11 +3573,11 @@ async def ig_cc_links_handler(message: types.Message, page=0):
     if buttons: keyboard.append(buttons)
     keyboard.append([KeyboardButton(text="⬅️ BACK TO LINKS MENU")])
     
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown", disable_web_page_preview=True)
+    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.message(F.text == "⬅️ BACK TO LINKS MENU")
 async def back_to_links_menu(message: types.Message):
-    await message.answer("🔗 **DEEP LINKS MANAGER**", reply_markup=get_links_menu(), parse_mode="Markdown")
+    await message.answer("🔗 <b>DEEP LINKS MANAGER</b>", reply_markup=get_links_menu(), parse_mode="HTML")
 
 @dp.message(lambda m: m.text and (m.text.startswith("⬅️ PREV_IGLINK") or m.text.startswith("➡️ NEXT_IGLINK")))
 async def ig_link_pagination(message: types.Message):
@@ -3574,7 +3607,7 @@ async def all_pdf_links_handler(message: types.Message, page=0):
         await message.answer("⚠️ End of list.", reply_markup=get_links_menu())
         return
 
-    text = f"📑 **ALL PDF LINKS** (Page {page+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    text = f"📑 <b>ALL PDF LINKS</b> (Page {page+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
     username = "msanodebot"
     
     for pdf in pdfs:
@@ -3587,10 +3620,10 @@ async def all_pdf_links_handler(message: types.Message, page=0):
         if not pdf.get('yt_title'): missing.append("YT Title")
         if not pdf.get('yt_link'): missing.append("YT Link")
         
-        text += f"🆔 `{pdf['index']}`. **{pdf.get('name', 'Unknown')}**\n"
+        text += f"🆔 `{pdf['index']}`. <b>{pdf.get('name', 'Unknown')}</b>\n"
         
         if missing:
-            text += f"⚠️ **Missing Details:** {', '.join(missing)}\n"
+            text += f"⚠️ <b>Missing Details:</b> {', '.join(missing)}\n"
             text += "🚫 Links not generated. Please fill all fields.\n"
         else:
             # Generate Links
@@ -3611,11 +3644,11 @@ async def all_pdf_links_handler(message: types.Message, page=0):
             orig_link = f"https://t.me/{username}?start={orig_code}_orig_{sanitized_name}"
             
             text += (
-                f"📸 **IG Link**: `{ig_link}`\n"
-                f"   └ 🎟️ Code: `{ig_code}`\n\n"
-                f"▶️ **YT Link**: `{yt_link}`\n"
-                f"   └ 🎟️ Code: `{yt_code}`\n\n"
-                f"🔐 **MSA Code**: `{pdf['msa_code']}`\n"
+                f"📸 <b>IG Link</b>: <code>{ig_link}</code>\n"
+                f"   └ 🎟️ Code: <code>{ig_code}</code>\n\n"
+                f"▶️ <b>YT Link</b>: <code>{yt_link}</code>\n"
+                f"   └ 🎟️ Code: <code>{yt_code}</code>\n\n"
+                f"🔐 <b>MSA Code</b>: <code>{pdf['msa_code']}</code>\n"
             )
         text += "────────────────────\n"
     
@@ -3628,7 +3661,7 @@ async def all_pdf_links_handler(message: types.Message, page=0):
     if buttons: keyboard.append(buttons)
     keyboard.append([KeyboardButton(text="⬅️ BACK TO LINKS MENU")])
     
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown", disable_web_page_preview=True)
+    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.message(lambda m: m.text and (m.text.startswith("⬅️ PREV_PDFLINK") or m.text.startswith("➡️ NEXT_PDFLINK")))
 async def pdf_link_pagination(message: types.Message):
@@ -3638,12 +3671,11 @@ async def pdf_link_pagination(message: types.Message):
     except:
         await message.answer("❌ Error navigating.")
 
-@dp.message(F.text == "⬅️ BACK TO YT MENU")
 @dp.message(F.text == "📸 IG")
 async def ig_menu_handler(message: types.Message):
     if not await check_authorization(message, "IG Menu", "can_add"):
         return
-    await message.answer("📸 **IG MANAGEMENT**", reply_markup=get_ig_menu(), parse_mode="Markdown")
+    await message.answer("📸 <b>IG MANAGEMENT</b>", reply_markup=get_ig_menu(), parse_mode="HTML")
 
 # --- IG HANDLERS ---
 
@@ -3653,7 +3685,7 @@ async def start_add_ig(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "Add IG", "can_add"):
         return
     await state.set_state(IGStates.waiting_for_content_name)
-    await message.answer("📝 **Enter IG Content:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+    await message.answer("📝 <b>Enter IG Content:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 @dp.message(IGStates.waiting_for_content_name)
 async def process_ig_content_name(message: types.Message, state: FSMContext):
@@ -3665,7 +3697,7 @@ async def process_ig_content_name(message: types.Message, state: FSMContext):
     
     # Check for duplicate name
     if is_ig_name_duplicate(content_name):
-        await message.answer("⚠️ **Content name already exists!**\nPlease use a different name.", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer("⚠️ <b>Content name already exists!</b>\nPlease use a different name.", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
     
     # Auto-generate CC code
@@ -3686,11 +3718,11 @@ async def process_ig_content_name(message: types.Message, state: FSMContext):
     
     await state.clear()
     await message.answer(
-        f"✅ **IG Content Added!**\n\n"
-        f"🆔 Code: **{cc_code}**\n"
+        f"✅ <b>IG Content Added!</b>\n\n"
+        f"🆔 Code: <b>{cc_code}</b>\n"
         f"📝 Name: {content_name}",
         reply_markup=get_ig_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # 2. EDIT IG
@@ -3744,15 +3776,15 @@ async def process_ig_edit_select(message: types.Message, state: FSMContext):
     await state.update_data(content_id=str(content["_id"]), old_name=content["name"], cc_code=content["cc_code"])
     
     # Display ONLY the selected item with FULL content
-    text = f"✅ **SELECTED IG CONTENT**\n━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"`{display_index}`. **{content['cc_code']}**\n"
+    text = f"✅ <b>SELECTED IG CONTENT</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"`{display_index}`. <b>{content['cc_code']}</b>\n"
     text += f"📝 Full Content:\n{content['name']}\n"
     
     await state.set_state(IGEditStates.waiting_for_new_name)
     await message.answer(
-        text + "\n━━━━━━━━━━━━━━━━━━━━\n⌨️ **Enter New Content:**",
+        text + "\n━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter New Content:</b>",
         reply_markup=get_cancel_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(IGEditStates.waiting_for_new_name)
@@ -3766,7 +3798,7 @@ async def process_ig_edit_new_name(message: types.Message, state: FSMContext):
     
     # Check for duplicate name (excluding current content)
     if is_ig_name_duplicate(new_name, exclude_id=data['content_id']):
-        await message.answer("⚠️ **Content name already exists!**\nPlease use a different name.", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer("⚠️ <b>Content name already exists!</b>\nPlease use a different name.", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
     
     from bson.objectid import ObjectId
@@ -3777,11 +3809,11 @@ async def process_ig_edit_new_name(message: types.Message, state: FSMContext):
     
     await state.clear()
     await message.answer(
-        f"✅ **IG Content Updated!**\n\n"
+        f"✅ <b>IG Content Updated!</b>\n\n"
         f"🆔 Code: {data['cc_code']}\n"
         f"📝 New Name: {new_name}",
         reply_markup=get_ig_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # 3. DELETE IG
@@ -3838,10 +3870,10 @@ async def process_ig_delete_select(message: types.Message, state: FSMContext):
             not_found.append(q)
             
     if not found_contents:
-        msg = "❌ **No Content Found**"
+        msg = "❌ <b>No Content Found</b>"
         if not_found:
              msg += "\nNot found: " + ", ".join(not_found)
-        await message.answer(msg, reply_markup=get_cancel_keyboard())
+        await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
         
     # Store IDs
@@ -3850,20 +3882,20 @@ async def process_ig_delete_select(message: types.Message, state: FSMContext):
     await state.update_data(delete_ids=delete_ids)
     
     # Confirmation Message
-    msg = f"⚠️ **CONFIRM BULK DELETION ({len(found_contents)})** ⚠️\n\n"
+    msg = f"⚠️ <b>CONFIRM BULK DELETION ({len(found_contents)})</b> ⚠️\n\n"
     for c in found_contents:
-        msg += f"• **{c['cc_code']}** - {c['name']}\n"
+        msg += f"• <b>{c['cc_code']}</b> - {c['name']}\n"
         
     if not_found:
         msg += f"\n⚠️ Skipped: {', '.join(not_found)}\n"
         
-    msg += "\n**Are you sure?**"
+    msg += "\n<b>Are you sure?</b>"
     
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="✅ CONFIRM DELETE"), KeyboardButton(text="❌ CANCEL")]
     ], resize_keyboard=True)
     await state.set_state(IGDeleteStates.waiting_for_confirm)
-    await message.answer(msg, reply_markup=kb, parse_mode="Markdown")
+    await message.answer(msg, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(IGDeleteStates.waiting_for_confirm)
 async def process_ig_delete_confirm(message: types.Message, state: FSMContext):
@@ -3879,9 +3911,9 @@ async def process_ig_delete_confirm(message: types.Message, state: FSMContext):
             
             await state.clear()
             await message.answer(
-                f"🗑️ **Deleted {count} IG Content(s)!**",
+                f"🗑️ <b>Deleted {count} IG Content(s)!</b>",
                 reply_markup=get_ig_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         else:
              await state.clear()
@@ -3903,7 +3935,7 @@ async def process_ig_list_view(message: types.Message, state: FSMContext):
     # Handle BACK buttons first
     if message.text == "⬅️ BACK TO IG MENU":
         await state.clear()
-        return await message.answer("📸 **IG MANAGEMENT**", reply_markup=get_ig_menu(), parse_mode="Markdown")
+        return await message.answer("📸 <b>IG MANAGEMENT</b>", reply_markup=get_ig_menu(), parse_mode="HTML")
     
     if message.text == "⬅️ BACK TO LIST":
         await send_ig_list_view(message, page=0, mode="list")
@@ -3947,9 +3979,9 @@ async def process_ig_list_view(message: types.Message, state: FSMContext):
         return
     
     # Display the selected content
-    text = f"✅ **VIEWING IG CONTENT**\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"✅ <b>VIEWING IG CONTENT</b>\n━━━━━━━━━━━━━━━━━━━━\n"
     text += f"{display_index}. {content['cc_code']}\n\n"
-    text += f"📝 **Full Content:**\n{content['name']}\n"
+    text += f"📝 <b>Full Content:</b>\n{content['name']}\n"
     text += "━━━━━━━━━━━━━━━━━━━━"
     
     kb = ReplyKeyboardMarkup(keyboard=[
@@ -3957,7 +3989,7 @@ async def process_ig_list_view(message: types.Message, state: FSMContext):
         [KeyboardButton(text="⬅️ BACK TO IG MENU")]
     ], resize_keyboard=True)
     
-    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(F.text == "⬅️ BACK TO LIST")
 async def back_to_ig_list(message: types.Message, state: FSMContext):
@@ -3987,7 +4019,7 @@ async def ig_pagination_handler(message: types.Message, state: FSMContext):
 @dp.message(F.text == "⬅️ BACK TO IG MENU")
 async def back_to_ig_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("📸 **IG MANAGEMENT**", reply_markup=get_ig_menu(), parse_mode="Markdown")
+    await message.answer("📸 <b>IG MANAGEMENT</b>", reply_markup=get_ig_menu(), parse_mode="HTML")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4001,7 +4033,7 @@ async def comprehensive_list_handler(message: types.Message, state: FSMContext):
         [KeyboardButton(text="📚 ALL"), KeyboardButton(text="📸 IG CONTENT")],
         [KeyboardButton(text="⬅️ BACK")]
     ], resize_keyboard=True)
-    await message.answer("📋 **SELECT VIEW:**", reply_markup=kb, parse_mode="Markdown")
+    await message.answer("📋 <b>SELECT VIEW:</b>", reply_markup=kb, parse_mode="HTML")
 
 @dp.message(F.text == "📚 ALL")
 async def list_all_pdfs(message: types.Message, state: FSMContext):
@@ -4027,7 +4059,7 @@ async def back_from_list_menu(message: types.Message, state: FSMContext):
     
     # Otherwise, go back to main menu (from LIST selection menu itself)
     await state.clear()
-    await message.answer("📋 **Main Menu**", reply_markup=get_main_menu(message.from_user.id))
+    await message.answer("📋 <b>Main Menu</b>", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
 
 
 async def send_all_pdfs_view(message: types.Message, page=0):
@@ -4043,10 +4075,10 @@ async def send_all_pdfs_view(message: types.Message, page=0):
             keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True))
         return
     
-    text = f"📚 **PDF DATA** (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"📚 <b>PDF DATA</b> (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
     
     for pdf in pdfs:
-        text += f"{pdf['index']}. **{pdf['name']}**\n"
+        text += f"{pdf['index']}. <b>{pdf['name']}</b>\n"
         text += f"🔗 Link: {pdf['link']}\n"
         text += f"💸 AFF: {pdf.get('affiliate_link', 'Not Set')}\n"
         text += f"▶️ YT Title: {pdf.get('yt_title', 'Not Set')}\n"
@@ -4065,7 +4097,7 @@ async def send_all_pdfs_view(message: types.Message, page=0):
         keyboard.append(buttons)
     keyboard.append([KeyboardButton(text="⬅️ BACK")])
     
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
 
 async def send_all_ig_view(message: types.Message, page=0):
     """Display paginated IG content list (10 per page)"""
@@ -4080,7 +4112,7 @@ async def send_all_ig_view(message: types.Message, page=0):
             keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True))
         return
     
-    text = f"📸 **IG CONTENT** (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"📸 <b>IG CONTENT</b> (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
     
     for idx, content in enumerate(contents, start=1):
         display_index = skip + idx
@@ -4103,7 +4135,7 @@ async def send_all_ig_view(message: types.Message, page=0):
         keyboard.append(buttons)
     keyboard.append([KeyboardButton(text="⬅️ BACK")])
     
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
 
 # Handle pagination for ALL PDFs
 @dp.message(ListStates.viewing_all)
@@ -4118,12 +4150,93 @@ async def handle_all_pdfs_pagination(message: types.Message, state: FSMContext):
 # Handle pagination for IG CC
 @dp.message(ListStates.viewing_ig)
 async def handle_ig_cc_pagination(message: types.Message, state: FSMContext):
-    if message.text and (message.text.startswith("⬅️ PREV_IGCC") or message.text.startswith("➡️ NEXT_IGCC")):
+    text = message.text or ""
+
+    # Pagination buttons
+    if text.startswith("⬅️ PREV_IGCC") or text.startswith("➡️ NEXT_IGCC"):
         try:
-            page = int(message.text.split()[-1]) - 1
+            page = int(text.split()[-1]) - 1
             await send_all_ig_view(message, page=page)
         except:
             await send_all_ig_view(message, page=0)
+        return
+
+    # BACK button — go to list selection menu
+    if text == "⬅️ BACK":
+        await state.clear()
+        await comprehensive_list_handler(message, state)
+        return
+
+    # ─── Full Detail View: index number or CC code ───────────────────────
+    query = text.strip()
+    if not query:
+        return
+
+    content = None
+    display_index = None
+    all_contents = list(col_ig_content.find().sort("cc_number", 1))
+
+    if query.isdigit():
+        idx = int(query) - 1
+        if 0 <= idx < len(all_contents):
+            content = all_contents[idx]
+            display_index = int(query)
+    elif query.upper().startswith("CC"):
+        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{query}$", "$options": "i"}})
+        if content:
+            for i, c in enumerate(all_contents, start=1):
+                if c["_id"] == content["_id"]:
+                    display_index = i
+                    break
+
+    if not content:
+        await message.answer(
+            "❌ <b>Not Found</b>\n\nSend an index number (e.g. `3`) or CC code (e.g. `CC3`) to view full details.\nOr press ⬅️ BACK.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="⬅️ BACK")]],
+                resize_keyboard=True
+            )
+        )
+        return
+
+    # Format full detail
+    name = content.get("name", "N/A")
+    aff_link = content.get("affiliate_link", "Not Set")
+    start_code = content.get("start_code", "Not Set")
+    ig_cc_clicks = content.get("ig_cc_clicks", 0)
+    created_at = content.get("created_at")
+    last_click = content.get("last_ig_cc_click")
+    cc_number = content.get("cc_number", "?")
+
+    created_str = created_at.strftime("%b %d, %Y  %I:%M %p") if isinstance(created_at, datetime) else str(created_at) if created_at else "N/A"
+    last_click_str = last_click.strftime("%b %d, %Y  %I:%M %p") if isinstance(last_click, datetime) else str(last_click) if last_click else "Never"
+
+    detail = (
+        f"📸 <b>IG CONTENT — FULL DETAIL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>#{display_index}  {content['cc_code']}</b>\n\n"
+        f"📝 <b>Name / Content:</b>\n{name}\n\n"
+        f"💸 <b>Affiliate Link:</b>\n{aff_link}\n\n"
+        f"🔗 <b>Start Code:</b> `{start_code}`\n"
+        f"📊 <b>IG CC Clicks:</b> `{ig_cc_clicks:,}`\n"
+        f"🔢 <b>CC Number:</b> `{cc_number}`\n\n"
+        f"📅 <b>Created:</b> {created_str}\n"
+        f"🖱️ <b>Last Click:</b> {last_click_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="⬅️ BACK TO IG LIST")],
+        [KeyboardButton(text="⬅️ BACK")]
+    ], resize_keyboard=True)
+    await message.answer(detail, parse_mode="HTML", reply_markup=kb)
+
+@dp.message(ListStates.viewing_ig, F.text == "⬅️ BACK TO IG LIST")
+async def return_to_ig_list_from_detail(message: types.Message, state: FSMContext):
+    """Return to IG content list from detail view"""
+    await send_all_ig_view(message, page=0)
+
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -4139,7 +4252,7 @@ async def search_menu_handler(message: types.Message):
         [KeyboardButton(text="🔍 SEARCH PDF"), KeyboardButton(text="🔍 SEARCH IG CC")],
         [KeyboardButton(text="⬅️ BACK")]
     ], resize_keyboard=True)
-    await message.answer("🔍 **SELECT SEARCH TYPE:**", reply_markup=kb, parse_mode="Markdown")
+    await message.answer("🔍 <b>SELECT SEARCH TYPE:</b>", reply_markup=kb, parse_mode="HTML")
 
 @dp.message(F.text == "🔍 SEARCH PDF")
 async def search_pdf_start(message: types.Message, state: FSMContext):
@@ -4162,12 +4275,12 @@ async def send_search_pdf_list(message: types.Message, page=0):
             keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True))
         return
     
-    text = f"📚 **AVAILABLE PDFs** (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"📚 <b>AVAILABLE PDFs</b> (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
     for pdf in pdfs:
         text += f"{pdf['index']}. {pdf['name']}\n"
         text += f"🔗 {pdf['link']}\n\n"
     
-    text += "━━━━━━━━━━━━━━━━━━━━\n⌨️ **Enter PDF Index or Name:**"
+    text += "━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter PDF Index or Name:</b>"
     
     # Pagination buttons
     buttons = []
@@ -4181,7 +4294,7 @@ async def send_search_pdf_list(message: types.Message, page=0):
         keyboard.append(buttons)
     keyboard.append([KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="❌ CANCEL")])
     
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
 
 @dp.message(SearchStates.viewing_pdf_list)
 async def handle_search_pdf_list(message: types.Message, state: FSMContext):
@@ -4235,7 +4348,7 @@ async def process_pdf_search(message: types.Message, state: FSMContext):
     date_str = creation_time.strftime("%A, %B %d, %Y")
     
     # Build detailed info
-    text = f"📄 **PDF DETAILS**\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"📄 <b>PDF DETAILS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
     text += f"🆔 Index: {pdf['index']}\n"
     text += f"📛 Name: {pdf['name']}\n"
     text += f"🔗 Link: {pdf['link']}\n"
@@ -4250,18 +4363,18 @@ async def process_pdf_search(message: types.Message, state: FSMContext):
     await state.set_state(SearchStates.waiting_for_pdf_input)
     
     # Add input prompt
-    text += "\n\n━━━━━━━━━━━━━━━━━━━━\n⌨️ **Enter another PDF Index or Name to Search:**"
+    text += "\n\n━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter another PDF Index or Name to Search:</b>"
     
     # Auto-split if message exceeds Telegram's 4096 character limit
     if len(text) > 4000:
         parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for idx, part in enumerate(parts):
             if idx == len(parts) - 1:  # Last part gets the keyboard
-                await message.answer(part, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+                await message.answer(part, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
             else:
-                await message.answer(part, parse_mode="Markdown")
+                await message.answer(part, parse_mode="HTML")
     else:
-        await message.answer(text, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(text, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text == "🔍 SEARCH IG CC")
 async def search_ig_start(message: types.Message, state: FSMContext):
@@ -4284,12 +4397,12 @@ async def send_search_ig_list(message: types.Message, page=0):
             keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True))
         return
     
-    text = f"📸 **AVAILABLE IG CONTENT** (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"📸 <b>AVAILABLE IG CONTENT</b> (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
     for idx, content in enumerate(contents, start=1):
         display_idx = skip + idx
         text += f"{display_idx}. {content['cc_code']}\n"
     
-    text += "━━━━━━━━━━━━━━━━━━━━\n⌨️ **Enter Index or CC Code:**"
+    text += "━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter Index or CC Code:</b>"
     
     # Pagination buttons
     buttons = []
@@ -4303,7 +4416,7 @@ async def send_search_ig_list(message: types.Message, page=0):
         keyboard.append(buttons)
     keyboard.append([KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="❌ CANCEL")])
     
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
 
 @dp.message(SearchStates.viewing_ig_list)
 async def handle_search_ig_list(message: types.Message, state: FSMContext):
@@ -4360,7 +4473,7 @@ async def process_ig_search(message: types.Message, state: FSMContext):
     date_str = creation_time.strftime("%A, %B %d, %Y")
     
     # Build detailed info
-    text = f"📸 **IG CONTENT DETAILS**\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"📸 <b>IG CONTENT DETAILS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
     text += f"🆔 Code: {content['cc_code']}\n"
     text += f"📝 Content:\n{content['name']}\n\n"
     
@@ -4375,18 +4488,18 @@ async def process_ig_search(message: types.Message, state: FSMContext):
     await state.set_state(SearchStates.waiting_for_ig_input)
     
     # Add input prompt
-    text += "\n\n━━━━━━━━━━━━━━━━━━━━\n⌨️ **Enter another Index or CC Code to Search:**"
+    text += "\n\n━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter another Index or CC Code to Search:</b>"
     
     # Auto-split if message exceeds Telegram's 4096 character limit
     if len(text) > 4000:
         parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for idx, part in enumerate(parts):
             if idx == len(parts) - 1:  # Last part gets the keyboard
-                await message.answer(part, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+                await message.answer(part, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
             else:
-                await message.answer(part, parse_mode="Markdown")
+                await message.answer(part, parse_mode="HTML")
     else:
-        await message.answer(text, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await message.answer(text, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 
 @dp.message(F.text == "🩺 DIAGNOSIS")
@@ -4394,7 +4507,7 @@ async def diagnosis_handler(message: types.Message):
     if not await check_authorization(message, "System Diagnosis", "can_view_analytics"):
         return
     """Comprehensive System Health Check & Diagnosis"""
-    status_msg = await message.answer("🔍 **Running Complete System Diagnosis...**\n\n⏳ This may take a moment...", parse_mode="Markdown")
+    status_msg = await message.answer("🔍 <b>Running Complete System Diagnosis...</b>\n\n⏳ This may take a moment...", parse_mode="HTML")
     
     issues = []
     warnings = []
@@ -4493,7 +4606,15 @@ async def diagnosis_handler(message: types.Message):
         missing_indexes = [idx for idx in required_indexes if idx not in index_names]
         
         if missing_indexes:
-            warnings.append(f"⚠️ Missing indexes: {', '.join(missing_indexes)}")
+            # Auto-create missing indexes
+            for idx in missing_indexes:
+                field = idx.replace('_1', '')
+                try:
+                    col_pdfs.create_index([(field, 1)])
+                except:
+                    pass
+            warnings.append(f"ℹ️ Auto-rebuilt missing indexes: {', '.join(missing_indexes)}")
+            checks_passed += 1
         else:
             checks_passed += 1
             
@@ -4695,6 +4816,70 @@ async def diagnosis_handler(message: types.Message):
     except Exception as e:
         warnings.append(f"⚠️ Affiliate Links Check: {str(e)}")
 
+    # --- 15. ADMIN STATUS CHECK ---
+    total_checks += 1
+    try:
+        total_admins = col_admins.count_documents({})
+        active_admins = col_admins.count_documents({"is_locked": False})
+        locked_admins = col_admins.count_documents({"is_locked": True})
+        if total_admins == 0:
+            warnings.append("⚠️ No admins configured (only master admin has access)")
+        else:
+            checks_passed += 1
+        # summarize in report as info
+        extra_admin_info = f"👥 Admins: {total_admins} total — {active_admins} active, {locked_admins} locked"
+        warnings.append(f"ℹ️ {extra_admin_info}")  # informational, not a warning
+    except Exception as e:
+        warnings.append(f"⚠️ Admin Check: {str(e)}")
+
+    # --- 16. BACKUP HEALTH CHECK ---
+    total_checks += 1
+    try:
+        last_backup = col_backups.find_one(sort=[("created_at", -1)])
+        if last_backup:
+            last_bk_time = last_backup.get("created_at")
+            if last_bk_time:
+                delta = now_local() - last_bk_time
+                days_ago = delta.days
+                if days_ago > 35:
+                    warnings.append(f"⚠️ Last backup was {days_ago} days ago — consider creating a new backup")
+                else:
+                    checks_passed += 1
+                bk_time_str = last_bk_time.strftime("%b %d, %Y  %I:%M %p") if hasattr(last_bk_time, 'strftime') else str(last_bk_time)
+                warnings.append(f"ℹ️ Last backup: {bk_time_str} "
+                                 f"({last_backup.get('filename', 'unknown')}, "
+                                 f"{last_backup.get('file_size_mb', 0):.2f} MB)")
+            else:
+                warnings.append("⚠️ Last backup has no timestamp")
+        else:
+            warnings.append("⚠️ No backups found — create a backup via 💾 BACKUP DATA")
+    except Exception as e:
+        warnings.append(f"⚠️ Backup Health Check: {str(e)}")
+
+    # --- 17. USER SOURCE TRACKING CHECK ---
+    total_checks += 1
+    try:
+        tracking_col = db["bot10_user_tracking"]
+        tracked_total = tracking_col.count_documents({})
+        with_source = tracking_col.count_documents({"source": {"$exists": True}})
+        dedup_col = db["bot9_user_activity"]
+        dedup_records = dedup_col.count_documents({})
+
+        source_pipeline = [
+            {"$group": {"_id": "$source", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        source_dist = {doc["_id"]: doc["count"] for doc in tracking_col.aggregate(source_pipeline)}
+        src_summary = ", ".join([f"{k}: {v}" for k, v in source_dist.items()]) if source_dist else "none"
+
+        checks_passed += 1
+        warnings.append(
+            f"ℹ️ Source tracking: {tracked_total} users tracked, {with_source} with source locked. "
+            f"Distribution: [{src_summary}]. Dedup records: {dedup_records:,}"
+        )
+    except Exception as e:
+        warnings.append(f"⚠️ Source Tracking Check: {str(e)}")
+
     
     # --- GENERATE REPORT ---
     health_score = (checks_passed / total_checks * 100) if total_checks > 0 else 0
@@ -4719,31 +4904,31 @@ async def diagnosis_handler(message: types.Message):
     
     # Build detailed report
     report = f"""
-🩺 **SYSTEM DIAGNOSIS REPORT**
+🩺 <b>SYSTEM DIAGNOSIS REPORT</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-{status_emoji} **HEALTH STATUS: {status_text}**
+{status_emoji} <b>HEALTH STATUS: {status_text}</b>
 {status_msg_text}
 
-**📊 CHECKS SUMMARY**
+<b>📊 CHECKS SUMMARY</b>
 • Total Checks: `{total_checks}`
 • Passed: `{checks_passed}` ✅
 • Warnings: `{len(warnings)}` ⚠️
 • Critical: `{len(issues)}` ❌
 
-**🎯 HEALTH SCORE**
-{status_emoji} **{health_score:.1f}%**
+<b>🎯 HEALTH SCORE</b>
+{status_emoji} <b>{health_score:.1f}%</b>
 """
 
     # Add critical issues
     if issues:
-        report += "\n**❌ CRITICAL ISSUES:**\n"
+        report += "\n<b>❌ CRITICAL ISSUES:</b>\n"
         for issue in issues:
             report += f"{issue}\n"
     
     # Add warnings
     if warnings:
-        report += "\n**⚠️ WARNINGS:**\n"
+        report += "\n<b>⚠️ WARNINGS:</b>\n"
         for warning in warnings[:5]:  # Limit to 5
             report += f"{warning}\n"
         if len(warnings) > 5:
@@ -4751,7 +4936,7 @@ async def diagnosis_handler(message: types.Message):
     
     # Add all clear message
     if not issues and not warnings:
-        report += "\n**✅ ALL CHECKS PASSED**\n"
+        report += "\n<b>✅ ALL CHECKS PASSED</b>\n"
         report += "• Database: Healthy\n"
         report += "• Collections: Valid\n"
         report += "• Data Integrity: Perfect\n"
@@ -4762,26 +4947,30 @@ async def diagnosis_handler(message: types.Message):
         report += "• Resources: Optimal\n"
         report += "• Configuration: Complete\n"
         report += "• Consistency: Validated\n"
-        report += "\n🎉 **System is running flawlessly!**\n"
+        report += "\n🎉 <b>System is running flawlessly!</b>\n"
     
     # Add recommendations
-    if issues or warnings:
-        report += "\n**💡 RECOMMENDATIONS:**\n"
-        if len(issues) > 0:
-            report += "• Address critical issues immediately\n"
-        if any("duplicate" in str(w).lower() for w in warnings + issues):
-            report += "• Run duplicate cleanup\n"
-        if any("storage" in str(w).lower() or "database" in str(w).lower() for w in warnings):
-            report += "• Consider archiving old data\n"
-        if any("log" in str(w).lower() for w in warnings):
-            report += "• Rotate log files\n"
-        if any("index" in str(w).lower() for w in warnings):
-            report += "• Rebuild database indexes\n"
+    # Add recommendations (ignoring informational ℹ️ messages)
+    real_warnings = [w for w in warnings if not str(w).startswith("ℹ️")]
+    recs = ""
+    if len(issues) > 0:
+        recs += "• Address critical issues immediately\n"
+    if any("duplicate" in str(w).lower() for w in real_warnings + issues):
+        recs += "• Run duplicate cleanup\n"
+    if any("storage" in str(w).lower() or "database" in str(w).lower() for w in real_warnings):
+        recs += "• Consider archiving old data\n"
+    if any("log" in str(w).lower() for w in real_warnings):
+        recs += "• Rotate log files\n"
+    if any("index" in str(w).lower() and "rebuilt" not in str(w).lower() for w in real_warnings):
+        recs += "• Rebuild database indexes\n"
+
+    if recs:
+        report += "\n<b>💡 RECOMMENDATIONS:</b>\n" + recs
     
     report += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     report += f"_Diagnostic completed at {now_local().strftime('%I:%M:%S %p')}_"
     
-    await status_msg.edit_text(report, parse_mode="Markdown")
+    await status_msg.edit_text(report, parse_mode="HTML")
     log_user_action(message.from_user, "Ran System Diagnosis", f"Score: {health_score:.1f}%")
 
 def get_recent_logs(lines_count=30):
@@ -4796,10 +4985,11 @@ def get_recent_logs(lines_count=30):
         with open(log_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
             content = "".join(lines[-lines_count:])
-            if len(content) > 2000:
-                content = content[-2000:]
+            if len(content) > 3500:
+                content = content[-3500:]
                 content = "..." + content
-            return content.replace("`", "'") if content.strip() else "No recent logs."
+            import html
+            return html.escape(content) if content.strip() else "No recent logs."
     except Exception as e:
         return f"Error reading logs: {e}"
 
@@ -4808,10 +4998,10 @@ async def terminal_handler(message: types.Message):
     if not await check_authorization(message, "Terminal", "can_view_analytics"):
         return
     log_user_action(message.from_user, "Viewed Terminal")
-    logs = get_recent_logs()
-    text = f"🖥️ **LIVE TERMINAL OUTPUT**\n━━━━━━━━━━━━━━━━━━━━\n```\n{logs}\n```\n━━━━━━━━━━━━━━━━━━━━"
+    logs = get_recent_logs(lines_count=40)
+    text = f"🖥️ <b>LIVE TERMINAL OUTPUT</b>\n━━━━━━━━━━━━━━━━━━━━\n<pre><code class=\"language-python\">{logs}</code></pre>\n━━━━━━━━━━━━━━━━━━━━"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 REFRESH", callback_data="refresh_terminal")]])
-    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "refresh_terminal")
 async def refresh_terminal_callback(callback: types.CallbackQuery):
@@ -4820,12 +5010,12 @@ async def refresh_terminal_callback(callback: types.CallbackQuery):
     if not await check_authorization_user(callback.from_user, callback.message, "Refresh Terminal", "can_view_analytics"):
          await callback.answer("⛔ Access Denied", show_alert=True)
          return
-    logs = get_recent_logs()
-    text = f"🖥️ **LIVE TERMINAL OUTPUT**\n━━━━━━━━━━━━━━━━━━━━\n```\n{logs}\n```\n━━━━━━━━━━━━━━━━━━━━"
+    logs = get_recent_logs(lines_count=40)
+    text = f"🖥️ <b>LIVE TERMINAL OUTPUT</b>\n━━━━━━━━━━━━━━━━━━━━\n<pre><code class=\"language-python\">{logs}</code></pre>\n━━━━━━━━━━━━━━━━━━━━"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 REFRESH", callback_data="refresh_terminal")]])
     
     try:
-        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass # Content identical or message not modified
     
@@ -4834,16 +5024,16 @@ async def refresh_terminal_callback(callback: types.CallbackQuery):
 GUIDE_PAGES = [
     # ── PAGE 1 ── Overview + Main Menu buttons
     (
-        "📚 **BOT 9 — COMPLETE GUIDE**\n"
+        "📚 <b>BOT 9 — COMPLETE GUIDE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📄 *Page 1 / 4 — Overview & Main Menu*\n\n"
 
-        "🤖 **WHAT IS BOT 9?**\n"
-        "Bot 9 is the **content management & analytics hub**.\n"
+        "🤖 <b>WHAT IS BOT 9?</b>\n"
+        "Bot 9 is the <b>content management & analytics hub</b>.\n"
         "It stores PDFs, IG content, affiliate links, YT links, and\n"
         "generates unique tracking links for Bot 8 users.\n\n"
 
-        "🏠 **MAIN MENU BUTTONS**\n"
+        "🏠 <b>MAIN MENU BUTTONS</b>\n"
         "┌─────────────────────────────\n"
         "│ 📋 LIST       — Browse all stored content\n"
         "│ ➕ ADD        — Add new content (PDF/IG/YT/Code)\n"
@@ -4858,47 +5048,47 @@ GUIDE_PAGES = [
         "│ 📚 BOT GUIDE  — This guide\n"
         "└─────────────────────────────\n\n"
 
-        "🔐 **ACCESS LEVELS**\n"
-        "• **Master Admin** — Full access to all features\n"
-        "• **Admin** — Access based on assigned permissions\n"
-        "• **Unauthorized** — Blocked, only sees Bot Guide\n\n"
+        "🔐 <b>ACCESS LEVELS</b>\n"
+        "• <b>Master Admin</b> — Full access to all features\n"
+        "• <b>Admin</b> — Access based on assigned permissions\n"
+        "• <b>Unauthorized</b> — Blocked, only sees Bot Guide\n\n"
 
         "⬇️ *Use the buttons below to navigate pages*"
     ),
 
     # ── PAGE 2 ── ADD / LIST / SEARCH / LINKS
     (
-        "📚 **BOT 9 — COMPLETE GUIDE**\n"
+        "📚 <b>BOT 9 — COMPLETE GUIDE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📄 *Page 2 / 4 — Content Management*\n\n"
 
-        "➕ **ADD MENU** *(Add new content)*\n"
-        "├ 📄 **PDF** — Add / Edit / Delete / List PDFs\n"
+        "➕ <b>ADD MENU</b> *(Add new content)*\n"
+        "├ 📄 <b>PDF</b> — Add / Edit / Delete / List PDFs\n"
         "│   └ Each PDF gets a unique link for Bot 8 users\n"
         "│   └ Supports: name, link, MSA code, IG code, YT link\n"
-        "├ 💸 **AFFILIATE** — Manage affiliate links per PDF\n"
+        "├ 💸 <b>AFFILIATE</b> — Manage affiliate links per PDF\n"
         "│   └ Add / Edit / Delete / List affiliate links\n"
         "│   └ Tracks affiliate clicks separately\n"
-        "├ 🔑 **CODE** — YT Code management\n"
+        "├ 🔑 <b>CODE</b> — YT Code management\n"
         "│   └ Add / Edit / Delete / List YT access codes\n"
         "│   └ Used for YTCODE tracking links\n"
-        "├ ▶️ **YT** — YouTube link management\n"
+        "├ ▶️ <b>YT</b> — YouTube link management\n"
         "│   └ Add / Edit / Delete / List YT links\n"
         "│   └ Links YT content to PDFs for tracking\n"
-        "└ 📸 **IG** — Instagram content management\n"
+        "└ 📸 <b>IG</b> — Instagram content management\n"
         "    └ Add / Edit / Delete / List IG content\n"
         "    └ Supports IG CC codes & click tracking\n\n"
 
-        "📋 **LIST MENU** *(Browse stored content)*\n"
+        "📋 <b>LIST MENU</b> *(Browse stored content)*\n"
         "├ 📚 ALL      — Show all PDFs with full details\n"
         "├ 📸 IG CONTENT — Show all IG content\n"
         "└ Paginated with ⬅️ PREV / NEXT ➡️ buttons\n\n"
 
-        "🔍 **SEARCH MENU** *(Find content fast)*\n"
+        "🔍 <b>SEARCH MENU</b> *(Find content fast)*\n"
         "├ 🔍 SEARCH PDF    — Search PDFs by name/code\n"
         "└ 🔍 SEARCH IG CC  — Search IG content by code\n\n"
 
-        "🔗 **LINKS MENU** *(Generate tracking links)*\n"
+        "🔗 <b>LINKS MENU</b> *(Generate tracking links)*\n"
         "├ 🏠 HOME YT   — YT homepage tracking link\n"
         "├ 📑 ALL PDF   — Direct PDF tracking links\n"
         "├ 📸 IG CC     — IG CC tracking links\n"
@@ -4907,11 +5097,11 @@ GUIDE_PAGES = [
 
     # ── PAGE 3 ── Analytics / Diagnosis / Backup / Terminal
     (
-        "📚 **BOT 9 — COMPLETE GUIDE**\n"
+        "📚 <b>BOT 9 — COMPLETE GUIDE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📄 *Page 3 / 4 — Analytics, Diagnosis & Tools*\n\n"
 
-        "📊 **ANALYTICS MENU** *(Click tracking & stats)*\n"
+        "📊 <b>ANALYTICS MENU</b> *(Click tracking & stats)*\n"
         "├ 📊 OVERVIEW         — Full dashboard: total clicks,\n"
         "│                        top performers, content counts\n"
         "├ 📄 PDF Clicks        — Per-PDF click breakdown\n"
@@ -4921,35 +5111,35 @@ GUIDE_PAGES = [
         "├ 📸 IG CC Start Clicks— IG CC link clicks\n"
         "└ 🔑 YT Code Clicks   — YT Code link clicks\n\n"
 
-        "🩺 **DIAGNOSIS MENU** *(System health checks)*\n"
+        "🩺 <b>DIAGNOSIS MENU</b> *(System health checks)*\n"
         "├ Checks MongoDB connection & collection sizes\n"
         "├ Detects orphaned records & broken references\n"
         "├ Reports missing MSA codes, empty fields\n"
         "└ Validates PDF links & IG content integrity\n\n"
 
-        "💾 **BACKUP MENU** *(Data safety tools)*\n"
+        "💾 <b>BACKUP MENU</b> *(Data safety tools)*\n"
         "├ 💾 FULL BACKUP      — Export entire DB to JSON file\n"
         "├ 📋 VIEW AS JSON     — Preview backup in chat\n"
         "├ 📊 BACKUP STATS     — Show DB collection sizes\n"
         "└ 📜 BACKUP HISTORY   — View past backup records\n\n"
 
-        "🖥️ **TERMINAL** *(Master Admin only)*\n"
+        "🖥️ <b>TERMINAL</b> *(Master Admin only)*\n"
         "├ Run any shell command directly from Telegram\n"
         "├ Output streamed back to chat\n"
         "└ Use with caution — no restrictions applied\n\n"
 
-        "⚠️ **RESET BOT DATA** *(Master Admin only)*\n"
+        "⚠️ <b>RESET BOT DATA</b> *(Master Admin only)*\n"
         "└ Wipes selected collections — irreversible!\n"
         "   Requires double confirmation before executing"
     ),
 
     # ── PAGE 4 ── Admins / Permissions / Ban / Roles
     (
-        "📚 **BOT 9 — COMPLETE GUIDE**\n"
+        "📚 <b>BOT 9 — COMPLETE GUIDE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📄 *Page 4 / 4 — Admin & Permission System*\n\n"
 
-        "👥 **ADMINS MENU** *(Manage admin accounts)*\n"
+        "👥 <b>ADMINS MENU</b> *(Manage admin accounts)*\n"
         "├ ➕ NEW ADMIN     — Add a new admin by user ID\n"
         "├ ➖ REMOVE ADMIN  — Remove an admin\n"
         "├ 📋 LIST ADMINS   — Show all admins with roles\n"
@@ -4958,7 +5148,7 @@ GUIDE_PAGES = [
         "├ 🔒 LOCK/UNLOCK   — Temporarily disable an admin\n"
         "└ 🚫 BAN CONFIG    — Ban/unban users from Bot 8\n\n"
 
-        "🔐 **PERMISSION FLAGS** *(Per-admin access control)*\n"
+        "🔐 <b>PERMISSION FLAGS</b> *(Per-admin access control)*\n"
         "├ can_list         — View content lists\n"
         "├ can_add          — Add/edit/delete content\n"
         "├ can_search       — Use search feature\n"
@@ -4970,15 +5160,15 @@ GUIDE_PAGES = [
         "├ can_manage_admins— Add/remove other admins\n"
         "└ can_reset        — Reset bot data (⚠️ dangerous)\n\n"
 
-        "🚫 **BAN SYSTEM**\n"
+        "🚫 <b>BAN SYSTEM</b>\n"
         "├ 🚫 BAN USER    — Block a user from Bot 8\n"
         "├ ✅ UNBAN USER  — Remove a ban\n"
         "└ 📋 LIST BANNED — See all currently banned users\n\n"
 
-        "📎 **ADD AFFILIATE** *(Quick inline affiliate tool)*\n"
+        "📎 <b>ADD AFFILIATE</b> *(Quick inline affiliate tool)*\n"
         "└ Shortcut to attach affiliate links to PDFs\n\n"
 
-        "💡 **TIPS**\n"
+        "💡 <b>TIPS</b>\n"
         "• All actions are logged to console\n"
         "• Unauthorized access is auto-blocked & logged\n"
         "• Bot 9 feeds content to Bot 8 in real-time\n"
@@ -5006,7 +5196,7 @@ async def guide_handler(message: types.Message, state: FSMContext):
     await message.answer(
         GUIDE_PAGES[0],
         reply_markup=get_guide_nav_keyboard(0),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "GUIDE NEXT ➡️")
@@ -5018,7 +5208,7 @@ async def guide_next_handler(message: types.Message, state: FSMContext):
     await message.answer(
         GUIDE_PAGES[page],
         reply_markup=get_guide_nav_keyboard(page),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "⬅️ GUIDE PREV")
@@ -5030,7 +5220,7 @@ async def guide_prev_handler(message: types.Message, state: FSMContext):
     await message.answer(
         GUIDE_PAGES[page],
         reply_markup=get_guide_nav_keyboard(page),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # ==========================================
@@ -5044,10 +5234,10 @@ async def analytics_menu_handler(message: types.Message, state: FSMContext):
     """Show Analytics Menu"""
     await state.set_state(AnalyticsStates.viewing_analytics)
     await message.answer(
-        "📊 **ANALYTICS DASHBOARD**\n\n"
+        "📊 <b>ANALYTICS DASHBOARD</b>\n\n"
         "Select a category to view detailed analytics:",
         reply_markup=get_analytics_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "📊 OVERVIEW")
@@ -5123,21 +5313,49 @@ async def analytics_overview_handler(message: types.Message):
     all_items.sort(key=lambda x: x["clicks"], reverse=True)
     top_5 = all_items[:5]
     
+    # ── Source tracking from bot10_user_tracking (permanent first-source lock) ──
+    try:
+        tracking_col = db["bot10_user_tracking"]
+        source_pipeline = [
+            {"$group": {"_id": "$source", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        source_counts = {doc["_id"]: doc["count"] for doc in tracking_col.aggregate(source_pipeline)}
+        total_tracked_users = tracking_col.count_documents({})
+        src_ig      = source_counts.get("IG", 0)
+        src_yt      = source_counts.get("YT", 0)
+        src_igcc    = source_counts.get("IGCC", 0)
+        src_ytcode  = source_counts.get("YTCODE", 0)
+        src_other   = total_tracked_users - src_ig - src_yt - src_igcc - src_ytcode
+    except Exception:
+        total_tracked_users = src_ig = src_yt = src_igcc = src_ytcode = src_other = 0
+
     # Build overview message
-    text = "📊 **ANALYTICS OVERVIEW**\n"
+    text = "📊 <b>ANALYTICS OVERVIEW</b>\n"
     text += "═══════════════════════\n\n"
     
-    text += f"📈 **TOTAL CLICKS:** {total_clicks:,}\n\n"
+    text += f"📈 <b>TOTAL CLICKS:</b> {total_clicks:,}\n\n"
     
-    text += "**📊 Clicks by Category:**\n"
+    text += "<b>📊 Clicks by Category:</b>\n"
     text += f"├ 📄 PDFs: {pdf_clicks:,}\n"
     text += f"├ 💸 Affiliates: {aff_clicks:,}\n"
     text += f"├ 📸 IG Start: {ig_clicks:,}\n"
     text += f"├ ▶️ YT Start: {yt_clicks:,}\n"
     text += f"├ 📸 IG CC: {ig_cc_clicks:,}\n"
     text += f"└ 🔑 YT Code: {yt_code_clicks:,}\n\n"
-    
-    text += "**📚 Content Library:**\n"
+
+    text += "<b>📡 TRAFFIC SOURCES (Unique Users — Permanently Locked):</b>\n"
+    text += f"├ 👥 Total Tracked Users: {total_tracked_users:,}\n"
+    text += f"├ 📸 IG Start: {src_ig:,} users\n"
+    text += f"├ ▶️ YT Start: {src_yt:,} users\n"
+    text += f"├ 📸 IG CC: {src_igcc:,} users\n"
+    text += f"├ 🔑 YT Code: {src_ytcode:,} users\n"
+    if src_other > 0:
+        text += f"└ ❓ Other: {src_other:,} users\n\n"
+    else:
+        text += f"└ _(Each user's source is locked on first click — never changes)_\n\n"
+
+    text += "<b>📚 Content Library:</b>\n"
     text += f"├ Total PDFs: {total_pdfs}\n"
     text += f"├ IG Content: {total_ig_content}\n"
     text += f"├ With Affiliates: {pdfs_with_affiliate}\n"
@@ -5146,9 +5364,9 @@ async def analytics_overview_handler(message: types.Message):
     text += f"└ With MSA Codes: {pdfs_with_msa}\n\n"
     
     if top_5:
-        text += "🏆 **TOP 5 PERFORMERS:**\n"
+        text += "🏆 <b>TOP 5 PERFORMERS:</b>\n"
         for idx, item in enumerate(top_5, 1):
-            text += f"{idx}. {item['type']} **{item['name']}** - {item['clicks']:,} clicks\n"
+            text += f"{idx}. {item['type']} <b>{item['name']}</b> - {item['clicks']:,} clicks\n"
         text += "\n"
     else:
         text += "📭 No clicks recorded yet.\n\n"
@@ -5163,7 +5381,7 @@ async def analytics_overview_handler(message: types.Message):
             "msa_code": {"$exists": True, "$ne": ""}
         })
         completion_rate = (complete_pdfs / total_pdfs * 100) if total_pdfs > 0 else 0
-        text += f"✅ **Setup Completion:** {completion_rate:.1f}% ({complete_pdfs}/{total_pdfs} fully configured)\n"
+        text += f"✅ <b>Setup Completion:</b> {completion_rate:.1f}% ({complete_pdfs}/{total_pdfs} fully configured)\n"
     
     text += "\n═══════════════════════\n"
     text += "💡 Select a category below for detailed analytics."
@@ -5171,7 +5389,7 @@ async def analytics_overview_handler(message: types.Message):
     await message.answer(
         text,
         reply_markup=get_analytics_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 async def send_analytics_view(message: types.Message, category: str, page: int = 0):
@@ -5248,7 +5466,7 @@ async def send_analytics_view(message: types.Message, category: str, page: int =
             f"{title}\n\n"
             f"📭 {empty_msg}",
             reply_markup=get_analytics_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
     
@@ -5289,7 +5507,11 @@ async def send_analytics_view(message: types.Message, category: str, page: int =
     text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
     
     for idx, item in enumerate(items, start=skip + 1):
-        item_name = item.get(name_field, "Unnamed")
+        # For IG CC: show only cc_code (not full content text)
+        if category == "ig_cc_start":
+            item_name = item.get("cc_code", "Unknown")
+        else:
+            item_name = item.get(name_field, "Unnamed")
         clicks = item.get(click_field, 0)
         
         # Get last clicked timestamp
@@ -5316,8 +5538,8 @@ async def send_analytics_view(message: types.Message, category: str, page: int =
         else:
             indicator = "🔥"
         
-        text += f"{idx}. {indicator} **{item_name}**\n"
-        text += f"   🔢 Clicks: **{clicks:,}**"
+        text += f"{idx}. {indicator} <b>{item_name}</b>\n"
+        text += f"   🔢 Clicks: <b>{clicks:,}</b>"
         
         if last_clicked:
             from datetime import datetime, timedelta
@@ -5341,27 +5563,39 @@ async def send_analytics_view(message: types.Message, category: str, page: int =
     
     text += f"━━━━━━━━━━━━━━━━━━━━\n"
     text += f"📊 Showing {skip + 1}-{skip + len(items)} of {total_items} items\n"
-    
+
     # Pagination buttons
     keyboard = []
     nav_row = []
-    
     if page > 0:
         nav_row.append(KeyboardButton(text=f"⬅️ PREV ({category})"))
-    
     if skip + items_per_page < total_items:
         nav_row.append(KeyboardButton(text=f"➡️ NEXT ({category})"))
-    
     if nav_row:
         keyboard.append(nav_row)
-    
     keyboard.append([KeyboardButton(text="⬅️ BACK TO ANALYTICS")])
-    
-    await message.answer(
-        text,
-        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
+
+    reply_kb = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+    if len(text) > 4000:
+        # Split into chunks, last chunk gets keyboard
+        parts = []
+        chunk = ""
+        for line in text.split("\n"):
+            if len(chunk) + len(line) + 1 > 4000:
+                parts.append(chunk)
+                chunk = line + "\n"
+            else:
+                chunk += line + "\n"
+        if chunk:
+            parts.append(chunk)
+        for i, part in enumerate(parts):
+            if i == len(parts) - 1:
+                await message.answer(part, reply_markup=reply_kb, parse_mode="HTML")
+            else:
+                await message.answer(part, parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=reply_kb, parse_mode="HTML")
 
 @dp.message(F.text == "📄 PDF Clicks")
 async def pdf_clicks_handler(message: types.Message, state: FSMContext):
@@ -5423,17 +5657,65 @@ async def back_to_analytics_handler(message: types.Message, state: FSMContext):
     """Return to analytics menu"""
     await state.set_state(AnalyticsStates.viewing_analytics)
     await message.answer(
-        "📊 **ANALYTICS DASHBOARD**",
+        "📊 <b>ANALYTICS DASHBOARD</b>",
         reply_markup=get_analytics_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
+
+@dp.message(F.text == "🆔 MSA ID POOL")
+async def msa_id_pool_handler(message: types.Message):
+    """Show MSA Node ID pool usage with progress bar"""
+    if not await check_authorization(message, "MSA ID Pool", "can_view_analytics"):
+        return
+    try:
+        # MSA IDs live in MSANODEDATA db (shared with bot8/bot10)
+        msa_col = client["MSANODEDATA"]["msa_ids"]
+        total_allocated = msa_col.count_documents({})
+        total_retired = msa_col.count_documents({"retired": True})
+        active_members = total_allocated - total_retired
+
+        TOTAL_POOL = 900_000_000  # 100,000,000 – 999,999,999
+        available = TOTAL_POOL - total_allocated
+        pct_used = total_allocated / TOTAL_POOL * 100
+        filled = round(pct_used / 5)  # 20-block bar (each block = 5%)
+        bar = "█" * filled + "░" * (20 - filled)
+
+        if pct_used > 90:
+            risk = "🔴 CRITICAL"
+        elif pct_used > 50:
+            risk = "🟠 HIGH"
+        elif pct_used > 20:
+            risk = "🟡 MODERATE"
+        else:
+            risk = "🟢 ABUNDANT"
+
+        text = (
+            "🆔 <b>MSA NODE ID POOL STATUS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>Total Pool:</b> 900,000,000 IDs\n"
+            f"✅ <b>Active Members:</b> {active_members:,}\n"
+            f"🗄️ <b>Retired IDs (reserved):</b> {total_retired:,}\n"
+            f"🔢 <b>Total Used (active+retired):</b> {total_allocated:,}\n"
+            f"🟢 <b>Available:</b> {available:,}\n\n"
+            f"📈 <b>Usage Bar:</b>\n`[{bar}]`\n"
+            f"`{pct_used:.6f}%` used \u2014 {risk}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 {now_local().strftime('%B %d, %Y  %I:%M:%S %p')}"
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=get_analytics_menu())
+    except Exception as e:
+        await message.answer(
+            f"❌ MSA Pool check failed: `{str(e)[:150]}`",
+            parse_mode="HTML",
+            reply_markup=get_analytics_menu()
+        )
 
 # --- DATA RESET HANDLER ---
 @dp.message(F.text == "⚠️ RESET BOT DATA")
 async def start_reset_data(message: types.Message, state: FSMContext):
-    # Security Check
+    # Security Check — Master Admin only
     if message.from_user.id != MASTER_ADMIN_ID:
-        await message.answer("⛔ **ACCESS DENIED.** Only the Master Admin can perform this action.")
+        await message.answer("⛔ <b>ACCESS DENIED.</b> Only the Master Admin can perform this action.", parse_mode="HTML")
         return
 
     await state.set_state(ResetStates.waiting_for_confirm_button)
@@ -5443,16 +5725,20 @@ async def start_reset_data(message: types.Message, state: FSMContext):
         [KeyboardButton(text="❌ CANCEL")]
     ]
     await message.answer(
-        "⚠️ **DANGER ZONE** ⚠️\n\n"
-        "You have requested to **RESET ALL BOT DATA**.\n"
-        "This will permanently delete:\n"
-        "- All PDFs and Links\n"
-        "- All IG Content\n"
-        "- All Logs and Settings\n\n"
-        "**THIS ACTION CANNOT BE UNDONE.**\n\n"
-        "Please confirm using the button below:",
+        "⚠️ <b>DANGER ZONE — FULL SYSTEM WIPE</b> ⚠️\n\n"
+        "You have requested to <b>RESET ALL BOT DATA</b>.\n\n"
+        "This will permanently delete <b>EVERY SINGLE THING</b> from the database:\n"
+        "• All PDFs and Links\n"
+        "• All IG Content\n"
+        "• All Logs and Settings\n"
+        "• All Admins (except your master account)\n"
+        "• All Banned Users\n"
+        "• All User Activity & Click Dedup Records\n"
+        "• All Backup Records\n\n"
+        "🔴 <b>THIS ACTION CANNOT BE UNDONE.</b>\n\n"
+        "<b>STEP 1 OF 2 — Click the button to proceed:</b>",
         reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(ResetStates.waiting_for_confirm_button)
@@ -5467,11 +5753,12 @@ async def process_reset_step1(message: types.Message, state: FSMContext):
         keyboard = [[KeyboardButton(text="❌ CANCEL")]]
         
         await message.answer(
-            "🛑 **FINAL CONFIRMATION REQUIRED** 🛑\n\n"
-            "To execute the reset protocol, type **CONFIRM** below.\n"
-            "Any other input (or clicking Cancel) will stop the operation.",
+            "🛑 <b>STEP 2 OF 2 — FINAL CONFIRMATION</b> 🛑\n\n"
+            "To execute the <b>COMPLETE SYSTEM WIPE</b>, type the word below exactly:\n\n"
+            "```\nCONFIRM\n```\n\n"
+            "Any other input (or ❌ CANCEL) will abort the operation.",
             reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     else:
         await message.answer("⚠️ Please select an option.")
@@ -5483,43 +5770,63 @@ async def process_reset_final(message: types.Message, state: FSMContext):
         return await message.answer("✅ Reset Cancelled.", reply_markup=get_main_menu(message.from_user.id))
         
     if message.text.upper() == "CONFIRM":
-        msg = await message.answer("🧨 **INITIATING SYSTEM WIPE...**", reply_markup=types.ReplyKeyboardRemove())
+        msg = await message.answer("🧨 <b>INITIATING COMPLETE SYSTEM WIPE...</b>", reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
         
         try:
-            # 1. Delete Collections
-            db.drop_collection("bot9_pdfs")
-            db.drop_collection("bot9_ig_content")
-            db.drop_collection("bot9_logs")
-            db.drop_collection("bot9_settings")
-            db.drop_collection("bot9_backups")  # Added backup metadata collection
-            
-            # 2. Delete Log File
-            log_file = "bot9.log"
-            if os.path.exists(log_file):
-                # Close logger handlers first? Python logging might lock file.
-                # We can try truncating it instead of deleting if locked.
-                with open(log_file, "w"):
-                    pass
-            
-            # 3. Delete Backup Files
+            # 1. Drop ALL bot9 collections
+            collections_to_wipe = [
+                "bot9_pdfs",
+                "bot9_ig_content",
+                "bot9_logs",
+                "bot9_settings",
+                "bot9_backups",
+                "bot9_admins",
+                "bot9_banned_users",
+                "bot9_user_activity",
+                "bot9_state",
+            ]
+            wiped = []
+            for coll_name in collections_to_wipe:
+                db.drop_collection(coll_name)
+                wiped.append(coll_name)
+
+            # 2. Truncate log file if exists
+            for log_file in ["bot9.log", "logs/bot9.log"]:
+                if os.path.exists(log_file):
+                    with open(log_file, "w"):
+                        pass
+
+            # 3. Delete local backup files
             backup_dir = "backups"
             if os.path.exists(backup_dir):
                 import shutil
                 shutil.rmtree(backup_dir)
-                logger.info("✅ Deleted all backup files")
-            
-            # Log Action (to new log file)
-            log_user_action(message.from_user, "PERFORMED FULL SYSTEM RESET")
-            
+
+            # 4. Re-seed master admin so the bot stays usable
+            try:
+                col_admins.insert_one({
+                    "user_id": MASTER_ADMIN_ID,
+                    "is_owner": True,
+                    "is_locked": False,
+                    "permissions": list(PERMISSIONS.keys()),
+                    "full_name": "Master Admin",
+                    "username": "owner",
+                    "added_at": now_local(),
+                })
+            except Exception:
+                pass  # Already exists is fine
+
+            wiped_str = "\n".join([f"• `{c}`" for c in wiped])
             await message.answer(
-                "✅ **SYSTEM RESET COMPLETE**\n"
-                "All data has been eradicated.\n"
-                "System is clean.",
+                f"✅ <b>SYSTEM RESET COMPLETE</b>\n\n"
+                f"🗑 <b>Wiped collections:</b>\n{wiped_str}\n\n"
+                f"🔄 Master Admin account re-seeded.\n"
+                f"🤖 System is clean and ready.",
                 reply_markup=get_main_menu(message.from_user.id),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         except Exception as e:
-            await message.answer(f"❌ **RESET FAILED:** {e}", reply_markup=get_main_menu(message.from_user.id))
+            await message.answer(f"❌ <b>RESET FAILED:</b> `{e}`", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
             
         await state.clear()
     else:
@@ -5536,9 +5843,9 @@ async def ig_affiliate_menu_handler(message: types.Message):
         return
     """Show IG Affiliate Submenu"""
     await message.answer(
-        "📎 **IG AFFILIATE MANAGEMENT**\n\nSelect an option:",
+        "📎 <b>IG AFFILIATE MANAGEMENT</b>\n\nSelect an option:",
         reply_markup=get_ig_affiliate_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # Back button from affiliate submenu to IG menu
@@ -5546,7 +5853,7 @@ async def ig_affiliate_menu_handler(message: types.Message):
 async def ig_affiliate_back_handler(message: types.Message, state: FSMContext):
     """Return from affiliate menu to IG menu"""
     await state.clear()
-    await message.answer("📸 **IG CODE MANAGEMENT**", reply_markup=get_ig_menu(), parse_mode="Markdown")
+    await message.answer("📸 <b>IG CODE MANAGEMENT</b>", reply_markup=get_ig_menu(), parse_mode="HTML")
 
 # 5a. ADD AFFILIATE TO IG CONTENT
 @dp.message(F.text == "📎 Add")
@@ -5604,10 +5911,10 @@ async def process_ig_affiliate_selection(message: types.Message, state: FSMConte
             not_found.append(q)
             
     if not found_contents:
-        msg = "❌ **No Content Found**"
+        msg = "❌ <b>No Content Found</b>"
         if not_found:
              msg += "\nNot found: " + ", ".join(not_found)
-        await message.answer(msg, reply_markup=get_cancel_keyboard())
+        await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         return
     
     # Store IDs
@@ -5616,13 +5923,13 @@ async def process_ig_affiliate_selection(message: types.Message, state: FSMConte
     await state.update_data(affiliate_ids=affiliate_ids)
     await state.set_state(IGAffiliateStates.waiting_for_link)
     
-    msg = f"✅ **Selected {len(found_contents)} IG items for Affiliate Link:**\n\n"
+    msg = f"✅ <b>Selected {len(found_contents)} IG items for Affiliate Link:</b>\n\n"
     for c in found_contents:
         msg += f"• {c['cc_code']} - {c['name']}\n"
     
-    msg += "\n🔗 **Enter Affiliate Link (applies to ALL above):**"
+    msg += "\n🔗 <b>Enter Affiliate Link (applies to ALL above):</b>"
     
-    await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+    await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 @dp.message(IGAffiliateStates.waiting_for_link)
 async def process_ig_affiliate_link(message: types.Message, state: FSMContext):
@@ -5654,11 +5961,11 @@ async def process_ig_affiliate_link(message: types.Message, state: FSMContext):
         
         await state.clear()
         await message.answer(
-            f"✅ **Bulk Affiliate Link Applied!**\n\n"
+            f"✅ <b>Bulk Affiliate Link Applied!</b>\n\n"
             f"🔗 Link: `{link}`\n"
             f"📊 Applied to {len(affiliate_ids)} items.",
             reply_markup=get_ig_affiliate_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     else:
         await state.clear()
@@ -5674,9 +5981,9 @@ async def start_edit_ig_affiliate(message: types.Message, state: FSMContext):
     count = col_ig_content.count_documents({"affiliate_link": {"$exists": True, "$ne": ""}})
     if count == 0:
         return await message.answer(
-            "⚠️ **No affiliate links found!**\n\nAdd an affiliate link first.",
+            "⚠️ <b>No affiliate links found!</b>\n\nAdd an affiliate link first.",
             reply_markup=get_ig_affiliate_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     
     await state.set_state(IGAffiliateEditStates.waiting_for_selection)
@@ -5726,11 +6033,11 @@ async def process_ig_affiliate_edit_selection(message: types.Message, state: FSM
     await state.set_state(IGAffiliateEditStates.waiting_for_new_link)
     
     await message.answer(
-        f"✅ **Selected:** {content['cc_code']} - {content['name']}\n\n"
+        f"✅ <b>Selected:</b> {content['cc_code']} - {content['name']}\n\n"
         f"📎 Current Link: {content.get('affiliate_link', 'N/A')}\n\n"
-        f"🔗 **Enter New Affiliate Link:**",
+        f"🔗 <b>Enter New Affiliate Link:</b>",
         reply_markup=get_cancel_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(IGAffiliateEditStates.waiting_for_new_link)
@@ -5751,7 +6058,7 @@ async def process_ig_affiliate_edit_link(message: types.Message, state: FSMConte
     
     # Check if link is same as old link
     if link == data.get('old_link'):
-        await message.answer("⚠️ **Link is identical to current link.**\nNo changes made.", reply_markup=get_ig_affiliate_menu())
+        await message.answer("⚠️ <b>Link is identical to current link.</b>\nNo changes made.", reply_markup=get_ig_affiliate_menu(), parse_mode="HTML")
         await state.clear()
         return
 
@@ -5767,12 +6074,12 @@ async def process_ig_affiliate_edit_link(message: types.Message, state: FSMConte
     
     await state.clear()
     await message.answer(
-        f"✅ **Affiliate Link Updated!**\n\n"
+        f"✅ <b>Affiliate Link Updated!</b>\n\n"
         f"🆔 Code: {data['cc_code']}\n"
         f"📝 Content: {data['name']}\n"
         f"🔗 New Link: {link}",
         reply_markup=get_ig_affiliate_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # 5c. DELETE IG AFFILIATE
@@ -5785,9 +6092,9 @@ async def start_delete_ig_affiliate(message: types.Message, state: FSMContext):
     count = col_ig_content.count_documents({"affiliate_link": {"$exists": True, "$ne": ""}})
     if count == 0:
         return await message.answer(
-            "⚠️ **No affiliate links found!**\n\nNothing to delete.",
+            "⚠️ <b>No affiliate links found!</b>\n\nNothing to delete.",
             reply_markup=get_ig_affiliate_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     
     await state.set_state(IGAffiliateDeleteStates.waiting_for_selection)
@@ -5840,13 +6147,13 @@ async def process_ig_affiliate_delete_selection(message: types.Message, state: F
     confirm_kb = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
     
     await message.answer(
-        f"⚠️ **CONFIRM DELETE AFFILIATE**\n\n"
+        f"⚠️ <b>CONFIRM DELETE AFFILIATE</b>\n\n"
         f"🆔 Code: {content['cc_code']}\n"
         f"📝 Content: {content['name']}\n"
         f"🔗 Link: {content.get('affiliate_link', '')}\n\n"
         f"Are you sure?",
         reply_markup=confirm_kb,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(IGAffiliateDeleteStates.waiting_for_confirm)
@@ -5866,11 +6173,11 @@ async def process_ig_affiliate_delete_confirm(message: types.Message, state: FSM
         
         await state.clear()
         await message.answer(
-            f"🗑️ **Affiliate Link Deleted!**\n\n"
+            f"🗑️ <b>Affiliate Link Deleted!</b>\n\n"
             f"🆔 Code: {data['cc_code']}\n"
             f"📝 Content: {data['name']}",
             reply_markup=get_ig_affiliate_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     else:
         await state.clear()
@@ -5889,25 +6196,25 @@ async def send_ig_affiliate_list_view_text(message: types.Message, page=0):
     
     if not contents and page == 0:
         return await message.answer(
-            "⚠️ **No affiliate links found!**\n\nAdd an affiliate link first.",
+            "⚠️ <b>No affiliate links found!</b>\n\nAdd an affiliate link first.",
             reply_markup=get_ig_affiliate_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     
-    text = f"📋 **IG CONTENT WITH AFFILIATE LINKS (Page {page+1}):**\nResult {skip+1}-{min(skip+len(contents), total)} of {total}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    text = f"📋 <b>IG CONTENT WITH AFFILIATE LINKS (Page {page+1}):</b>\nResult {skip+1}-{min(skip+len(contents), total)} of {total}\n━━━━━━━━━━━━━━━━━━━━\n\n"
     
     for idx, content in enumerate(contents, start=skip+1):
-        text += f"{idx}. **{content['cc_code']}**\n"
+        text += f"{idx}. <b>{content['cc_code']}</b>\n"
         text += f"   🔗 {content.get('affiliate_link', 'N/A')}\n\n"
     
-    text += f"━━━━━━━━━━━━━━━━━━━━\nTotal: **{total}** affiliate link(s)"
+    text += f"━━━━━━━━━━━━━━━━━━━━\nTotal: <b>{total}</b> affiliate link(s)"
     
     # Pagination Keyboard
     buttons = []
     if page > 0: 
-        buttons.append(KeyboardButton(text=f"⬅️ PREV_AFF {page}"))
+        buttons.append(KeyboardButton(text=f"⬅️ PREV_IGAFF {page}"))
     if (skip + limit) < total: 
-        buttons.append(KeyboardButton(text=f"➡️ NEXT_AFF {page+2}"))
+        buttons.append(KeyboardButton(text=f"➡️ NEXT_IGAFF {page+2}"))
     
     keyboard = []
     if buttons: keyboard.append(buttons)
@@ -5918,9 +6225,9 @@ async def send_ig_affiliate_list_view_text(message: types.Message, page=0):
         # Split logic if dangerously huge (fallback)
         parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for part in parts:
-             await message.answer(part, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+             await message.answer(part, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
     else:
-        await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+        await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
 
 @dp.message(F.text == "📋 List")
 async def list_ig_affiliates_handler(message: types.Message):
@@ -5929,7 +6236,7 @@ async def list_ig_affiliates_handler(message: types.Message):
     """List all IG content with affiliate links"""
     await send_ig_affiliate_list_view_text(message, page=0)
 
-@dp.message(lambda m: m.text and (m.text.startswith("⬅️ PREV_AFF") or m.text.startswith("➡️ NEXT_AFF")))
+@dp.message(lambda m: m.text and (m.text.startswith("⬅️ PREV_IGAFF") or m.text.startswith("➡️ NEXT_IGAFF")))
 async def ig_affiliate_pagination_handler(message: types.Message):
     """Handle pagination for affiliate text list"""
     try:
@@ -6012,11 +6319,14 @@ async def create_backup_file(auto=False):
         total_ig_cc_clicks = sum(ig.get('ig_cc_clicks', 0) for ig in all_ig_content)
         
         # Create metadata
+        now_ts = now_local()
         metadata = {
             "backup_type": "auto" if auto else "manual",
-            "created_at": now_local(),
-            "month": now_local().strftime("%B"),
-            "year": now_local().year,
+            "created_at": now_ts,
+            "month": now_ts.strftime("%B"),
+            "month_num": now_ts.month,            # numeric for sorting (1-12)
+            "year": now_ts.year,
+            "backup_key": f"{now_ts.year}/{now_ts.month:02d}",   # e.g. "2026/01"
             "filename": filename,
             "pdfs_count": len(all_pdfs),
             "ig_count": len(all_ig_content),
@@ -6088,12 +6398,12 @@ async def auto_backup_task():
                     try:
                         await bot.send_message(
                             MASTER_ADMIN_ID,
-                            f"✅ **AUTO-BACKUP SUCCESSFUL**\n\n"
+                            f"✅ <b>AUTO-BACKUP SUCCESSFUL</b>\n\n"
                             f"📦 File: `{metadata['filename']}`\n"
                             f"💾 Size: {metadata['file_size_mb']:.2f} MB\n"
                             f"📊 PDFs: {metadata['pdfs_count']} | IG: {metadata['ig_count']}\n"
                             f"🕐 Time: {now.strftime('%I:%M %p')}",
-                            parse_mode="Markdown"
+                            parse_mode="HTML"
                         )
                     except:
                         pass
@@ -6102,12 +6412,12 @@ async def auto_backup_task():
                     try:
                         await bot.send_message(
                             MASTER_ADMIN_ID,
-                            f"🚨 **AUTO-BACKUP FAILED!**\n\n"
+                            f"🚨 <b>AUTO-BACKUP FAILED!</b>\n\n"
                             f"⚠️ The scheduled monthly backup could not be created.\n"
                             f"📅 Date: {now.strftime('%B %d, %Y')}\n"
                             f"🕐 Time: {now.strftime('%I:%M %p')}\n\n"
                             f"Please check the system immediately!",
-                            parse_mode="Markdown"
+                            parse_mode="HTML"
                         )
                     except:
                         logger.error("Could not notify admin of backup failure!")
@@ -6125,33 +6435,33 @@ async def auto_backup_task():
             try:
                 await bot.send_message(
                     MASTER_ADMIN_ID,
-                    f"🚨 **BACKUP SYSTEM ERROR!**\n\n"
+                    f"🚨 <b>BACKUP SYSTEM ERROR!</b>\n\n"
                     f"❌ Error: `{str(e)}`\n"
                     f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
                     f"The auto-backup system encountered an error.",
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
             except:
                 logger.error("Could not notify admin of backup system error!")
             
             await asyncio.sleep(3600)  # Wait an hour before retrying
 
-@dp.message(F.text == "💾 BACKUP DATA")
+@dp.message(F.text == "💾 BACKUP DATA", StateFilter(None))
 async def backup_menu_handler(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "Backup Menu", "can_manage_admins"):
         return
     """Show backup menu"""
     await state.set_state(BackupStates.viewing_backup_menu)
     await message.answer(
-        "💾 **BACKUP & EXPORT**\n\n"
+        "💾 <b>BACKUP & EXPORT</b>\n\n"
         "Choose a backup option:\n\n"
-        "💾 **FULL BACKUP** - Export all data with timestamps\n"
-        "📋 **VIEW AS JSON** - See backup in JSON format\n"
-        "📊 **BACKUP STATS** - View database statistics\n"
-        "📜 **BACKUP HISTORY** - View all monthly backup reports\n\n"
+        "💾 <b>FULL BACKUP</b> - Export all data with timestamps\n"
+        "📋 <b>VIEW AS JSON</b> - See backup in JSON format\n"
+        "📊 <b>BACKUP STATS</b> - View database statistics\n"
+        "📜 <b>BACKUP HISTORY</b> - View all monthly backup reports\n\n"
         "Select an option:",
         reply_markup=get_backup_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "💾 FULL BACKUP")
@@ -6176,12 +6486,12 @@ async def full_backup_handler(message: types.Message):
             try:
                 await bot.send_message(
                     MASTER_ADMIN_ID,
-                    f"🚨 **MANUAL BACKUP FAILED!**\n\n"
+                    f"🚨 <b>MANUAL BACKUP FAILED!</b>\n\n"
                     f"⚠️ User: {message.from_user.first_name or 'Unknown'} (ID: {message.from_user.id})\n"
                     f"📅 Date: {now_local().strftime('%B %d, %Y')}\n"
                     f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
                     f"Please investigate the backup system!",
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
             except:
                 logger.error("Could not notify admin of manual backup failure!")
@@ -6193,26 +6503,26 @@ async def full_backup_handler(message: types.Message):
         timestamp_12h = now.strftime("%Y-%m-%d %I:%M:%S %p")
         
         # Build backup summary
-        backup_text = f"✅ **BACKUP CREATED SUCCESSFULLY!**\n"
+        backup_text = f"✅ <b>BACKUP CREATED SUCCESSFULLY!</b>\n"
         backup_text += f"═══════════════════════════\n\n"
-        backup_text += f"📦 **File:** `{metadata['filename']}`\n"
-        backup_text += f"💾 **Size:** {metadata['file_size_mb']:.2f} MB\n"
-        backup_text += f"🕐 **Created:** {timestamp_12h}\n\n"
+        backup_text += f"📦 <b>File:</b> `{metadata['filename']}`\n"
+        backup_text += f"💾 <b>Size:</b> {metadata['file_size_mb']:.2f} MB\n"
+        backup_text += f"🕐 <b>Created:</b> {timestamp_12h}\n\n"
         
-        backup_text += f"📊 **DATA SUMMARY:**\n"
+        backup_text += f"📊 <b>DATA SUMMARY:</b>\n"
         backup_text += f"├ 📄 PDFs: {metadata['pdfs_count']}\n"
         backup_text += f"└ 📸 IG Content: {metadata['ig_count']}\n\n"
         
-        backup_text += f"🎯 **CLICK STATISTICS:**\n"
+        backup_text += f"🎯 <b>CLICK STATISTICS:</b>\n"
         backup_text += f"├ Total Clicks: {metadata['total_clicks']:,}\n"
         backup_text += f"├ YT Clicks: {metadata['total_yt_clicks']:,}\n"
         backup_text += f"└ IGCC Clicks: {metadata['total_ig_cc_clicks']:,}\n\n"
         
         backup_text += f"═══════════════════════════\n"
-        backup_text += f"💡 **Backup Location:**\n`backups/{metadata['filename']}`\n\n"
+        backup_text += f"💡 <b>Backup Location:</b>\n`backups/{metadata['filename']}`\n\n"
         backup_text += f"🔒 Data is compressed and saved securely!"
         
-        await message.answer(backup_text, parse_mode="Markdown")
+        await message.answer(backup_text, parse_mode="HTML")
         
         # Log the backup action
         log_user_action(message.from_user, "FULL_BACKUP", f"Created {metadata['filename']} ({metadata['file_size_mb']:.2f} MB)")
@@ -6225,12 +6535,12 @@ async def full_backup_handler(message: types.Message):
         try:
             await bot.send_message(
                 MASTER_ADMIN_ID,
-                f"🚨 **BACKUP EXCEPTION!**\n\n"
+                f"🚨 <b>BACKUP EXCEPTION!</b>\n\n"
                 f"❌ Error: `{str(e)}`\n"
                 f"👤 User: {message.from_user.first_name or 'Unknown'} (ID: {message.from_user.id})\n"
                 f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
                 f"Check the backup system immediately!",
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         except:
             logger.error("Could not notify admin of backup exception!")
@@ -6296,12 +6606,12 @@ async def view_json_backup_handler(message: types.Message):
         # Send file to user
         await message.answer_document(
             types.FSInputFile(filename),
-            caption=f"📋 **JSON BACKUP**\n\n"
+            caption=f"📋 <b>JSON BACKUP</b>\n\n"
                    f"🕐 Time: {timestamp_12h}\n"
                    f"📊 PDFs: {len(all_pdfs)}\n"
                    f"📸 IG Content: {len(all_ig_content)}\n\n"
                    f"✅ Backup exported successfully!",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         
         # Log the action
@@ -6334,15 +6644,15 @@ async def backup_stats_handler(message: types.Message):
         ig_size_mb = ig_stats.get("size", 0) / (1024 * 1024)
         
         # Build stats message
-        stats_text = f"📊 **DATABASE STATISTICS**\n"
+        stats_text = f"📊 <b>DATABASE STATISTICS</b>\n"
         stats_text += f"═══════════════════════════\n\n"
         
-        stats_text += f"💾 **STORAGE:**\n"
+        stats_text += f"💾 <b>STORAGE:</b>\n"
         stats_text += f"├ Total DB Size: {db_size_mb:.2f} MB\n"
         stats_text += f"├ PDFs Collection: {pdf_size_mb:.2f} MB\n"
         stats_text += f"└ IG Collection: {ig_size_mb:.2f} MB\n\n"
         
-        stats_text += f"📁 **COLLECTIONS:**\n"
+        stats_text += f"📁 <b>COLLECTIONS:</b>\n"
         stats_text += f"├ `bot9_pdfs`: {pdf_count:,} documents\n"
         stats_text += f"└ `bot9_ig_content`: {ig_count:,} documents\n\n"
         
@@ -6353,7 +6663,7 @@ async def backup_stats_handler(message: types.Message):
         pdf_index_count = sum(1 for _ in pdf_indexes)
         ig_index_count = sum(1 for _ in ig_indexes)
         
-        stats_text += f"🔍 **INDEXES:**\n"
+        stats_text += f"🔍 <b>INDEXES:</b>\n"
         stats_text += f"├ PDFs: {pdf_index_count} indexes\n"
         stats_text += f"└ IG Content: {ig_index_count} indexes\n\n"
         
@@ -6361,14 +6671,14 @@ async def backup_stats_handler(message: types.Message):
         recent_pdfs = col_pdfs.count_documents({"created_at": {"$gte": now_local().replace(hour=0, minute=0, second=0, microsecond=0)}})
         recent_ig = col_ig_content.count_documents({"created_at": {"$gte": now_local().replace(hour=0, minute=0, second=0, microsecond=0)}})
         
-        stats_text += f"📈 **TODAY'S ACTIVITY:**\n"
+        stats_text += f"📈 <b>TODAY'S ACTIVITY:</b>\n"
         stats_text += f"├ New PDFs: {recent_pdfs}\n"
         stats_text += f"└ New IG Content: {recent_ig}\n\n"
         
         stats_text += f"═══════════════════════════\n"
-        stats_text += f"🕐 **Updated:** {now_local().strftime('%I:%M:%S %p')}"
+        stats_text += f"🕐 <b>Updated:</b> {now_local().strftime('%I:%M:%S %p')}"
         
-        await message.answer(stats_text, parse_mode="Markdown")
+        await message.answer(stats_text, parse_mode="HTML")
         
     except Exception as e:
         logger.error(f"Stats error: {e}")
@@ -6377,74 +6687,90 @@ async def backup_stats_handler(message: types.Message):
 
 @dp.message(F.text == "📜 BACKUP HISTORY")
 async def backup_history_handler(message: types.Message):
-    """Show complete backup history with all monthly reports"""
+    """Show complete backup history grouped by Year → Month with MongoDB storage info"""
     if not await check_authorization(message, "View Backup History", "can_manage_users"):
         return
     
     try:
-        # Get all backups sorted by creation date (newest first)
-        all_backups = list(col_backups.find().sort("created_at", -1))
+        # Get all backups sorted newest first
+        all_backups = list(col_backups.find().sort([("year", -1), ("month_num", -1), ("created_at", -1)]))
         
         if not all_backups:
             await message.answer(
-                "📜 **BACKUP HISTORY**\n\n"
+                "📜 <b>BACKUP HISTORY</b>\n\n"
                 "No backups found in the system.\n\n"
-                "💡 Use **💾 FULL BACKUP** to create your first backup!",
-                parse_mode="Markdown"
+                "💡 Use <b>💾 FULL BACKUP</b> to create your first backup!\n\n"
+                f"📦 <b>Storage Location:</b>\n"
+                f"Database: `{MONGO_DB_NAME}`\n"
+                f"Collection: `bot9_backups`\n"
+                f"Key structure: `year / month_num / backup_key`",
+                parse_mode="HTML"
             )
             return
         
-        # Build history report
-        history = "📜 **BACKUP HISTORY REPORT**\n"
-        history += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        history += f"📊 **Total Backups:** {len(all_backups)}\n\n"
-        
-        # Group by year for better organization
-        backups_by_year = {}
+        # Group by year → then month_num within year
+        from collections import defaultdict
+        by_year_month: dict = defaultdict(lambda: defaultdict(list))
         for backup in all_backups:
-            year = backup.get('year', now_local().year)
-            if year not in backups_by_year:
-                backups_by_year[year] = []
-            backups_by_year[year].append(backup)
-        
-        # Display backups grouped by year
-        for year in sorted(backups_by_year.keys(), reverse=True):
-            history += f"📅 **{year}**\n"
-            history += "═" * 30 + "\n"
-            
-            for backup in backups_by_year[year]:
-                month = backup.get('month', 'Unknown')
-                filename = backup.get('filename', 'Unknown')
-                size_mb = backup.get('file_size_mb', 0)
-                backup_type = backup.get('backup_type', 'manual')
-                created_at = backup.get('created_at')
-                
-                # Format timestamp
-                if created_at:
-                    if isinstance(created_at, str):
-                        time_str = created_at
+            year = backup.get("year", now_local().year)
+            month_num = backup.get("month_num", now_local().month)
+            by_year_month[year][month_num].append(backup)
+
+        history = "📜 <b>BACKUP HISTORY</b>\n"
+        history += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        history += f"📊 <b>Total Backups:</b> {len(all_backups)}\n"
+        history += f"📦 <b>Stored in:</b> `{MONGO_DB_NAME}` → collection `bot9_backups`\n\n"
+
+        for year in sorted(by_year_month.keys(), reverse=True):
+            history += f"╔═══════════════════\n"
+            history += f"║ 📅 <b>{year}</b>\n"
+            history += f"╚═══════════════════\n"
+
+            months_in_year = by_year_month[year]
+            for month_num in sorted(months_in_year.keys(), reverse=True):
+                backups_in_month = months_in_year[month_num]
+                first = backups_in_month[0]
+                month_name = first.get("month", f"Month {month_num}")
+                backup_key = first.get("backup_key", f"{year}/{month_num:02d}")
+
+                history += f"\n  📁 <b>{month_name} {year}</b>\n"
+                history += f"  DB path: `{MONGO_DB_NAME}.bot9_backups`  key: `{backup_key}`\n"
+                history += "  " + "─" * 30 + "\n"
+
+                for backup in backups_in_month:
+                    filename  = backup.get("filename", "unknown")
+                    size_mb   = backup.get("file_size_mb", 0)
+                    bk_type   = backup.get("backup_type", "manual")
+                    created_at = backup.get("created_at")
+
+                    if created_at and hasattr(created_at, "strftime"):
+                        time_str = created_at.strftime("%b %d, %Y  %I:%M %p")
                     else:
-                        time_str = created_at.strftime("%b %d, %I:%M %p")
-                else:
-                    time_str = "Unknown"
-                
-                # Type emoji
-                type_emoji = "🔄" if backup_type == "auto" else "👤"
-                
-                history += f"\n{type_emoji} **{month}**\n"
-                history += f"├ File: `{filename}`\n"
-                history += f"├ Size: {size_mb:.2f} MB\n"
-                history += f"├ PDFs: {backup.get('pdfs_count', 0)} | IG: {backup.get('ig_count', 0)}\n"
-                history += f"├ Clicks: {backup.get('total_clicks', 0):,}\n"
-                history += f"└ Created: {time_str}\n"
-            
+                        time_str = str(created_at) if created_at else "Unknown"
+
+                    type_emoji = "🔄 Auto" if bk_type == "auto" else "👤 Manual"
+
+                    history += f"  {type_emoji}\n"
+                    history += f"  ├ 🗂 File: `{filename}`\n"
+                    history += f"  ├ 💾 Size: {size_mb:.2f} MB\n"
+                    history += f"  ├ 📄 PDFs: {backup.get('pdfs_count', 0)}  |  📸 IG: {backup.get('ig_count', 0)}\n"
+                    history += f"  ├ 🖱 Clicks: {backup.get('total_clicks', 0):,}\n"
+                    history += f"  └ 🕐 Created: {time_str}\n\n"
+
             history += "\n"
-        
+
         history += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        history += "🔄 = Auto-backup | 👤 = Manual backup\n\n"
-        history += "💡 All backups are stored permanently"
-        
-        await message.answer(history, parse_mode="Markdown")
+        history += "🔄 = Auto-backup  |  👤 = Manual backup\n"
+        history += "💡 All backups are stored permanently in MongoDB"
+
+        # Split if too long for Telegram (4096 chars limit)
+        if len(history) > 4000:
+            chunks = [history[i:i+4000] for i in range(0, len(history), 4000)]
+            for chunk in chunks:
+                await message.answer(chunk, parse_mode="HTML")
+        else:
+            await message.answer(history, parse_mode="HTML")
+
         log_user_action(message.from_user, "VIEW_BACKUP_HISTORY", f"Viewed {len(all_backups)} backups")
         
     except Exception as e:
@@ -6462,7 +6788,7 @@ async def admin_menu_handler(message: types.Message):
     if not await check_authorization(message, "Access Admin Menu", "can_manage_admins"):
         return
     
-    await message.answer("🔐 **Admin Management**\nSelect an option below:", reply_markup=get_admin_config_menu(), parse_mode="Markdown")
+    await message.answer("🔐 <b>Admin Management</b>\nSelect an option below:", reply_markup=get_admin_config_menu(), parse_mode="HTML")
 
 @dp.message(F.text == "📋 LIST ADMINS")
 async def list_admins_handler(message: types.Message, state: FSMContext):
@@ -6481,8 +6807,8 @@ async def send_admin_list_view(message: types.Message, page: int = 0):
     skip = page * ADMINS_PER_PAGE
 
     try:
-        total_admins = col_admins.count_documents({})
-        admins = list(col_admins.find({}).skip(skip).limit(ADMINS_PER_PAGE))
+        total_admins = col_admins.count_documents({"user_id": {"$ne": MASTER_ADMIN_ID}})
+        admins = list(col_admins.find({"user_id": {"$ne": MASTER_ADMIN_ID}}).skip(skip).limit(ADMINS_PER_PAGE))
 
         if not admins and page == 0:
             # Build keyboard with just back button
@@ -6490,12 +6816,12 @@ async def send_admin_list_view(message: types.Message, page: int = 0):
                 keyboard=[[KeyboardButton(text="⬅️ BACK TO ADMIN MENU")]],
                 resize_keyboard=True
             )
-            await message.answer("📋 **Admin List**\n\nNo admins found in the database.", reply_markup=kb, parse_mode="Markdown")
+            await message.answer("📋 <b>Admin List</b>\n\nNo other admins found in the database.", reply_markup=kb, parse_mode="HTML")
             return
 
         # Build message
         total_pages = max(1, (total_admins + ADMINS_PER_PAGE - 1) // ADMINS_PER_PAGE)
-        text = f"📋 **Admin List** — Page {page + 1}/{total_pages} ({total_admins} total)\n"
+        text = f"📋 <b>Admin List</b> — Page {page + 1}/{total_pages} ({total_admins} total)\n"
         text += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
         for i, admin in enumerate(admins, start=skip + 1):
@@ -6508,7 +6834,9 @@ async def send_admin_list_view(message: types.Message, page: int = 0):
             status_str = "[🔒 LOCKED]" if is_locked else "[🔓 ACTIVE]"
 
             username_str = f"@{username}" if username and username != "Unknown" else "No username"
-            text += f"**{i}.** `{uid}` — {name} {status_str}\n"
+            
+            # Use same format but separate lines carefully
+            text += f"<b>{i}.</b> `{uid}` — {name} {status_str}\n"
             text += f"   {username_str} | 🔑 {perm_count} permissions\n\n"
 
         text += "━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -6527,7 +6855,7 @@ async def send_admin_list_view(message: types.Message, page: int = 0):
         keyboard_rows.append([KeyboardButton(text="⬅️ RETURN BACK"), KeyboardButton(text="🏠 MAIN MENU")])
 
         kb = ReplyKeyboardMarkup(keyboard=keyboard_rows, resize_keyboard=True)
-        await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Error in send_admin_list_view: {e}")
@@ -6548,16 +6876,15 @@ async def prev_admin_page(message: types.Message, state: FSMContext):
     await send_admin_list_view(message, page)
 
 @dp.message(F.text.contains("BACK"))
-@dp.message(F.text == "⬅️ RETURN BACK")
 async def admin_list_back(message: types.Message, state: FSMContext):
     """Return to Admin Management menu from list view"""
     if not await check_authorization(message, "Admin Menu", "can_manage_admins"):
         return
     await state.clear()
     await message.answer(
-        "🔐 **Admin Management**\nSelect an option below:",
+        "🔐 <b>Admin Management</b>\nSelect an option below:",
         reply_markup=get_admin_config_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 
@@ -6566,32 +6893,19 @@ async def admin_list_back(message: types.Message, state: FSMContext):
 # BAN CONFIGURATION HANDLERS
 # ==========================================
 
-@dp.message(F.text == "🏠 MAIN MENU")
-async def main_menu_handler(message: types.Message, state: FSMContext):
-    """Return to Main Menu (globally available for admins)"""
-    if not await check_authorization(message, "Main Menu"):
-        return
-        
-    await state.clear()
-    await message.answer(
-        "👋 **Welcome Back!**\nSelect an option from the menu below:",
-        reply_markup=get_main_menu(message.from_user.id),
-        parse_mode="Markdown"
-    )
-
 @dp.message(F.text == "🚫 BAN CONFIG")
 async def ban_config_menu_handler(message: types.Message):
     """Show Ban Configuration Menu"""
     if not await check_authorization(message, "Access Ban Config", "can_manage_admins"):
         return
-    await message.answer("🚫 **BAN CONFIGURATION**\nSelect an option below:", reply_markup=get_ban_config_menu(), parse_mode="Markdown")
+    await message.answer("🚫 <b>BAN CONFIGURATION</b>\nSelect an option below:", reply_markup=get_ban_config_menu(), parse_mode="HTML")
 
 @dp.message(F.text == "⬅️ BACK TO ADMIN MENU")
 async def back_to_admin_menu_handler(message: types.Message):
     """Return to Admin Menu"""
     if not await check_authorization(message, "Back to Admin Menu", "can_manage_admins"):
         return
-    await message.answer("👥 **ADMIN CONFIGURATION**", reply_markup=get_admin_config_menu(), parse_mode="Markdown")
+    await message.answer("👥 <b>ADMIN CONFIGURATION</b>", reply_markup=get_admin_config_menu(), parse_mode="HTML")
 
 @dp.message(F.text == "🚫 BAN USER")
 async def ban_user_start(message: types.Message, state: FSMContext):
@@ -6600,11 +6914,11 @@ async def ban_user_start(message: types.Message, state: FSMContext):
         return
     await state.set_state(AdminManagementStates.waiting_for_ban_user_id)
     await message.answer(
-        "🚫 **BAN USER**\n\n"
-        "Please enter the **Telegram User ID** of the user to ban.\n"
+        "🚫 <b>BAN USER</b>\n\n"
+        "Please enter the <b>Telegram User ID</b> of the user to ban.\n"
         "They will be blocked from accessing the bot.",
         reply_markup=get_cancel_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminManagementStates.waiting_for_ban_user_id)
@@ -6625,9 +6939,11 @@ async def ban_user_process_id(message: types.Message, state: FSMContext):
         # Prevent banning Admins
         if is_admin(ban_id):
             await message.answer(
-                "⛔ **ERROR**\n\nYou cannot ban an Admin!\nRemove them from admins first.", 
+                "⛔ <b>ACTION DENIED</b>\n\n"
+                "You cannot ban an active Admin!\n"
+                "<i>Please remove them from the Admin list first.</i>", 
                 reply_markup=get_ban_config_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             await state.clear()
             return
@@ -6635,9 +6951,9 @@ async def ban_user_process_id(message: types.Message, state: FSMContext):
         # Check if already banned
         if is_banned(ban_id):
             await message.answer(
-                f"⚠️ **User {ban_id} is already banned!**", 
+                f"⚠️ <b>User `{ban_id}` is already banned!</b>", 
                 reply_markup=get_ban_config_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             await state.clear()
             return
@@ -6648,9 +6964,9 @@ async def ban_user_process_id(message: types.Message, state: FSMContext):
         
         await state.clear()
         await message.answer(
-            f"✅ **SUCCESS!**\n\nUser `{ban_id}` has been BANNED.",
+            f"✅ <b>SUCCESS!</b>\n\nUser `{ban_id}` has been BANNED.",
             reply_markup=get_ban_config_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         
     except Exception as e:
@@ -6665,10 +6981,10 @@ async def unban_user_start(message: types.Message, state: FSMContext):
         return
     await state.set_state(AdminManagementStates.waiting_for_unban_user_id)
     await message.answer(
-        "✅ **UNBAN USER**\n\n"
-        "Please enter the **Telegram User ID** of the user to unban.",
+        "✅ <b>UNBAN USER</b>\n\n"
+        "Please enter the <b>Telegram User ID</b> of the user to unban.",
         reply_markup=get_cancel_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminManagementStates.waiting_for_unban_user_id)
@@ -6690,9 +7006,9 @@ async def unban_user_process_id(message: types.Message, state: FSMContext):
         banned_doc = col_banned_users.find_one({"user_id": unban_id})
         if not banned_doc:
             await message.answer(
-                f"⚠️ **User {unban_id} is NOT found in ban list.**", 
+                f"⚠️ <b>User {unban_id} is NOT found in ban list.</b>", 
                 reply_markup=get_ban_config_menu(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             await state.clear()
             return
@@ -6703,9 +7019,9 @@ async def unban_user_process_id(message: types.Message, state: FSMContext):
         
         await state.clear()
         await message.answer(
-            f"✅ **SUCCESS!**\n\nUser `{unban_id}` has been UNBANNED.",
+            f"✅ <b>SUCCESS!</b>\n\nUser `{unban_id}` has been UNBANNED.",
             reply_markup=get_ban_config_menu(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         
     except Exception as e:
@@ -6722,10 +7038,10 @@ async def list_banned_handler(message: types.Message):
     banned_users = list(col_banned_users.find({}))
     
     if not banned_users:
-        await message.answer("⚠️ **No banned users found.**", reply_markup=get_ban_config_menu(), parse_mode="Markdown")
+        await message.answer("⚠️ <b>No banned users found.</b>", reply_markup=get_ban_config_menu(), parse_mode="HTML")
         return
         
-    msg = "🚫 **BANNED USERS LIST**\n━━━━━━━━━━━━━━━━━━━━\n"
+    msg = "🚫 <b>BANNED USERS LIST</b>\n━━━━━━━━━━━━━━━━━━━━\n"
     count = 0
     for user in banned_users:
         count += 1
@@ -6744,7 +7060,7 @@ async def list_banned_handler(message: types.Message):
         name = user.get("full_name", "Unknown")
         
         msg += (
-            f"{count}. **{name}** (`{uid}`)\n"
+            f"{count}. <b>{name}</b> (`{uid}`)\n"
             f"   📝 Reason: {reason}\n"
             f"   📅 Time: {date_str}\n\n"
         )
@@ -6752,7 +7068,7 @@ async def list_banned_handler(message: types.Message):
     if len(msg) > 4000:
         msg = msg[:4000] + "\n...(truncated)"
         
-    await message.answer(msg, reply_markup=get_ban_config_menu(), parse_mode="Markdown")
+    await message.answer(msg, reply_markup=get_ban_config_menu(), parse_mode="HTML")
 
 # ==========================================
 # ROLE MANAGEMENT HANDLERS
@@ -6765,9 +7081,9 @@ async def roles_menu_handler(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "Manage Roles", "can_manage_admins"):
         return
         
-    # Check if admins exist
-    if col_admins.count_documents({}) == 0:
-        await message.answer("⚠️ No admins found.", reply_markup=get_admin_config_menu())
+    # Check if admins exist excluding Master Admin
+    if col_admins.count_documents({"user_id": {"$ne": MASTER_ADMIN_ID}}) == 0:
+        await message.answer("⚠️ No other admins found.", reply_markup=get_admin_config_menu())
         return
 
     # Determine Mode
@@ -6782,14 +7098,17 @@ async def roles_menu_handler(message: types.Message, state: FSMContext):
     await send_role_admin_list(message, 0, mode)
 
 async def send_role_admin_list(message: types.Message, page: int, mode: str = "roles"):
-    """Helper to send paginated admin list for role selection"""
+    """Helper to send paginated admin list for role selection or lock/unlock"""
     ITEMS_PER_PAGE = 10
-    admins = list(col_admins.find({}).sort("added_at", 1))
+    admins = list(col_admins.find({"user_id": {"$ne": MASTER_ADMIN_ID}}).sort("added_at", 1))
     total_admins = len(admins)
-    total_pages = (total_admins + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+    total_pages = max(1, (total_admins + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    
+    # Cap page just in case
+    page = min(page, max(0, total_pages - 1))
     
     start = page * ITEMS_PER_PAGE
-    end = start + ITEMS_PER_PAGE
+    end = min(start + ITEMS_PER_PAGE, total_admins)
     current_admins = admins[start:end]
     
     # Build Keyboard & Text List
@@ -6800,17 +7119,28 @@ async def send_role_admin_list(message: types.Message, page: int, mode: str = "r
     row = []
     for i, admin in enumerate(current_admins):
         user_id = admin.get("user_id")
-        name = admin.get("full_name", "Unknown")
-        is_locked = admin.get("is_locked", False)
         
+        # Smartly extract Name, fallback to Username, then User ID
+        name = admin.get("full_name")
+        if not name or name == str(user_id):
+            name = admin.get("username")
+            if not name:
+                name = "Admin"
+                
+        is_locked = admin.get("is_locked", False)
         status_str = "[🔒 LOCKED]" if is_locked else "[🔓 ACTIVE]"
         
         # Add to text list
         global_idx = start + i + 1
-        admin_list_text += f"{global_idx}. **{name}** (`{user_id}`) {status_str}\n"
+        admin_list_text += f"{global_idx}. <b>{name}</b> (`{user_id}`) {status_str}\n"
         
-        # Button Format: "👤 Name (ID)"
-        btn_text = f"👤 {name} ({user_id})"
+        # Button Format changes based on mode
+        if mode == "lock":
+            icon = "🔒" if is_locked else "🔓"
+            btn_text = f"{icon} {name} [{user_id}]"
+        else:
+            btn_text = f"👤 {name} [{user_id}]"
+            
         row.append(KeyboardButton(text=btn_text))
         if len(row) == 2:
             keyboard.append(row)
@@ -6830,13 +7160,16 @@ async def send_role_admin_list(message: types.Message, page: int, mode: str = "r
     # Standard Controls
     keyboard.append([KeyboardButton(text="⬅️ RETURN BACK"), KeyboardButton(text="🏠 MAIN MENU")])
     
+    header = "LOCK/UNLOCK" if mode == "lock" else "MODIFY ROLE"
+    action = "toggle lock status" if mode == "lock" else "modify their role"
+    
     await message.answer(
-        f"👔 **SELECT ADMIN TO {'MODIFY ROLE' if mode == 'roles' else 'LOCK/UNLOCK'}**\n\n"
-        f"Select an admin from the list below:\n\n"
+        f"👔 <b>SELECT ADMIN TO {header}</b>\n\n"
+        f"Select an admin from the list below to {action}:\n\n"
         f"{admin_list_text}\n"
         f"Page {page + 1}/{total_pages}",
         reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminRoleStates.waiting_for_admin_selection, F.text == "➡️ NEXT ROLES")
@@ -6857,7 +7190,7 @@ async def prev_role_page(message: types.Message, state: FSMContext):
 
 @dp.message(AdminRoleStates.waiting_for_admin_selection)
 async def role_admin_selected(message: types.Message, state: FSMContext):
-    """Admin selected for role"""
+    """Admin selected for role or lock toggle"""
     text = message.text
     
     if text == "❌ CANCEL" or text == "⬅️ RETURN BACK":
@@ -6865,11 +7198,12 @@ async def role_admin_selected(message: types.Message, state: FSMContext):
         await message.answer("↩️ Returned to Admin menu.", reply_markup=get_admin_config_menu())
         return
 
-    # Try to extract ID from button text "Name (ID)"
-    # Regex to find digits inside parentheses at the end of string
+    # Try to extract ID from button text "Name [ID]" or "(ID)" for legacy
     import re
-    match = re.search(r"\((\d+)\)$", text)
-    
+    match = re.search(r"\[(\d+)\]$", text)
+    if not match:
+        match = re.search(r"\((\d+)\)$", text)
+        
     target_admin_id = None
     if match:
         target_admin_id = int(match.group(1))
@@ -6880,7 +7214,6 @@ async def role_admin_selected(message: types.Message, state: FSMContext):
         return
         
     # Verify admin exists (Direct DB check to allow managing locked admins)
-    # is_admin() returns False for locked admins, so we can't use it here.
     admin_doc = col_admins.find_one({"user_id": target_admin_id})
     if not admin_doc and target_admin_id != MASTER_ADMIN_ID:
         await message.answer(f"⚠️ User {target_admin_id} is not an admin.", reply_markup=get_admin_config_menu())
@@ -6889,41 +7222,50 @@ async def role_admin_selected(message: types.Message, state: FSMContext):
         
     # Prevent modifying Master Admin
     if target_admin_id == MASTER_ADMIN_ID:
-        await message.answer("⛔ You cannot modify the Master Admin's role.", reply_markup=get_admin_config_menu())
+        await message.answer("⛔ You cannot modify the Master Admin.", reply_markup=get_admin_config_menu())
         await state.clear()
         return
-        
-    # Store target admin ID
-    await state.update_data(target_admin_id=target_admin_id)
-    await state.set_state(AdminRoleStates.waiting_for_role_selection)
-    
-    admin_name = "Admin"
-    admin_doc = col_admins.find_one({"user_id": target_admin_id})
-    is_locked = False
-    if admin_doc:
-        admin_name = admin_doc.get("full_name", "Admin")
-        is_locked = admin_doc.get("is_locked", False)
 
+    admin_name = admin_doc.get("full_name", "Admin")
+    is_locked = admin_doc.get("is_locked", False)
+    
     # Determine Menu based on Mode
     data = await state.get_data()
     mode = data.get("role_menu_mode", "roles")
-    
-    target_menu = get_roles_menu()
-    msg_text = f"👔 **SELECT ROLE FOR {admin_name}** (`{target_admin_id}`)\n\nChoose a role to apply permissions:"
+    current_page = data.get("role_admin_page", 0)
     
     if mode == "lock":
-        target_menu = get_lock_menu()
-        status_text = "🔒 **LOCKED**" if is_locked else "🔓 **UNLOCKED**"
-        msg_text = (
-            f"🔒 **LOCK MANAGEMENT FOR {admin_name}** (`{target_admin_id}`)\n\n"
-            f"Current Status: {status_text}\n\n"
-            f"Select action:"
+        # Instantly toggle lock status and stay on the same paginated keyboard
+        new_lock_state = not is_locked
+        col_admins.update_one({"user_id": target_admin_id}, {"$set": {"is_locked": new_lock_state}})
+        
+        status_text = "LOCKED (Inactive)" if new_lock_state else "UNLOCKED (Active)"
+        icon = "🔒" if new_lock_state else "🔓"
+        
+        log_user_action(message.from_user, f"{icon} ADMIN STATUS CHANGED", f"Set {target_admin_id} to {status_text}")
+        
+        await message.answer(
+            f"✅ <b>STATUS UPDATED</b>\n\n"
+            f"👤 Admin: {admin_name} (`{target_admin_id}`)\n"
+            f"{icon} Status: <b>{status_text}</b>",
+            parse_mode="HTML"
         )
-
+        
+        # Refresh the active page
+        await send_role_admin_list(message, current_page, mode)
+        return
+        
+    # Standard role assignment flow (mode == "roles")
+    await state.update_data(target_admin_id=target_admin_id)
+    await state.set_state(AdminRoleStates.waiting_for_role_selection)
+    
+    target_menu = get_roles_menu()
+    msg_text = f"👔 <b>SELECT ROLE FOR {admin_name}</b> (`{target_admin_id}`)\n\nChoose a role to apply permissions:"
+    
     await message.answer(
         msg_text,
         reply_markup=target_menu,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminRoleStates.waiting_for_role_selection)
@@ -6945,11 +7287,11 @@ async def role_selected_process(message: types.Message, state: FSMContext):
         await state.update_data(target_role="OWNER")
         await state.set_state(AdminRoleStates.waiting_for_owner_password)
         await message.answer(
-            "🔐 **SECURITY CHECK**\n\n"
+            "🔐 <b>SECURITY CHECK</b>\n\n"
             "Resetting Ownership requires a password.\n"
-            "Please enter the **Owner Password**:",
+            "Please enter the <b>Owner Password</b>:",
             reply_markup=get_cancel_keyboard(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
 
@@ -6963,7 +7305,7 @@ async def role_selected_process(message: types.Message, state: FSMContext):
         # Check if already locked
         admin_doc = col_admins.find_one({"user_id": target_admin_id})
         if admin_doc and admin_doc.get("is_locked", False):
-            await message.answer(f"⚠️ **Admin {target_admin_id} is ALREADY LOCKED.**", reply_markup=get_admin_config_menu())
+            await message.answer(f"⚠️ <b>Admin {target_admin_id} is ALREADY LOCKED.</b>", reply_markup=get_admin_config_menu(), parse_mode="HTML")
             await state.clear()
             return
 
@@ -6971,8 +7313,8 @@ async def role_selected_process(message: types.Message, state: FSMContext):
         log_user_action(message.from_user, "ADMIN LOCKED", f"Locked {target_admin_id}")
         await state.clear()
         await message.answer(
-            f"🔒 **ADMIN LOCKED**\n\nUser `{target_admin_id}` has been locked.\nThey have NO access.",
-            reply_markup=get_admin_config_menu(), parse_mode="Markdown"
+            f"🔒 <b>ADMIN LOCKED</b>\n\nUser `{target_admin_id}` has been locked.\nThey have NO access.",
+            reply_markup=get_admin_config_menu(), parse_mode="HTML"
         )
         return
         
@@ -6980,16 +7322,52 @@ async def role_selected_process(message: types.Message, state: FSMContext):
         # Check if already unlocked
         admin_doc = col_admins.find_one({"user_id": target_admin_id})
         if admin_doc and not admin_doc.get("is_locked", False):
-            await message.answer(f"⚠️ **Admin {target_admin_id} is ALREADY UNLOCKED.**", reply_markup=get_admin_config_menu())
+            await message.answer(f"⚠️ <b>Admin {target_admin_id} is ALREADY UNLOCKED.</b>", reply_markup=get_admin_config_menu(), parse_mode="HTML")
             await state.clear()
             return
 
         col_admins.update_one({"user_id": target_admin_id}, {"$set": {"is_locked": False}})
         log_user_action(message.from_user, "ADMIN UNLOCKED", f"Unlocked {target_admin_id}")
+        
+        # Send Role Message on Unlock
+        if admin_doc:
+            perms = admin_doc.get("permissions", [])
+            # Determine role from perms
+            detected_role = "SUPPORT"
+            for r_name, r_perms in ROLES.items():
+                if set(r_perms) == set(perms):
+                    detected_role = r_name
+                    break
+            
+            try:
+                caps_list = []
+                if detected_role == "OWNER": caps_list = ["• Absolute Power", "• Manage Everything"]
+                elif detected_role == "MANAGER": caps_list = ["• Manage Admins", "• Manage Content", "• View Analytics"]
+                elif detected_role == "ADMIN": caps_list = ["• Manage Content", "• Manage Links", "• View Analytics"]
+                elif detected_role == "MODERATOR": caps_list = ["• Add/Edit Content", "• Search Database"]
+                elif detected_role == "SUPPORT": caps_list = ["• View Content", "• Search Only"]
+                
+                caps_str = "\n".join(caps_list)
+                
+                await bot.send_message(
+                    target_admin_id,
+                    f"🌟 <b>ACCESS RESTORED</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n\n"
+                    f"<b>Dear Administrator,</b>\n\n"
+                    f"Your account status has been officially <b>UNLOCKED</b>.\n\n"
+                    f"You are currently designated as a <b>{detected_role}</b>. "
+                    f"Your authorized system capabilities are outlined below:\n\n"
+                    f"{caps_str}\n\n"
+                    f"<i>Access restored and authorized by {message.from_user.full_name}.</i>",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin {target_admin_id} of unlock: {e}")
+
         await state.clear()
         await message.answer(
-            f"🔓 **ADMIN UNLOCKED**\n\nUser `{target_admin_id}` has been unlocked.\nPermissions restored.",
-            reply_markup=get_admin_config_menu(), parse_mode="Markdown"
+            f"🔓 <b>ADMIN UNLOCKED</b>\n\nUser `{target_admin_id}` has been unlocked.\nPermissions restored.",
+            reply_markup=get_admin_config_menu(), parse_mode="HTML"
         )
         return
     
@@ -7012,37 +7390,39 @@ async def role_selected_process(message: types.Message, state: FSMContext):
     # LOG
     log_user_action(message.from_user, "ROLE UPDATE", f"Set {target_admin_id} to {role_key}")
     
-    # Notify Target Admin (Premium Message)
-    try:
-        caps_list = []
-        # OWNER handled separately
-        if role_key == "MANAGER": caps_list = ["• Manage Admins", "• Manage Content", "• View Analytics"]
-        elif role_key == "ADMIN": caps_list = ["• Manage Content", "• Manage Links", "• View Analytics"]
-        elif role_key == "MODERATOR": caps_list = ["• Add/Edit Content", "• Search Database"]
-        elif role_key == "SUPPORT": caps_list = ["• View Content", "• Search Only"]
-        
-        caps_str = "\n".join(caps_list)
-        
-        await bot.send_message(
-            target_admin_id,
-            f"🌟 **PROMOTION GRANTED**\n\n"
-            f"Dear Admin,\n\n"
-            f"You have been promoted to **{role_key}**.\n"
-            f"Your new capabilities include:\n"
-            f"{caps_str}\n\n"
-            f"*Access granted by {message.from_user.full_name}*.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Failed to notify admin {target_admin_id} of role change: {e}")
+    # Notify Target Admin (Premium Message) ONLY if not locked
+    admin_doc = col_admins.find_one({"user_id": target_admin_id})
+    if admin_doc and not admin_doc.get("is_locked", False) and "UNLOCK" not in selected_role:
+        try:
+            caps_list = []
+            if role_key == "MANAGER": caps_list = ["• Manage Admins", "• Manage Content", "• View Analytics"]
+            elif role_key == "ADMIN": caps_list = ["• Manage Content", "• Manage Links", "• View Analytics"]
+            elif role_key == "MODERATOR": caps_list = ["• Add/Edit Content", "• Search Database"]
+            elif role_key == "SUPPORT": caps_list = ["• View Content", "• Search Only"]
+            
+            caps_str = "\n".join(caps_list)
+            
+            await bot.send_message(
+                target_admin_id,
+                f"🌟 <b>PROMOTION GRANTED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n\n"
+                f"<b>Dear Administrator,</b>\n\n"
+                f"Your account has been officially elevated to <b>{role_key}</b> status.\n\n"
+                f"Your new authorized system capabilities are outlined below:\n\n"
+                f"{caps_str}\n\n"
+                f"<i>Access granted and authorized by {message.from_user.full_name}.</i>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin {target_admin_id} of role change: {e}")
         
     await state.clear()
     await message.answer(
-        f"✅ **SUCCESS!**\n\n"
-        f"User `{target_admin_id}` is now **{role_key}**.\n"
+        f"✅ <b>SUCCESS!</b>\n\n"
+        f"User `{target_admin_id}` is now <b>{role_key}</b>.\n"
         f"Permissions updated.",
         reply_markup=get_admin_config_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminRoleStates.waiting_for_owner_password)
@@ -7055,34 +7435,50 @@ async def process_owner_password(message: types.Message, state: FSMContext):
 
     password = message.text.strip()
     if password == OWNER_PASSWORD:
-        # Check permissions - Only Current Owner can do this?
-        # Actually any admin with 'can_manage_admins' can access Roles menu, 
-        # BUT only valid password holders (Owner) should know this.
-        
+        # Check permissions — only the owner (who knows OWNER_PASSWORD) can confirm ownership transfer
         await state.set_state(AdminRoleStates.waiting_for_owner_confirm)
         
         data = await state.get_data()
         target_admin_id = data.get("target_admin_id")
         
         await message.answer(
-            f"⚠️ **CRITICAL WARNING** ⚠️\n\n"
-            f"You are about to transfer **OWNERSHIP** to `{target_admin_id}`.\n"
-            f"This action is **IRREVERSIBLE** via the bot.\n"
+            f"⚠️ <b>CRITICAL WARNING</b> ⚠️\n\n"
+            f"You are about to transfer <b>OWNERSHIP</b> to `{target_admin_id}`.\n"
+            f"This action is <b>IRREVERSIBLE</b> via the bot.\n"
             f"You will lose your Owner privileges.\n\n"
             f"Are you sure?",
             reply_markup=ReplyKeyboardMarkup(
                 keyboard=[[KeyboardButton(text="✅ YES, TRANSFER OWNERSHIP"), KeyboardButton(text="❌ CANCEL")]],
                 resize_keyboard=True
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     else:
-        await message.answer("⛔ **Incorrect Password.** Access Denied.", reply_markup=get_roles_menu())
+        await message.answer("⛔ <b>Incorrect Password.</b> Access Denied.", reply_markup=get_roles_menu(), parse_mode="HTML")
         await state.clear()
 
 @dp.message(AdminRoleStates.waiting_for_owner_confirm)
 async def process_owner_confirm(message: types.Message, state: FSMContext):
     if message.text == "✅ YES, TRANSFER OWNERSHIP":
+        await state.set_state(AdminRoleStates.waiting_for_owner_second_confirm)
+        await message.answer(
+            f"⚠️ <b>FINAL CONFIRMATION</b> ⚠️\n\n"
+            f"This is your last warning! Transferring ownership is permanent and you will become a manager.\n"
+            f"Are you ABSOLUTELY sure?",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="✅ YES, I AM SURE"), KeyboardButton(text="❌ CANCEL")]],
+                resize_keyboard=True
+            ),
+            parse_mode="HTML"
+        )
+    else:
+        # Return to Role Selection state
+        await state.set_state(AdminRoleStates.waiting_for_role_selection)
+        await message.answer("❌ Transfer Cancelled.", reply_markup=get_roles_menu())
+
+@dp.message(AdminRoleStates.waiting_for_owner_second_confirm)
+async def process_owner_second_confirm(message: types.Message, state: FSMContext):
+    if message.text == "✅ YES, I AM SURE":
         data = await state.get_data()
         target_admin_id = data.get("target_admin_id")
         current_owner_id = message.from_user.id
@@ -7099,8 +7495,6 @@ async def process_owner_confirm(message: types.Message, state: FSMContext):
         )
         
         # 2. Demote Old Owner (to Manager)
-        # Note: If current_owner_id is the Environ Var ID, we can't 'remove' env var.
-        # But we can update DB to say 'role: manager'.
         if current_owner_id != target_admin_id: # Self-promotion check
             col_admins.update_one(
                 {"user_id": current_owner_id},
@@ -7110,9 +7504,21 @@ async def process_owner_confirm(message: types.Message, state: FSMContext):
                 }}
             )
         
-        # 3. Update Global Cache
+        # 3. Update Global Cache & .env permanently
         MASTER_ADMIN_ID = target_admin_id
-        
+        try:
+            with open("BOT9.env", "r", encoding="utf-8") as f:
+                env_data = f.read()
+            # Replace MASTER_ADMIN_ID correctly
+            if "MASTER_ADMIN_ID=" in env_data:
+                env_data = re.sub(r"MASTER_ADMIN_ID=.*", f"MASTER_ADMIN_ID={target_admin_id}", env_data)
+            else:
+                env_data += f"\\nMASTER_ADMIN_ID={target_admin_id}\\n"
+            with open("BOT9.env", "w", encoding="utf-8") as f:
+                f.write(env_data)
+        except Exception as e:
+            logger.error(f"Failed to update BOT9.env: {e}")
+            
         # Log
         log_user_action(message.from_user, "OWNERSHIP TRANSFER", f"New Owner: {target_admin_id}")
         
@@ -7120,22 +7526,22 @@ async def process_owner_confirm(message: types.Message, state: FSMContext):
         try:
              await bot.send_message(
                 target_admin_id,
-                f"👑 **ALL HAIL THE NEW OWNER!**\n\n"
-                f"You have been granted **OWNERSHIP** of this bot.\n"
-                f"You now have absolute power.\n\n"
+                f"👑 <b>ALL HAIL THE NEW OWNER!</b>\\n\\n"
+                f"You have been granted <b>OWNERSHIP</b> of this bot.\\n"
+                f"You now have absolute power.\\n\\n"
                 f"*Transfer authorized by previous owner.*",
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         except: pass
         
         await state.clear()
         await message.answer(
-            f"✅ **OWNERSHIP TRANSFERRED!**\n\n"
-            f"New Owner: `{target_admin_id}`\n"
-            f"You are now a **MANAGER**.\n"
+            f"✅ <b>OWNERSHIP TRANSFERRED!</b>\\n\\n"
+            f"New Owner: `{target_admin_id}`\\n"
+            f"You are now a <b>MANAGER</b>.\\n"
             f"Please restart the bot for full effect.",
             reply_markup=get_main_menu(current_owner_id),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         
     else:
@@ -7155,19 +7561,19 @@ async def permissions_menu_handler(message: types.Message, state: FSMContext):
     
     # Check if Master Admin (Only Master can manage permissions)
     if message.from_user.id != MASTER_ADMIN_ID:
-        await message.answer("⛔ **ACCESS DENIED**\n\nOnly the Master Admin can manage permissions.")
+        await message.answer("⛔ <b>ACCESS DENIED</b>\n\nOnly the Master Admin can manage permissions.", parse_mode="HTML")
         return
 
-    # List admins to select
-    admins = list(col_admins.find().sort("added_at", 1))
+    # List admins to select (EXCLUDE MASTER ADMIN)
+    admins = list(col_admins.find({"user_id": {"$ne": MASTER_ADMIN_ID}}).sort("added_at", 1))
     
     if not admins:
-        await message.answer("⚠️ **No additional admins found.**\nAdd admins first to configure permissions.", reply_markup=get_admin_config_menu())
+        await message.answer("⚠️ <b>No additional admins found.</b>\nAdd admins first to configure permissions.", reply_markup=get_admin_config_menu(), parse_mode="HTML")
         return
         
     await state.set_state(AdminPermissionStates.waiting_for_admin_selection)
     
-    msg = "🔐 **MANAGE PERMISSIONS**\n\nSelect an admin to configure:\n"
+    msg = "🔐 <b>MANAGE PERMISSIONS</b>\n\nSelect an admin to configure:\n"
     keyboard = []
     
     for admin in admins:
@@ -7179,7 +7585,7 @@ async def permissions_menu_handler(message: types.Message, state: FSMContext):
         
     keyboard.append([KeyboardButton(text="❌ CANCEL")])
     
-    await message.answer(msg, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+    await message.answer(msg, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
 
 @dp.message(AdminPermissionStates.waiting_for_admin_selection)
 async def permission_admin_selected(message: types.Message, state: FSMContext):
@@ -7201,10 +7607,10 @@ async def permission_admin_selected(message: types.Message, state: FSMContext):
         await state.clear()
         return
         
-    # Get current permissions (Default to ALL if not set)
+    # Get current permissions (Default to None so we can initialize to empty as requested)
     current_perms = admin.get("permissions")
     if current_perms is None:
-        current_perms = [p for p in DEFAULT_SAFE_PERMISSIONS] # Clone safe defaults
+        current_perms = [] # Start blank so you explicitly grant what is needed
         
     # Save partial state
     await state.update_data(target_admin_id=target_id, current_perms=current_perms)
@@ -7216,10 +7622,10 @@ async def permission_admin_selected(message: types.Message, state: FSMContext):
 async def send_permission_toggles(message: types.Message, target_id: int, current_perms: list, admin_name: str):
     """Helper to send/update permission toggle UI (Reply Keyboard)"""
     
-    text = f"🔐 **CONFIGURING: {admin_name}** (`{target_id}`)\n\n"
+    text = f"🔐 <b>CONFIGURING: {admin_name}</b> (`{target_id}`)\n\n"
     text += "Use the buttons below to toggle permissions.\n"
     text += "✅ = Allowed | ❌ = Denied\n\n"
-    text += "Click **💾 SAVE CHANGES** to save and exit."
+    text += "Click <b>💾 SAVE CHANGES</b> to save and exit."
     
     # Build Reply Keyboard
     keyboard = []
@@ -7243,7 +7649,7 @@ async def send_permission_toggles(message: types.Message, target_id: int, curren
     
     # Send message with ReplyKeyboard
     # Note: We rely on ReplyKeyboardMarkup to persistent the buttons until state is cleared
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="Markdown")
+    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
 
 @dp.message(AdminPermissionStates.configuring_permissions)
 async def permission_message_handler(message: types.Message, state: FSMContext):
@@ -7265,18 +7671,18 @@ async def permission_message_handler(message: types.Message, state: FSMContext):
             {"$set": {"permissions": current_perms}}
         )
         await state.clear()
-        await message.answer(f"✅ **PERMISSIONS SAVED** for Admin `{target_id}`", reply_markup=get_admin_config_menu(), parse_mode="Markdown")
+        await message.answer(f"✅ <b>PERMISSIONS SAVED</b> for Admin `{target_id}`", reply_markup=get_admin_config_menu(), parse_mode="HTML")
         return
 
     elif text == "✅ SELECT ALL":
         current_perms = [p for p in DEFAULT_SAFE_PERMISSIONS] # Only Select Safe ones
         # Feedback message
-        await message.answer("✅ **Safe permissions selected.**\n(Dangerous features must be toggled manually)")
+        await message.answer("✅ <b>Safe permissions selected.</b>\n(Dangerous features must be toggled manually)", parse_mode="HTML")
 
     elif text == "❌ REVOKE ALL":
         current_perms = []
         # Feedback message
-        await message.answer("❌ **All permissions revoked.**")
+        await message.answer("❌ <b>All permissions revoked.</b>", parse_mode="HTML")
 
     else:
         # Check if it's a toggle button
@@ -7314,211 +7720,6 @@ async def permission_message_handler(message: types.Message, state: FSMContext):
 
 
 
-# --- Smart PDF Selection ---
-
-@dp.message(lambda m: m.text and (m.text.isdigit() or len(m.text) > 2)) 
-async def smart_pdf_selection_handler(message: types.Message, state: FSMContext):
-    """Catches text that might be a PDF Index or Name"""
-    
-    # Ignore if in a specific state already (handled by FSM)
-    current_state = await state.get_state()
-    if current_state is not None:
-        return
-
-    query = message.text
-    pdf = None
-    
-    if query.isdigit():
-        pdf = col_pdfs.find_one({"index": int(query)})
-    else:
-        pdf = col_pdfs.find_one({"name": {"$regex": query, "$options": "i"}})
-    
-    if not pdf:
-        # Pass through to debug logger if not found
-        # We invoke the debug handler explicitly if we want, or just let it fall through
-        # But since we are catching it here, we must decide.
-        # If it looks like a command (starts with /), let it pass.
-        if message.text.startswith("/"): return 
-        # Otherwise, treat as "Unknown Command"
-        print(f"⚠️ UNHANDLED MESSAGE: '{message.text}'")
-        await message.answer(f"⚠️ Unhandled command: {message.text}\nPlease run /start to update your menu.")
-        return
-
-    # PDF Found - Show Actions
-    await state.update_data(edit_id=str(pdf["_id"]), current_name=pdf["name"], current_link=pdf["link"])
-    await state.set_state(PDFActionStates.waiting_for_action)
-    
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📝 EDIT NAME"), KeyboardButton(text="🔗 EDIT LINK")],
-        [KeyboardButton(text="🗑️ DELETE"), KeyboardButton(text="❌ CANCEL")]
-    ], resize_keyboard=True)
-    
-    await message.answer(
-        f"📄 **SELECTED PDF**\n"
-        f"🆔 Index: `{pdf['index']}`\n"
-        f"📛 Name: {pdf['name']}\n"
-        f"🔗 Link: {pdf['link']}\n\n"
-        "⬇️ **Select Action:**",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
-
-@dp.message(PDFActionStates.waiting_for_action)
-async def process_pdf_action(message: types.Message, state: FSMContext):
-    if message.text == "❌ CANCEL":
-        await state.clear()
-        return await message.answer("❌ Selection Cancelled.", reply_markup=get_pdf_menu())
-    
-    if message.text == "📝 EDIT NAME":
-        await state.update_data(field="name")
-        await state.set_state(PDFStates.waiting_for_edit_value)
-        await message.answer("⌨️ **Enter New Name:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
-        
-    elif message.text == "🔗 EDIT LINK":
-        await state.update_data(field="link")
-        await state.set_state(PDFStates.waiting_for_edit_value)
-        await message.answer("⌨️ **Enter New Link:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
-        
-    elif message.text == "🗑️ DELETE":
-        # Transition to delete confirm
-        data = await state.get_data()
-        await state.update_data(delete_id=data['edit_id']) # Reuse ID
-        
-        kb = ReplyKeyboardMarkup(keyboard=[
-            [KeyboardButton(text="✅ CONFIRM DELETE"), KeyboardButton(text="❌ CANCEL")]
-        ], resize_keyboard=True)
-        
-        await state.set_state(PDFStates.waiting_for_delete_confirm)
-        await message.answer(
-            f"⚠️ **CONFIRM DELETION**\n\nAre you sure you want to delete this PDF?",
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-    else:
-         await message.answer("⚠️ Invalid Option. Choose from the buttons.", reply_markup=get_cancel_keyboard())
-
-# ==========================================
-# 📊 ANALYTICS HANDLER
-# ==========================================
-
-@dp.message(F.text.in_(["📊 ANALYTICS", "📊 Analytics"]))
-async def analytics_handler(message: types.Message, state: FSMContext):
-    """Display analytics dashboard with PDF click stats and user metrics"""
-    if not await check_authorization(message, "View Analytics", "can_analytics"):
-        return
-    
-    await state.clear()
-    
-    # Get PDF analytics
-    total_pdfs = col_pdfs.count_documents({})
-    total_ig_content = col_ig_content.count_documents({})
-    
-    # Get user tracking stats
-    user_stats_pipeline = [
-        {"$group": {"_id": "$source", "count": {"$sum": 1}}}
-    ]
-    user_stats_raw = list(db["bot10_user_tracking"].aggregate(user_stats_pipeline))
-    user_stats = {stat["_id"]: stat["count"] for stat in user_stats_raw if stat["_id"]}
-    total_users = sum(user_stats.values())
-    
-    # Get top performing PDFs (sort by total clicks)
-    top_pdfs = list(col_pdfs.find().sort("clicks", -1).limit(5))
-    
-    # Get recent activity
-    last_ig_pdf = col_pdfs.find_one({"last_ig_click": {"$exists": True}}, sort=[("last_ig_click", -1)])
-    last_yt_pdf = col_pdfs.find_one({"last_yt_click": {"$exists": True}}, sort=[("last_yt_click", -1)])
-    last_igcc = col_ig_content.find_one({"last_ig_cc_click": {"$exists": True}}, sort=[("last_ig_cc_click", -1)])
-    
-    # Build analytics message
-    msg = "📊 **ANALYTICS DASHBOARD**\\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\\n\\n"
-    
-    # Overview
-    msg += f"📈 **OVERVIEW**\\n"
-    msg += f"• Total PDFs: {total_pdfs}\\n"
-    msg += f"• Total IG Content: {total_ig_content}\\n"
-    msg += f"• Total Users: {total_users}\\n\\n"
-    
-    # Top PDFs
-    if top_pdfs:
-        msg += "🔥 **TOP PERFORMING PDFs** (by clicks)\\n"
-        for i, pdf in enumerate(top_pdfs, 1):
-            clicks = pdf.get('clicks', 0)
-            ig_clicks = pdf.get('ig_start_clicks', 0)
-            yt_clicks = pdf.get('yt_start_clicks', 0)
-            name = pdf.get('name', 'Unnamed')
-            if len(name) > 25:
-                name = name[:25] + "..."
-            msg += f"{i}. {name} - {clicks} clicks\\n"
-            msg += f"   └ IG: {ig_clicks} | YT: {yt_clicks}\\n"
-        msg += "\\n"
-    
-    # User sources
-    if user_stats:
-        msg += "🎯 **USER SOURCES**\\n"
-        for source in ["IG", "YT", "IGCC"]:
-            count = user_stats.get(source, 0)
-            pct = (count / total_users * 100) if total_users > 0 else 0
-            msg += f"• {source}: {count} users ({pct:.0f}%)\\n"
-        msg += "\\n"
-    
-    # Recent activity
-    msg += "⏰ **RECENT ACTIVITY**\\n"
-    from datetime import datetime, timedelta
-    now = now_local()
-    
-    if last_ig_pdf and last_ig_pdf.get('last_ig_click'):
-        time_diff = now - last_ig_pdf['last_ig_click']
-        if time_diff < timedelta(hours=1):
-            time_str = f"{int(time_diff.total_seconds() / 60)} mins ago"
-        elif time_diff < timedelta(days=1):
-            time_str = f"{int(time_diff.total_seconds() / 3600)} hours ago"
-        else:
-            time_str = last_ig_pdf['last_ig_click'].strftime("%b %d, %I:%M %p")
-        msg += f"• Last IG click: {time_str} (PDF #{last_ig_pdf.get('index', '?')})\\n"
-    
-    if last_yt_pdf and last_yt_pdf.get('last_yt_click'):
-        time_diff = now - last_yt_pdf['last_yt_click']
-        if time_diff < timedelta(hours=1):
-            time_str = f"{int(time_diff.total_seconds() / 60)} mins ago"
-        elif time_diff < timedelta(days=1):
-            time_str = f"{int(time_diff.total_seconds() / 3600)} hours ago"
-        else:
-            time_str = last_yt_pdf['last_yt_click'].strftime("%b %d, %I:%M %p")
-        msg += f"• Last YT click: {time_str} (PDF #{last_yt_pdf.get('index', '?')})\\n"
-    
-    if last_igcc and last_igcc.get('last_ig_cc_click'):
-        time_diff = now - last_igcc['last_ig_cc_click']
-        if time_diff < timedelta(hours=1):
-            time_str = f"{int(time_diff.total_seconds() / 60)} mins ago"
-        elif time_diff < timedelta(days=1):
-            time_str = f"{int(time_diff.total_seconds() / 3600)} hours ago"
-        else:
-            time_str = last_igcc['last_ig_cc_click'].strftime("%b %d, %I:%M %p")
-        msg += f"• Last IGCC click: {time_str} ({last_igcc.get('cc_code', '?')})\\n"
-    
-    await message.answer(msg, reply_markup=get_main_menu(), parse_mode="Markdown")
-
-
-# --- General Handlers (Catch-all for buttons outside FSM states) ---
-@dp.message(F.text == "❌ CANCEL")
-async def general_cancel_handler(message: types.Message, state: FSMContext):
-    """Handles cancel button clicks when not in a specific state"""
-    if not await check_authorization(message, "Cancel button"):
-        return
-    await state.clear()
-    await message.answer("❌ Operation cancelled.", reply_markup=get_main_menu())
-
-
-# --- Debug Handler - Catch All with Authorization ---
-@dp.message()
-async def debug_catch_all(message: types.Message):
-    # Apply authorization check
-    if not await check_authorization(message, f"message: {message.text or 'media'}"):
-        return
-    
-    print(f"⚠️ UNHANDLED MESSAGE: '{message.text}'")
-    await message.answer(f"⚠️ Unhandled command: {message.text}\nPlease run /start to update your menu.")
 
 # --- Main Execution ---
 
@@ -7542,12 +7743,12 @@ async def check_and_create_missed_backup():
                 try:
                     await bot.send_message(
                         MASTER_ADMIN_ID,
-                        f"📦 **STARTUP BACKUP CREATED**\n\n"
+                        f"📦 <b>STARTUP BACKUP CREATED</b>\n\n"
                         f"The bot detected no backup for {month_year}.\n"
                         f"✅ Created: `{metadata['filename']}`\n"
                         f"💾 Size: {metadata['file_size_mb']:.2f} MB\n\n"
                         f"This ensures no monthly backup is missed!",
-                        parse_mode="Markdown"
+                        parse_mode="HTML"
                     )
                 except:
                     pass
@@ -7605,7 +7806,10 @@ async def generate_daily_report():
                 ig_cc_clicks_24h += ig.get('ig_cc_clicks', 0)
         
         # Get system metrics
-        uptime = now - health_monitor.system_metrics["uptime_start"]
+        _uptime_start = health_monitor.system_metrics["uptime_start"]
+        _uptime_start = _uptime_start.replace(tzinfo=None) if _uptime_start.tzinfo else _uptime_start
+        _now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+        uptime = _now_naive - _uptime_start
         uptime_str = f"{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds // 60) % 60}m"
         memory_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
         cpu_percent = psutil.cpu_percent(interval=1)
@@ -7615,29 +7819,29 @@ async def generate_daily_report():
         top_ig = list(col_ig_content.find({}).sort("ig_cc_clicks", -1).limit(5))
         
         # Build report
-        report = f"📊 **BOT 9 DAILY REPORT**\n"
+        report = f"📊 <b>BOT 9 DAILY REPORT</b>\n"
         report += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        report += f"📅 **Date:** {timestamp}\n"
-        report += f"⏰ **Report Type:** {'Morning' if now.hour < 12 else 'Evening'} Report\n\n"
+        report += f"📅 <b>Date:</b> {timestamp}\n"
+        report += f"⏰ <b>Report Type:</b> {'Morning' if now.hour < 12 else 'Evening'} Report\n\n"
         
-        report += f"📈 **DATABASE OVERVIEW**\n"
+        report += f"📈 <b>DATABASE OVERVIEW</b>\n"
         report += f"├ Total PDFs: {total_pdfs}\n"
         report += f"├ Total IG Content: {total_ig_content}\n"
         report += f"├ Total Admins: {total_admins}\n"
         report += f"└ Banned Users: {total_banned}\n\n"
         
-        report += f"🆕 **TODAY'S ADDITIONS**\n"
+        report += f"🆕 <b>TODAY'S ADDITIONS</b>\n"
         report += f"├ New PDFs: {pdfs_added_today}\n"
         report += f"└ New IG Content: {ig_added_today}\n\n"
         
-        report += f"📊 **LAST 24 HOURS ACTIVITY**\n"
+        report += f"📊 <b>LAST 24 HOURS ACTIVITY</b>\n"
         report += f"├ Total Interactions: {total_clicks_24h}\n"
         report += f"├ PDF Affiliate Clicks: {pdf_clicks_24h}\n"
         report += f"├ YT Link Clicks: {yt_clicks_24h}\n"
         report += f"└ IG CC Clicks: {ig_cc_clicks_24h}\n\n"
         
         if top_pdfs:
-            report += f"🔥 **TOP 5 PERFORMING PDFs**\n"
+            report += f"🔥 <b>TOP 5 PERFORMING PDFs</b>\n"
             for i, pdf in enumerate(top_pdfs, 1):
                 name = pdf.get('name', 'Unnamed')
                 if len(name) > 30:
@@ -7647,7 +7851,7 @@ async def generate_daily_report():
             report += "\n"
         
         if top_ig:
-            report += f"📸 **TOP 5 PERFORMING IG CONTENT**\n"
+            report += f"📸 <b>TOP 5 PERFORMING IG CONTENT</b>\n"
             for i, ig in enumerate(top_ig, 1):
                 name = ig.get('name', 'Unnamed')
                 if len(name) > 30:
@@ -7656,7 +7860,7 @@ async def generate_daily_report():
                 report += f"{i}. {name} - {clicks} clicks\n"
             report += "\n"
         
-        report += f"🖥️ **SYSTEM HEALTH**\n"
+        report += f"🖥️ <b>SYSTEM HEALTH</b>\n"
         report += f"├ Uptime: {uptime_str}\n"
         report += f"├ Memory Usage: {memory_mb:.2f} MB\n"
         report += f"├ CPU Usage: {cpu_percent}%\n"
@@ -7665,11 +7869,12 @@ async def generate_daily_report():
         report += f"└ Status: {'✅ Healthy' if health_monitor.is_healthy else '⚠️ Degraded'}\n\n"
         
         report += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        report += f"🤖 **Bot 9 Enterprise Monitoring System**\n"
-        report += f"📌 Next report at {DAILY_REPORT_TIME_2 if now.hour < 12 else '08:40 AM tomorrow'}"
+        report += f"🤖 <b>Bot 9 Enterprise Monitoring System</b>\n"
+        _next_lbl = "08:40 PM" if now.hour < 12 else "08:40 AM (tomorrow)"
+        report += f"📌 Next report at {_next_lbl}"
         
         # Send report
-        await bot.send_message(MASTER_ADMIN_ID, report, parse_mode="Markdown")
+        await bot.send_message(MASTER_ADMIN_ID, report, parse_mode="HTML")
         logger.info("✅ Daily report sent successfully")
         
     except Exception as e:
@@ -7681,28 +7886,47 @@ async def generate_daily_report():
         )
 
 async def daily_report_task():
-    """Background task for scheduled daily reports"""
+    """Background task for scheduled daily reports — sleep-until exact times."""
     if not DAILY_REPORT_ENABLED:
         logger.info("Daily reports disabled")
         return
-    
+
+    # Parse configured time strings into (hour, minute) tuples
+    _slots: list = []
+    for t_str in [DAILY_REPORT_TIME_1, DAILY_REPORT_TIME_2]:
+        try:
+            _h, _m = map(int, t_str.split(':'))
+            _slots.append((_h, _m))
+        except Exception:
+            logger.warning(f"Invalid report time '{t_str}' — skipping")
+    if not _slots:
+        logger.error("No valid daily report times configured")
+        return
+
     logger.info(f"✅ Daily report task started (Times: {DAILY_REPORT_TIME_1}, {DAILY_REPORT_TIME_2})")
-    
+
     while True:
         try:
-            # Get current time in configured timezone
+            # ── Calculate exact sleep until next slot ──────────────────────
             now = now_local()
-            current_time = now.strftime("%H:%M")
-            
-            # Check if it's time for report
-            if current_time == DAILY_REPORT_TIME_1 or current_time == DAILY_REPORT_TIME_2:
-                await generate_daily_report()
-                # Sleep for 61 seconds to avoid sending multiple times in the same minute
-                await asyncio.sleep(61)
-            else:
-                # Check every 30 seconds
-                await asyncio.sleep(30)
-                
+            next_fire = None
+            for hour, minute in _slots:
+                candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate <= now:
+                    candidate += timedelta(days=1)
+                if next_fire is None or candidate < next_fire:
+                    next_fire = candidate
+
+            wait_secs = (next_fire - now_local()).total_seconds()
+            h_w = int(wait_secs // 3600)
+            m_w = int((wait_secs % 3600) // 60)
+            logger.info(f"📊 Next daily report in {h_w}h {m_w}m")
+            await asyncio.sleep(max(wait_secs, 1))
+
+            await generate_daily_report()
+
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error(f"Daily report task error: {e}")
             await asyncio.sleep(60)
@@ -7768,6 +7992,329 @@ async def health_check_endpoint(request):
             "error": str(e)
         }, status=500)
 
+# ==========================================
+# 🎬 TUTORIAL PK — Universal tutorial link for ALL Bot8 users
+# Stored in db["bot9_tutorials"] with type="PK"
+# Delivered to Bot8 users on empty /start (no referral payload)
+# ==========================================
+
+@dp.message(F.text == "🎬 TUTORIAL")
+async def tutorial_pk_menu_handler(message: types.Message, state: FSMContext):
+    """Open Tutorial management submenu."""
+    if not await check_authorization(message, "Tutorial Menu", "can_add"):
+        return
+    await state.clear()
+    await message.answer(
+        "🎬 <b>TUTORIAL</b>\n\n"
+        "Manage the <b>universal tutorial link</b> shown to every Bot8 member\n"
+        "on their empty start and inside the Agent Guide.\n\n"
+        "One link — one message — delivered to every member automatically.",
+        reply_markup=get_tutorial_pk_menu(),
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.text == "➕ ADD TUTORIAL")
+async def tutorial_pk_add(message: types.Message, state: FSMContext):
+    """Start ADD flow — ask admin for the YouTube tutorial link."""
+    if not await check_authorization(message, "Add Tutorial", "can_add"):
+        return
+    existing = db["bot9_tutorials"].find_one({"type": "PK"})
+    if existing and existing.get("link"):
+        safe_link = _html.escape(existing["link"])
+        await message.answer(
+            f"⚠️ <b>A Tutorial link is already set:</b>\n\n"
+            f"<code>{safe_link}</code>\n\n"
+            "Use <b>✏️ EDIT TUTORIAL</b> to update it, or <b>🗑️ DELETE TUTORIAL</b> to remove it first.",
+            reply_markup=get_tutorial_pk_menu(),
+            parse_mode="HTML"
+        )
+        return
+    await state.set_state(TutorialPKStates.waiting_for_link)
+    await message.answer(
+        "🔗 <b>SEND THE YOUTUBE TUTORIAL LINK</b>\n\n"
+        "This link will be delivered to <b>all Bot8 users</b> when they start\n"
+        "with no referral — as a premium tutorial message with an inline button.\n\n"
+        "• Must be a valid URL starting with <code>https://</code>\n"
+        "• Shown as a button — never as raw text\n\n"
+        "Send the link now, or type <code>CANCEL</code> to abort.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(TutorialPKStates.waiting_for_link)
+async def tutorial_pk_save_link(message: types.Message, state: FSMContext):
+    """Save the new PK tutorial link to the database."""
+    if not await check_authorization(message, "Save Tutorial PK", "can_add"):
+        await state.clear()
+        return
+    text = message.text.strip()
+    if text.upper() == "CANCEL":
+        await state.clear()
+        await message.answer("❌ Cancelled.", reply_markup=get_tutorial_pk_menu(), parse_mode="HTML")
+        return
+    if not re.match(r"^https?://", text):
+        await message.answer(
+            "❌ <b>Invalid URL.</b> Please send a valid link starting with <code>https://</code>",
+            parse_mode="HTML"
+        )
+        return
+    db["bot9_tutorials"].update_one(
+        {"type": "PK"},
+        {"$set": {"type": "PK", "link": text, "updated_at": datetime.now()}},
+        upsert=True
+    )
+    safe_link = _html.escape(text)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>TUTORIAL SAVED</b>\n\n"
+        f"<b>Link:</b> <code>{safe_link}</code>\n\n"
+        "All Bot8 users will now see this tutorial on their next empty start and in the Agent Guide.",
+        reply_markup=get_tutorial_pk_menu(),
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.text == "✏️ EDIT TUTORIAL")
+async def tutorial_pk_edit(message: types.Message, state: FSMContext):
+    """Start EDIT flow — shows current link and asks for replacement."""
+    if not await check_authorization(message, "Edit Tutorial", "can_add"):
+        return
+    existing = db["bot9_tutorials"].find_one({"type": "PK"})
+    if not existing or not existing.get("link"):
+        await message.answer(
+            "⚠️ <b>No Tutorial link set yet.</b>\n\nUse <b>➕ ADD TUTORIAL</b> to add one first.",
+            reply_markup=get_tutorial_pk_menu(),
+            parse_mode="HTML"
+        )
+        return
+    safe_link = _html.escape(existing["link"])
+    await state.set_state(TutorialPKStates.waiting_for_edit_link)
+    await message.answer(
+        f"✏️ <b>EDIT TUTORIAL LINK</b>\n\n"
+        f"<b>Current link:</b>\n<code>{safe_link}</code>\n\n"
+        "Send the new YouTube link, or type <code>CANCEL</code> to abort.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(TutorialPKStates.waiting_for_edit_link)
+async def tutorial_pk_save_edit(message: types.Message, state: FSMContext):
+    """Apply the updated PK tutorial link."""
+    if not await check_authorization(message, "Save Edit Tutorial PK", "can_add"):
+        await state.clear()
+        return
+    text = message.text.strip()
+    if text.upper() == "CANCEL":
+        await state.clear()
+        await message.answer("❌ Cancelled.", reply_markup=get_tutorial_pk_menu(), parse_mode="HTML")
+        return
+    if not re.match(r"^https?://", text):
+        await message.answer(
+            "❌ <b>Invalid URL.</b> Please send a valid link starting with <code>https://</code>",
+            parse_mode="HTML"
+        )
+        return
+    db["bot9_tutorials"].update_one(
+        {"type": "PK"},
+        {"$set": {"link": text, "updated_at": datetime.now()}},
+        upsert=True
+    )
+    safe_link = _html.escape(text)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>TUTORIAL UPDATED</b>\n\n"
+        f"<b>New link:</b> <code>{safe_link}</code>\n\n"
+        "All Bot8 users will now receive this updated tutorial on their next empty start and in the Agent Guide.",
+        reply_markup=get_tutorial_pk_menu(),
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.text == "🗑️ DELETE TUTORIAL")
+async def tutorial_pk_delete(message: types.Message, state: FSMContext):
+    """Ask for confirmation before deleting tutorial link."""
+    if not await check_authorization(message, "Delete Tutorial", "can_add"):
+        return
+    existing = db["bot9_tutorials"].find_one({"type": "PK"})
+    if not existing or not existing.get("link"):
+        await message.answer(
+            "⚠️ <b>No Tutorial link to delete.</b>",
+            reply_markup=get_tutorial_pk_menu(),
+            parse_mode="HTML"
+        )
+        return
+    safe_link = _html.escape(existing["link"])
+    await state.set_state(TutorialPKStates.waiting_for_delete_confirm)
+    await message.answer(
+        f"🗑️ <b>DELETE TUTORIAL?</b>\n\n"
+        f"<b>Current link:</b>\n<code>{safe_link}</code>\n\n"
+        "Type <code>CONFIRM</code> to delete permanently, or <code>CANCEL</code> to abort.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(TutorialPKStates.waiting_for_delete_confirm)
+async def tutorial_pk_confirm_delete(message: types.Message, state: FSMContext):
+    """Execute deletion after CONFIRM keyword received."""
+    if not await check_authorization(message, "Confirm Delete Tutorial PK", "can_add"):
+        await state.clear()
+        return
+    text = message.text.strip().upper()
+    if text == "CONFIRM":
+        db["bot9_tutorials"].delete_one({"type": "PK"})
+        await state.clear()
+        await message.answer(
+            "✅ <b>TUTORIAL DELETED.</b>\n\n"
+            "Bot8 users will now see a professional 'coming soon' message "
+            "until a new link is added.",
+            reply_markup=get_tutorial_pk_menu(),
+            parse_mode="HTML"
+        )
+    elif text == "CANCEL":
+        await state.clear()
+        await message.answer("❌ Deletion cancelled.", reply_markup=get_tutorial_pk_menu(), parse_mode="HTML")
+    else:
+        await message.answer(
+            "⚠️ Type exactly <code>CONFIRM</code> to delete or <code>CANCEL</code> to abort.",
+            parse_mode="HTML"
+        )
+
+
+@dp.message(F.text == "📋 LIST TUTORIAL")
+async def tutorial_pk_list(message: types.Message, state: FSMContext):
+    """Display the currently stored tutorial link."""
+    if not await check_authorization(message, "List Tutorial", "can_add"):
+        return
+    await state.clear()
+    existing = db["bot9_tutorials"].find_one({"type": "PK"})
+    if existing and existing.get("link"):
+        safe_link = _html.escape(existing["link"])
+        updated = existing.get("updated_at")
+        updated_str = updated.strftime("%B %d, %Y — %I:%M %p") if updated else "Unknown"
+        await message.answer(
+            f"📋 <b>TUTORIAL LINK</b>\n\n"
+            f"<b>Status:</b> ✅ Active\n"
+            f"<b>Scope:</b> Universal — all Bot8 users (empty start + Agent Guide)\n"
+            f"<b>Last updated:</b> {updated_str}\n\n"
+            f"<b>Link:</b>\n<code>{safe_link}</code>",
+            reply_markup=get_tutorial_pk_menu(),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "📋 <b>TUTORIAL STATUS</b>\n\n"
+            "❌ <b>No link set yet.</b>\n\n"
+            "Use <b>➕ ADD TUTORIAL</b> to add a link — it will be\n"
+            "sent to Bot8 users as a premium framed message with a watch button.",
+            reply_markup=get_tutorial_pk_menu(),
+            parse_mode="HTML"
+        )
+
+# --- Smart PDF Selection ---
+
+@dp.message(lambda m: m.text and (m.text.isdigit() or len(m.text) > 2)) 
+async def smart_pdf_selection_handler(message: types.Message, state: FSMContext):
+    """Catches text that might be a PDF Index or Name"""
+    
+    # Ignore if in a specific state already (handled by FSM)
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+
+    query = message.text
+    pdf = None
+    
+    if query.isdigit():
+        pdf = col_pdfs.find_one({"index": int(query)})
+    else:
+        pdf = col_pdfs.find_one({"name": {"$regex": query, "$options": "i"}})
+    
+    if not pdf:
+        # Pass through to debug logger if not found
+        # We invoke the debug handler explicitly if we want, or just let it fall through
+        # But since we are catching it here, we must decide.
+        # If it looks like a command (starts with /), let it pass.
+        if message.text.startswith("/"): return 
+        # Otherwise, treat as "Unknown Command"
+        print(f"⚠️ UNHANDLED MESSAGE: '{message.text}'")
+        await message.answer(f"⚠️ Unhandled command: {message.text}\nPlease run /start to update your menu.")
+        return
+
+    # PDF Found - Show Actions
+    await state.update_data(edit_id=str(pdf["_id"]), current_name=pdf["name"], current_link=pdf["link"])
+    await state.set_state(PDFActionStates.waiting_for_action)
+    
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📝 EDIT NAME"), KeyboardButton(text="🔗 EDIT LINK")],
+        [KeyboardButton(text="🗑️ DELETE"), KeyboardButton(text="❌ CANCEL")]
+    ], resize_keyboard=True)
+    
+    await message.answer(
+        f"📄 <b>SELECTED PDF</b>\n"
+        f"🆔 Index: `{pdf['index']}`\n"
+        f"📛 Name: {pdf['name']}\n"
+        f"🔗 Link: {pdf['link']}\n\n"
+        "⬇️ <b>Select Action:</b>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+@dp.message(PDFActionStates.waiting_for_action)
+async def process_pdf_action(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer("❌ Selection Cancelled.", reply_markup=get_pdf_menu())
+    
+    if message.text == "📝 EDIT NAME":
+        await state.update_data(field="name")
+        await state.set_state(PDFStates.waiting_for_edit_value)
+        await message.answer("⌨️ <b>Enter New Name:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+        
+    elif message.text == "🔗 EDIT LINK":
+        await state.update_data(field="link")
+        await state.set_state(PDFStates.waiting_for_edit_value)
+        await message.answer("⌨️ <b>Enter New Link:</b>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+        
+    elif message.text == "🗑️ DELETE":
+        # Transition to delete confirm
+        data = await state.get_data()
+        await state.update_data(delete_id=data['edit_id']) # Reuse ID
+        
+        kb = ReplyKeyboardMarkup(keyboard=[
+            [KeyboardButton(text="✅ CONFIRM DELETE"), KeyboardButton(text="❌ CANCEL")]
+        ], resize_keyboard=True)
+        
+        await state.set_state(PDFStates.waiting_for_delete_confirm)
+        await message.answer(
+            f"⚠️ <b>CONFIRM DELETION</b>\n\nAre you sure you want to delete this PDF?",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    else:
+         await message.answer("⚠️ Invalid Option. Choose from the buttons.", reply_markup=get_cancel_keyboard())
+
+# ==========================================
+# --- General Handlers (Catch-all for buttons outside FSM states) ---
+@dp.message(F.text == "❌ CANCEL")
+async def general_cancel_handler(message: types.Message, state: FSMContext):
+    """Handles cancel button clicks when not in a specific state"""
+    if not await check_authorization(message, "Cancel button"):
+        return
+    await state.clear()
+    await message.answer("❌ Operation cancelled.", reply_markup=get_main_menu())
+
+
+# --- Debug Handler - Catch All with Authorization ---
+@dp.message()
+async def debug_catch_all(message: types.Message):
+    # Apply authorization check
+    if not await check_authorization(message, f"message: {message.text or 'media'}"):
+        return
+    
+    print(f"⚠️ UNHANDLED MESSAGE: '{message.text}'")
+    await message.answer(f"⚠️ Unhandled command: {message.text}\nPlease run /start to update your menu.")
+
 async def start_health_server():
     """Start health check web server for Render/Railway/Fly.io"""
     global health_server_runner
@@ -7828,14 +8375,14 @@ async def cleanup_on_shutdown():
             m = int((uptime.total_seconds() % 3600) // 60)
             await bot.send_message(
                 MASTER_ADMIN_ID,
-                f"🔴 **BOT 9 — OFFLINE**\n\n"
-                f"**Status:** Shutting down\n"
-                f"**Uptime:** {h}h {m}m\n"
-                f"**Errors:** {health_monitor.error_count}\n"
-                f"**Warnings:** {health_monitor.warning_count}\n\n"
-                f"**Time:** {now_local().strftime('%B %d, %Y — %I:%M:%S %p')}\n\n"
+                f"🔴 <b>BOT 9 — OFFLINE</b>\n\n"
+                f"<b>Status:</b> Shutting down\n"
+                f"<b>Uptime:</b> {h}h {m}m\n"
+                f"<b>Errors:</b> {health_monitor.error_count}\n"
+                f"<b>Warnings:</b> {health_monitor.warning_count}\n\n"
+                f"<b>Time:</b> {now_local().strftime('%B %d, %Y — %I:%M:%S %p')}\n\n"
                 f"_Bot 9 has stopped. It will resume when restarted._",
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
     except Exception as e:
         logger.error(f"Failed to send shutdown notification: {e}")
@@ -7882,20 +8429,20 @@ async def main():
     if MASTER_ADMIN_ID and MASTER_ADMIN_ID != 0:
         try:
             startup_msg = (
-                "🚀 **BOT 9 ENTERPRISE EDITION**\n\n"
-                "✅ **Status:** ONLINE\n"
-                f"📅 **Started:** {now_local().strftime('%B %d, %Y %I:%M %p')}\n\n"
-                "🔧 **Active Systems:**\n"
+                "🚀 <b>BOT 9 ENTERPRISE EDITION</b>\n\n"
+                "✅ <b>Status:</b> ONLINE\n"
+                f"📅 <b>Started:</b> {now_local().strftime('%B %d, %Y %I:%M %p')}\n\n"
+                "🔧 <b>Active Systems:</b>\n"
                 "├ Auto-Healer: ✅ Active\n"
                 "├ Health Monitor: ✅ Active\n"
                 "├ Daily Reports: ✅ Active\n"
                 "├ State Persistence: ✅ Active\n"
                 "└ Auto Backup: ✅ Active\n\n"
-                "🛡️ **Security:** Enterprise Level\n"
-                "⚡ **Ready to Handle:** Millions of Requests\n\n"
+                "🛡️ <b>Security:</b> Enterprise Level\n"
+                "⚡ <b>Ready to Handle:</b> Millions of Requests\n\n"
                 "All systems operational! 🎯"
             )
-            await bot.send_message(MASTER_ADMIN_ID, startup_msg, parse_mode="Markdown")
+            await bot.send_message(MASTER_ADMIN_ID, startup_msg, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Failed to send startup notification: {e}")
     else:
