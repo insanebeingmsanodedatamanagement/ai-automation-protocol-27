@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from aiohttp import web as aiohttp_web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from pymongo import MongoClient
@@ -20,6 +20,20 @@ from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 # Fix Windows console encoding for emojis
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
+
+# ── Bot 10 logging: suppress noisy library output, keep our prints ──────────
+import logging as _logging
+_logging.basicConfig(
+    level=_logging.WARNING,
+    format='[BOT10] %(asctime)s %(levelname)s %(name)s: %(message)s',
+    handlers=[_logging.StreamHandler(sys.stdout)],
+    force=True
+)
+for _noisy in ("pymongo", "pymongo.pool", "pymongo.topology",
+               "aiogram", "aiogram.event", "aiogram.dispatcher",
+               "aiohttp", "asyncio"):
+    _logging.getLogger(_noisy).setLevel(_logging.WARNING)
+del _noisy
 
 # ==============================================
 # BOT 10 - BROADCAST MANAGEMENT SYSTEM
@@ -59,11 +73,15 @@ BOT_TOKEN = os.getenv("BOT_10_TOKEN")
 BOT_8_TOKEN = os.getenv("BOT_8_TOKEN")  # Bot 8 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
 OWNER_ID = MASTER_ADMIN_ID  # Alias for compatibility with auto-healer notifications
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")   # Set on Render; never hardcode here
+
+# In-memory set of master-admin IDs that have completed password auth this session
+_admin_authenticated: set = set()
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "MSANodeDB")  # MongoDB database name
 REVIEW_LOG_CHANNEL = int(os.getenv("REVIEW_LOG_CHANNEL", 0))  # Support ticket channel
 # Render web-service health check port (Render sets PORT automatically)
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", 8090))
 
 # Validate critical config at startup
 if not BOT_TOKEN:
@@ -86,6 +104,8 @@ print(f"🤖 Bot 8 Token: {BOT_8_TOKEN[:20]}...")
 # MongoDB Connection
 client = MongoClient(MONGO_URI)
 db = client[MONGO_DB_NAME]
+# Shared content DB — bot9 writes PDFs/IG content here; bot10 reads from it (mirrors bot8.py)
+db_shared = client["MSANodeDB"]
 col_broadcasts = db["bot10_broadcasts"]
 col_user_tracking = db["bot10_user_tracking"]  # Track user sources
 col_support_tickets = db["support_tickets"]  # Bot 8 support tickets
@@ -101,8 +121,10 @@ col_bot8_settings = db["bot8_settings"]  # Bot 8 global settings (Maintenance Mo
 # Bot 8 Collections (for Terminal and Reset Data features)
 col_user_verification = db["user_verification"]  # Bot 8 user verification data
 col_msa_ids = db["msa_ids"]  # Bot 8 MSA+ ID tracking
-col_bot9_pdfs = db["bot9_pdfs"]  # Bot 8 PDF/Affiliate/YT data
-col_bot9_ig_content = db["bot9_ig_content"]  # Bot 8 IG Content Collection
+col_bot8_backups = db["bot8_backups"]  # Bot 8 auto-backups (separate)
+col_permanently_banned_msa = db["permanently_banned_msa"]  # Permanently banned MSA IDs
+col_bot9_pdfs = db_shared["bot9_pdfs"]  # ✅ Bot9 PDFs live in MSANodeDB — must use db_shared
+col_bot9_ig_content = db_shared["bot9_ig_content"]  # ✅ Bot9 IG content lives in MSANodeDB
 
 print(f"💾 Connected to MongoDB: MSANodeDB")
 print(f"📁 Bot 10 Collections: bot10_broadcasts, bot10_user_tracking, support_tickets, cleanup_backups, cleanup_logs, banned_users, suspended_features, bot10_backups")
@@ -128,6 +150,15 @@ try:
     # Bot 10 backups collection indexes
     col_bot10_backups.create_index([("backup_date", -1)])  # Latest backup first
     col_bot10_backups.create_index([("backup_type", 1)])  # Filter by type
+
+    # Bot 8 backups collection indexes
+    col_bot8_backups.create_index([("backup_date", -1)])
+    col_bot8_backups.create_index([("backup_type", 1)])
+    col_bot8_backups.create_index([("bot", 1)])
+
+    # Permanently banned MSA index
+    col_permanently_banned_msa.create_index("user_id")
+    col_permanently_banned_msa.create_index("msa_id")
     
     # Admin collection indexes
     col_admins.create_index("user_id", unique=True)  # One admin record per user
@@ -274,6 +305,7 @@ class AdminStates(StatesGroup):
     waiting_for_role_admin_id = State()
     selecting_role = State()
     waiting_for_lock_user_id = State()
+    waiting_for_lock_action = State()
     waiting_for_unlock_user_id = State()
     waiting_for_ban_user_id = State()
     waiting_for_admin_search = State()
@@ -281,14 +313,82 @@ class AdminStates(StatesGroup):
     owner_transfer_first_confirm = State()   # Step 1: "type CONFIRM"
     owner_transfer_second_confirm = State()  # Step 2: "type TRANSFER"
     owner_transfer_password = State()        # Step 3: enter secret password
+    # Admin session authentication (password gate on /start)
+    waiting_for_admin_pw_1 = State()
+    waiting_for_admin_pw_2 = State()
 
 class Bot8SettingsStates(StatesGroup):
-    viewing_menu = State()
+    viewing_menu    = State()
+    choosing_method = State()   # Auto / Templates / Custom choice
+    entering_custom = State()   # Typing custom broadcast message
 
 class GuideStates(StatesGroup):
     selecting         = State()   # user is on the guide selector screen
     viewing_bot10     = State()   # paginated Bot 10 admin guide
     viewing_bot8      = State()   # Bot 8 user guide (from inside bot10)
+
+# ==========================================
+# 🤖 BOT 8 SETTINGS — BROADCAST TEMPLATES
+# ==========================================
+
+_OFFLINE_TEMPLATES = [
+    {"title": "🔧 System Upgrade",        "text": "👤 **Dear Valued Member,**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🔧 **MSA NODE AGENT — SYSTEM UPGRADE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour MSA Node Agent is currently undergoing a **premium infrastructure upgrade** to deliver you an even more powerful experience.\n\n🚫 **During Upgrade:**\n• Start links are not active\n• All bot features are temporarily paused\n• No new sessions can begin\n\n⏳ **Status:** Coming back online very soon.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThank you for your patience. The upgrade ensures you receive the **best possible service**.\n\n_— MSA Node Systems_"},
+    {"title": "🛠 Maintenance Window",     "text": "🛠 **SCHEDULED MAINTENANCE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n**MSA NODE is currently in a scheduled maintenance window.**\n\nOur team is performing essential updates to keep the system running at peak performance.\n\n⏸ **Services on hold:**\n• Content access temporarily unavailable\n• All start links paused\n• Support queue on standby\n\n🔄 **We'll be back shortly.** Thank you for your understanding.\n\n_— MSA NODE Operations Team_"},
+    {"title": "⚠️ Emergency Maintenance",  "text": "⚠️ **EMERGENCY MAINTENANCE IN PROGRESS**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWe have detected a critical issue requiring **immediate attention**.\n\nOur engineering team is working around the clock to resolve this as quickly as possible.\n\n🚫 **All bot features are temporarily offline.**\n\n⏳ **Estimated downtime:** Minimal. We're moving fast.\n\nWe apologize for any inconvenience and appreciate your patience.\n\n_— MSA NODE Emergency Response_"},
+    {"title": "📅 Scheduled Downtime",     "text": "📅 **SCHEDULED DOWNTIME NOTICE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nAs part of our **regular system maintenance schedule**, MSA NODE Agent is currently offline.\n\nThis downtime was planned to ensure:\n• System stability\n• Performance improvements\n• Database optimization\n\n✅ **All your data and access are safe.** We'll notify you the moment we're back.\n\n_— MSA NODE Systems_"},
+    {"title": "🏗 Infrastructure Update",  "text": "🏗 **INFRASTRUCTURE UPDATE IN PROGRESS**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWe are upgrading the **core infrastructure** behind MSA NODE to bring you:\n\n⚡ Faster response times\n🔒 Enhanced security\n📈 Better reliability\n🌐 Improved global access\n\n⏳ **The agent will return shortly with a significantly improved experience.**\n\n_— MSA NODE Engineering_"},
+    {"title": "🔴 Critical Fix In Progress","text": "🔴 **CRITICAL FIX IN PROGRESS**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nOur team has identified and is actively resolving a **critical issue** in the MSA NODE system.\n\nTo maintain integrity and protect your experience, the agent has been **temporarily suspended**.\n\n🛡 **Your data and access remain fully protected.**\n\nWe will notify you immediately once the fix is deployed and the agent is restored.\n\n_— MSA NODE Tech Support_"},
+    {"title": "🚀 Premium Feature Update", "text": "🚀 **PREMIUM FEATURE UPDATE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nExciting things are happening behind the scenes!\n\nWe are currently deploying a **major premium feature update** to your MSA NODE Agent.\n\nNew capabilities and improvements are being integrated right now.\n\n⏳ **The agent will return with even more power. Stay tuned.**\n\n_— MSA NODE Development Team_"},
+    {"title": "🔒 Security Maintenance",   "text": "🔒 **SECURITY MAINTENANCE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWe are performing **critical security hardening** on the MSA NODE system.\n\nDuring this process, all services are temporarily suspended to ensure:\n• Complete system integrity\n• Protection of all member data\n• Zero-tolerance security standards\n\n🛡 **Your account and data are fully secure.**\n\nWe'll be back online shortly.\n\n_— MSA NODE Security Team_"},
+    {"title": "💾 Database Optimization",  "text": "💾 **DATABASE OPTIMIZATION IN PROGRESS**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWe are currently **optimizing our database architecture** to ensure:\n\n📊 Faster data retrieval\n🔄 Smoother user experience\n📈 Higher throughput for all members\n🗂 Better organization of your content\n\n⏳ **This optimization will be complete shortly.**\n\n_— MSA NODE Database Team_"},
+    {"title": "📦 New Updates in Agent",   "text": "📦 **NEW UPDATES INCOMING — AGENT OFFLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🚧 **We are installing new updates to your MSA NODE Agent.**\n\nFresh features, improved workflows, and enhanced content delivery are being prepared for you.\n\n🔧 **What's being updated:**\n• New agent capabilities\n• Enhanced search features\n• Improved dashboard\n• Backend performance boosts\n\n⏳ **Stand by — the new version launches soon.**\n\n_— MSA NODE Development_"},
+]
+
+_ONLINE_TEMPLATES = [
+    {"title": "✅ Back Online",            "text": "✅ **MSA NODE AGENT — BACK ONLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🟢 Your MSA Node Agent has completed its upgrade and is now **fully operational**.\n\n**All features are now available:**\n• 📊 Dashboard\n• 🔍 Search Code\n• � Tutorial\n• �📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n• All start links are active\n\nThank you for your patience during the upgrade.\n\n_— MSA Node Systems_"},
+    {"title": "🔧 System Restored",        "text": "🔧 **SYSTEM FULLY RESTORED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n✅ The MSA NODE system has been fully restored after maintenance.\n\n**Your full access has been reinstated:**\n• 📊 Dashboard — Active\n• 🔍 Search Code — Active\n• � Tutorial — Active\n• �📜 Rules — Active\n• 📖 Agent Guide — Active\n• 📞 Support — Active\n\nWe appreciate your patience and look forward to serving you.\n\n_— MSA NODE Operations_"},
+    {"title": "🟢 All Systems Green",      "text": "🟢 **ALL SYSTEMS GREEN**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n**MSA NODE Agent status: FULLY OPERATIONAL**\n\nEvery system has been verified and cleared for full operation.\n\n🚦 **System Status:**\n• 📊 Dashboard .................. ✅ Online\n• 🔍 Search ..................... ✅ Online\n• � Tutorial ................... ✅ Online\n• �📜 Rules ...................... ✅ Online\n• 📖 Guide ...................... ✅ Online\n• 📞 Support .................... ✅ Online\n\nWelcome back!\n\n_— MSA NODE Systems_"},
+    {"title": "✨ Premium Upgrade Complete","text": "✨ **PREMIUM UPGRADE COMPLETE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThe premium upgrade to your MSA NODE Agent has been **successfully completed**.\n\nYour experience has been enhanced with improved speed, reliability, and features.\n\n**Everything you need is ready:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\nThank you for being a valued MSA NODE member.\n\n_— MSA NODE Development_"},
+    {"title": "🆕 New Features Available", "text": "🆕 **NEW FEATURES AVAILABLE NOW**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎉 MSA NODE Agent is back online with **exciting new features and improvements!**\n\nWe've been working hard to make your experience better. Explore everything that's new and improved.\n\n**All services restored:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Development Team_"},
+    {"title": "⚡ Agent Update Deployed",  "text": "⚡ **AGENT UPDATE SUCCESSFULLY DEPLOYED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour MSA NODE Agent update has been **deployed and verified**.\n\nThe agent is now running at peak performance with all enhancements active.\n\n**Resume your activities:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Engineering_"},
+    {"title": "💎 Enhanced Experience",    "text": "💎 **ENHANCED EXPERIENCE READY**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour **enhanced MSA NODE experience** is now live!\n\nWe've upgraded performance, security, and features to give you the best possible agent experience.\n\n**Full access restored:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Premium Division_"},
+    {"title": "🌐 MSA NODE Next Level",    "text": "🌐 **MSA NODE — NEXT LEVEL ONLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🟢 MSA NODE has been elevated to its **next performance tier**.\n\nFaster. More powerful. Smarter.\n\n**Your access:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\nUse /start to begin.\n\n_— MSA NODE Systems_"},
+    {"title": "🔓 Elite Access Restored",  "text": "🔓 **ELITE ACCESS RESTORED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour **elite MSA NODE membership** has been fully restored.\n\nAll premium tools and features are available to you again.\n\n**Available now:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\nWelcome back to the elite tier.\n\n_— MSA NODE Elite Division_"},
+    {"title": "📦 Agent Session Unlocked", "text": "📦 **AGENT SESSION UNLOCKED — UPDATES LIVE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎯 **Your MSA NODE Agent has been updated and unlocked.**\n\nAll the new features from our latest session are now **live and ready** for you.\n\n**Explore what's new:**\n• 📊 Dashboard — Enhanced\n• 🔍 Search Code — Faster\n• 📜 Rules — Updated\n• 📖 Agent Guide — Expanded\n• 📞 Support — Improved\n\nUse /start to get started.\n\n_— MSA NODE Development_"},
+]
+
+_TPLS_PER_PAGE = 5   # templates shown per InlineKeyboard page
+
+
+def _build_template_kb(templates: list, page: int, direction: str) -> InlineKeyboardMarkup:
+    """Build paginated template selection InlineKeyboard."""
+    total   = len(templates)
+    total_p = (total + _TPLS_PER_PAGE - 1) // _TPLS_PER_PAGE
+    start   = page * _TPLS_PER_PAGE
+    end     = min(start + _TPLS_PER_PAGE, total)
+
+    rows = []
+    for idx in range(start, end):
+        rows.append([InlineKeyboardButton(
+            text=templates[idx]["title"],
+            callback_data=f"b8t_sel:{direction}:{idx}"
+        )])
+
+    # Navigation row
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ PREV", callback_data=f"b8t_pg:{direction}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"📄 {page+1}/{total_p}", callback_data="b8t_noop"))
+    if page < total_p - 1:
+        nav.append(InlineKeyboardButton(text="NEXT ▶️", callback_data=f"b8t_pg:{direction}:{page+1}"))
+    rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(text="✏️ CUSTOM MESSAGE", callback_data=f"b8t_custom:{direction}"),
+        InlineKeyboardButton(text="❌ CANCEL",          callback_data="b8t_cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 # ==========================================
 # ==========================================
@@ -458,7 +558,11 @@ async def has_permission(user_id: int, permission: str) -> bool:
     admin = col_admins.find_one({"user_id": user_id})
     if not admin:
         return False
-    
+
+    # Locked admins have NO permissions — even if they manually type a command
+    if admin.get('locked', False):
+        return False
+
     perms = admin.get('permissions', [])
     return 'all' in perms or permission in perms
 
@@ -499,7 +603,9 @@ async def get_main_menu(user_id: int = None):
         'shoot': "📸 SHOOT",
         'support': "💬 SUPPORT",
         'backup': "💾 BACKUP",
-        'terminal': "🖥️ TERMINAL"
+        'terminal': "🖥️ TERMINAL",
+        'admins': "👥 ADMINS",
+        'bot8': "🤖 BOT 8 SETTINGS"
     }
     
     # Build keyboard with only permitted features
@@ -521,9 +627,10 @@ async def get_main_menu(user_id: int = None):
 
 
 def get_backup_menu():
-    """Backup management submenu"""
+    """Backup management submenu — Bot 8 and Bot 10 separated"""
     keyboard = [
-        [KeyboardButton(text="📥 BACKUP NOW"), KeyboardButton(text="📊 VIEW BACKUPS")],
+        [KeyboardButton(text="🤖 BOT 8 BACKUP"), KeyboardButton(text="🤖 BOT 10 BACKUP")],
+        [KeyboardButton(text="📊 BOT 8 HISTORY"), KeyboardButton(text="📊 BOT 10 HISTORY")],
         [KeyboardButton(text="🗓️ MONTHLY STATUS"), KeyboardButton(text="⚙️ AUTO-BACKUP")],
         [KeyboardButton(text="⬅️ MAIN MENU")]
     ]
@@ -576,6 +683,13 @@ def _format_broadcast_msg(text: str, is_caption: bool = False) -> str:
         return header + body + footer
 
 
+def _esc_md(text: str) -> str:
+    """Escape Telegram Markdown v1 special chars in dynamic content (exception msgs, DB values)."""
+    for ch in ('*', '_', '`', '['):
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+
 def get_broadcast_type_menu():
     """Broadcast type selection menu"""
     keyboard = [
@@ -610,7 +724,7 @@ def get_category_menu():
     keyboard = [
         [KeyboardButton(text="📺 YT"), KeyboardButton(text="📸 IG")],
         [KeyboardButton(text="📎 IG CC"), KeyboardButton(text="🔗 YTCODE")],
-        [KeyboardButton(text="👥 ALL")],
+        [KeyboardButton(text="👥 ALL"), KeyboardButton(text="👤 UNKNOWN")],
         [KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="❌ CANCEL")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -625,19 +739,39 @@ def get_admin_menu():
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
+def _admin_btn(admin: dict) -> str:
+    """Build admin selection button label: '👤 @username (user_id)' or '👤 Name (user_id)'"""
+    uid  = admin['user_id']
+    name = admin.get('name', str(uid))
+    # Avoid showing 'uid (uid)' when name == uid fallback
+    if name == str(uid):
+        return f"👤 ({uid})"
+    return f"👤 {name} ({uid})"
+
+def _parse_admin_uid(text: str) -> int:
+    """Parse user_id from '👤 Name (user_id)' or legacy 'UID - Role' button text."""
+    if '(' in text and ')' in text:
+        return int(text.split('(')[-1].rstrip(')'))
+    if '[' in text and ']' in text:
+        return int(text.split('[')[-1].rstrip(']'))
+    if ' - ' in text:
+        return int(text.split(' - ')[0].strip())
+    return int(text.strip())
+
 def get_bot8_settings_menu():
-    """Bot 8 Settings Menu"""
-    # Get current status
+    """Bot 8 Settings Menu — TURN ON/OFF, Stats, Log."""
     settings = col_bot8_settings.find_one({"setting": "maintenance_mode"})
     is_maintenance = settings.get("value", False) if settings else False
-    
-    toggle_text = "🛠 MAINTENANCE: OFF" if not is_maintenance else "🛠 MAINTENANCE: ON"
-    
+
+    if is_maintenance:
+        toggle_btn = "🟢 TURN BOT ON"
+    else:
+        toggle_btn = "🔴 TURN BOT OFF"
+
     keyboard = [
-        [KeyboardButton(text=toggle_text)],
-        [KeyboardButton(text="📢 NOTIFY USERS: MAINTENANCE ON")],
-        [KeyboardButton(text="📢 NOTIFY USERS: BACK ONLINE")],
-        [KeyboardButton(text="⬅️ MAIN MENU")]
+        [KeyboardButton(text=toggle_btn)],
+        [KeyboardButton(text="📊 BOT STATS"), KeyboardButton(text="📜 OFFLINE LOG")],
+        [KeyboardButton(text="⬅️ MAIN MENU")],
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -671,7 +805,7 @@ def get_next_broadcast_id():
 # ==========================================
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     """Start command - shows main menu (ADMIN ONLY)"""
     user_id = message.from_user.id
     user_name = message.from_user.full_name
@@ -681,6 +815,21 @@ async def cmd_start(message: types.Message):
     if col_banned_users.find_one({"user_id": user_id}):
         log_action("🚫 BANNED ACCESS BLOCKED", user_id, f"Banned user tried /start")
         return  # Complete silence
+
+    # ── Password gate: master admin must authenticate once per session ──────
+    if user_id == MASTER_ADMIN_ID and ADMIN_PASSWORD and user_id not in _admin_authenticated:
+        await state.set_state(AdminStates.waiting_for_admin_pw_1)
+        await message.answer(
+            "🔐 <b>Authentication Required</b>\n\nEnter your access password:",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="❌ Cancel")]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+            parse_mode="HTML",
+        )
+        return
+    # ────────────────────────────────────────────────────────────────────────
     
     # 2. Check if user is admin
     if await is_admin(user_id):
@@ -745,6 +894,72 @@ async def cmd_start(message: types.Message):
     
     # Silent reject - NO response to user
     return
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🔐 ADMIN PASSWORD GATE (master-admin only, once per session, double confirmation)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dp.message(AdminStates.waiting_for_admin_pw_1)
+async def admin_pw_first(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    # Cancel = skip auth this session (owner ID already verified by /start gate)
+    if message.text and message.text.strip() == "❌ Cancel":
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    try: await message.delete()
+    except: pass
+    data = await state.get_data()
+    attempts = data.get("pw_attempts", 0)
+    if not ADMIN_PASSWORD:
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    if message.text == ADMIN_PASSWORD:
+        await state.update_data(pw_first_ok=True, pw_attempts=0)
+        await state.set_state(AdminStates.waiting_for_admin_pw_2)
+        await message.answer("✅ Password accepted.\n\nEnter password again to confirm:", parse_mode="HTML")
+    else:
+        attempts += 1
+        remaining = 3 - attempts
+        if remaining <= 0:
+            await state.clear()
+            await message.answer(
+                "❌ Too many failed attempts. Use /start to try again.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            await state.update_data(pw_attempts=attempts)
+            await message.answer(
+                f"❌ Incorrect password. <b>{remaining}</b> attempt(s) remaining.",
+                parse_mode="HTML",
+            )
+
+
+@dp.message(AdminStates.waiting_for_admin_pw_2)
+async def admin_pw_second(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    # Cancel = skip auth this session (owner ID already verified by /start gate)
+    if message.text and message.text.strip() == "❌ Cancel":
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    try: await message.delete()
+    except: pass
+    if message.text == ADMIN_PASSWORD:
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await cmd_start(message, state)
+    else:
+        await state.clear()
+        await message.answer(
+            "❌ Passwords did not match. Authentication failed.\n\nUse /start to try again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 @dp.message(Command("report"))
@@ -831,195 +1046,448 @@ async def back_to_main(message: types.Message, state: FSMContext):
     )
 
 @dp.message(F.text == "🤖 BOT 8 SETTINGS")
-async def bot8_settings_handler(message: types.Message):
+async def bot8_settings_handler(message: types.Message, state: FSMContext):
     """Show Bot 8 settings menu"""
-    # Only Master Admin or Admins with 'all' permission should access this
-    if not await has_permission(message.from_user.id, "all"):
-         await message.answer("⛔ Access Denied: You need 'all' permissions to manage Bot 8 settings.")
-         return
+    if not await has_permission(message.from_user.id, "bot8"):
+        await message.answer("⛔ Access Denied: You don't have permission to manage Bot 8 settings.")
+        return
 
+    await state.clear()
     log_action("🤖 BOT 8 SETTINGS", message.from_user.id, "Opened Bot 8 settings")
-    
-    # Get current maintenance status for display
-    settings = col_bot8_settings.find_one({"setting": "maintenance_mode"})
+
+    settings       = col_bot8_settings.find_one({"setting": "maintenance_mode"})
     is_maintenance = settings.get("value", False) if settings else False
-    status_icon = "🔴 UNDER MAINTENANCE" if is_maintenance else "🟢 ONLINE"
-    updated_at = settings.get("updated_at", None) if settings else None
-    updated_str = updated_at.strftime("%b %d, %Y %I:%M %p") if updated_at else "Never"
-    
+    status_icon    = "🔴 OFFLINE (Maintenance)" if is_maintenance else "🟢 ONLINE"
+    updated_at     = settings.get("updated_at", None) if settings else None
+    updated_str    = updated_at.strftime("%b %d, %Y %I:%M %p") if updated_at else "Never"
+
+    total_users = col_user_tracking.count_documents({})
+
     await message.answer(
         f"🤖 **BOT 8 SETTINGS**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📡 **Current Status:** {status_icon}\n"
-        f"🕒 **Last Changed:** {updated_str}\n\n"
-        f"⚠️ **Maintenance Mode** will block ALL users from accessing Bot 8.\n\n"
-        f"📢 Use **Notify Users** buttons to broadcast a message to all users via Bot 8.",
+        f"📡 **Status:** {status_icon}\n"
+        f"🕒 **Last Changed:** {updated_str}\n"
+        f"👥 **Registered Users:** {total_users}\n\n"
+        f"**🔴 TURN BOT OFF** — Put bot in Maintenance Mode\n"
+        f"**🟢 TURN BOT ON** — Bring bot back online\n\n"
+        f"Choose your action below:",
         reply_markup=get_bot8_settings_menu(),
         parse_mode="Markdown"
     )
 
-@dp.message(F.text.in_({"🛠 MAINTENANCE: ON", "🛠 MAINTENANCE: OFF"}))
-async def toggle_maintenance_handler(message: types.Message):
-    """Toggle maintenance mode and broadcast notification to all users via Bot 8"""
-    if not await has_permission(message.from_user.id, "all"):
-         return
 
-    # Determine new state based on button text (Toggle logic)
-    # If button says "ON", it means mode IS on, so we want to turn it OFF.
-    # If button says "OFF", it means mode IS off, so we want to turn it ON.
-    turn_on = "OFF" in message.text
-    
-    col_bot8_settings.update_one(
-        {"setting": "maintenance_mode"},
-        {"$set": {
-            "value": turn_on,
-            "updated_at": now_local(),
-            "updated_by": message.from_user.id
-        }},
-        upsert=True
-    )
-    
-    status = "ENABLED" if turn_on else "DISABLED"
-    log_action(f"🛠 MAINTENANCE {status}", message.from_user.id, f"Toggled maintenance mode to {status}")
-    
-    # Broadcast notification to all users via Bot 8
-    all_users = list(col_user_tracking.find({}, {"user_id": 1}))
-    sent_count = 0
-    failed_count = 0
-    
-    if turn_on:
-        broadcast_text = (
-            "👤 **Dear Valued Member,**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔧 **MSA NODE AGENT — SYSTEM UPGRADE**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Your MSA Node Agent is currently undergoing a **premium infrastructure upgrade** "
-            "to deliver you an even more powerful experience.\n\n"
-            "🚫 **During Upgrade:**\n"
-            "• Start links are not active\n"
-            "• All bot features are temporarily paused\n"
-            "• No new sessions can begin\n\n"
-            "⏳ **Status:** Coming back online very soon.\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Thank you for your patience. The upgrade ensures you receive the **best possible service**.\n\n"
-            "_— MSA Node Systems_"
-        )
-    else:
-        broadcast_text = (
-            "✅ **MSA NODE AGENT — BACK ONLINE**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "🟢 Your MSA Node Agent has completed its upgrade and is now **fully operational**.\n\n"
-            "**All features are now available:**\n"
-            "• 🔍 Search Code\n"
-            "• 📊 Dashboard\n"
-            "• 📞 Support\n"
-            "• All start links are active\n\n"
-            "Thank you for your patience during the upgrade.\n\n"
-            "_— MSA Node Systems_"
-        )
-    
-    progress_msg = await message.answer(
-        f"📡 Broadcasting {'maintenance' if turn_on else 'online'} notification to {len(all_users)} users..."
-    )
-    
-    for user_doc in all_users:
-        uid = user_doc.get("user_id")
-        if not uid:
-            continue
-        try:
-            await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown")
-            sent_count += 1
-            await asyncio.sleep(0.05)  # Rate limit: ~20 msgs/sec
-        except Exception:
-            failed_count += 1
-    
-    try:
-        await progress_msg.delete()
-    except Exception:
-        pass
-    
-    await message.answer(
-        f"✅ **MAINTENANCE MODE {status}**\n\n"
-        f"Bot 8 is now {'⛔ UNDER MAINTENANCE' if turn_on else '🟢 ONLINE'}.\n\n"
-        f"📢 **Broadcast Result:**\n"
-        f"• ✅ Sent: {sent_count} users\n"
-        f"• ❌ Failed: {failed_count} users",
-        reply_markup=get_bot8_settings_menu(),
-        parse_mode="Markdown"
-    )
+# ==========================================
+# 🤖 BOT 8 — TURN OFF / TURN ON  (with Auto / Template / Custom choice)
+# ==========================================
 
-@dp.message(F.text.in_({"📢 NOTIFY USERS: MAINTENANCE ON", "📢 NOTIFY USERS: BACK ONLINE"}))
-async def notify_users_manual_handler(message: types.Message):
-    """Manually send a notification broadcast to all users via Bot 8"""
-    if not await has_permission(message.from_user.id, "all"):
+@dp.message(F.text.in_({"🔴 TURN BOT OFF", "🟢 TURN BOT ON"}))
+async def b8_toggle_start_handler(message: types.Message, state: FSMContext):
+    """Ask admin how to broadcast: Auto, select template, or custom message."""
+    if not await has_permission(message.from_user.id, "bot8"):
         return
 
-    is_maintenance_msg = "MAINTENANCE ON" in message.text
+    direction = "OFF" if "OFF" in message.text else "ON"
+    await state.update_data(b8_direction=direction)
 
-    if is_maintenance_msg:
-        broadcast_text = (
-            "👤 **Dear Valued Member,**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔧 **MSA NODE AGENT — SYSTEM UPGRADE**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Your MSA Node Agent is currently undergoing a **premium infrastructure upgrade** "
-            "to deliver you an even more powerful experience.\n\n"
-            "🚫 **During Upgrade:**\n"
-            "• Start links are not active\n"
-            "• All bot features are temporarily paused\n"
-            "• No new sessions can begin\n\n"
-            "⏳ **Status:** Coming back online very soon.\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Thank you for your patience. The upgrade ensures you receive the **best possible service**.\n\n"
-            "_— MSA Node Systems_"
+    templates = _OFFLINE_TEMPLATES if direction == "OFF" else _ONLINE_TEMPLATES
+    action_word = "going OFFLINE" if direction == "OFF" else "coming ONLINE"
+
+    method_kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🤖 AUTO BROADCAST")],
+        [KeyboardButton(text="📋 SELECT TEMPLATE")],
+        [KeyboardButton(text="✏️ CUSTOM MESSAGE")],
+        [KeyboardButton(text="❌ CANCEL")],
+    ], resize_keyboard=True)
+
+    await message.answer(
+        f"🤖 **BOT IS {action_word}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"How would you like to notify users?\n\n"
+        f"**🤖 AUTO** — Use default template instantly\n"
+        f"**📋 TEMPLATES** — Pick from {len(templates)} curated professional templates\n"
+        f"**✏️ CUSTOM** — Write your own message\n\n"
+        f"Or **❌ CANCEL** to abort.",
+        reply_markup=method_kb,
+        parse_mode="Markdown"
+    )
+    await state.set_state(Bot8SettingsStates.choosing_method)
+
+
+@dp.message(Bot8SettingsStates.choosing_method)
+async def b8_method_handler(message: types.Message, state: FSMContext):
+    """Handle method choice for Bot 8 on/off notification."""
+    if not await has_permission(message.from_user.id, "bot8"):
+        await state.clear()
+        return
+
+    text = message.text
+    data = await state.get_data()
+    direction = data.get("b8_direction", "OFF")
+
+    if text == "❌ CANCEL":
+        await state.clear()
+        await message.answer("❌ Cancelled.", reply_markup=get_bot8_settings_menu())
+        return
+
+    if text == "🤖 AUTO BROADCAST":
+        # Use first / default template immediately
+        templates = _OFFLINE_TEMPLATES if direction == "OFF" else _ONLINE_TEMPLATES
+        broadcast_text = templates[0]["text"]
+        await _b8_execute_toggle(message, state, direction, broadcast_text)
+        return
+
+    if text == "📋 SELECT TEMPLATE":
+        templates = _OFFLINE_TEMPLATES if direction == "OFF" else _ONLINE_TEMPLATES
+        kb = _build_template_kb(templates, 0, direction)
+        await message.answer(
+            f"📋 **SELECT TEMPLATE**\n\n"
+            f"Choose a template for the {'OFFLINE' if direction=='OFF' else 'ONLINE'} broadcast:\n\n"
+            f"_(Tap a template name to preview & confirm)_",
+            reply_markup=kb,
+            parse_mode="Markdown"
         )
-    else:
-        broadcast_text = (
-            "✅ **MSA NODE AGENT — BACK ONLINE**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "🟢 Your MSA Node Agent has completed its upgrade and is now **fully operational**.\n\n"
-            "**All features are now available:**\n"
-            "• 🔍 Search Code\n"
-            "• 📊 Dashboard\n"
-            "• 📞 Support\n"
-            "• All start links are active\n\n"
-            "Thank you for your patience during the upgrade.\n\n"
-            "_— MSA Node Systems_"
+        # Stay in choosing_method state so we can still cancel via keyboard
+        return
+
+    if text == "✏️ CUSTOM MESSAGE":
+        cancel_kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+            resize_keyboard=True
         )
+        await message.answer(
+            f"✏️ **CUSTOM MESSAGE**\n\n"
+            f"Type the message you want to broadcast to all users.\n\n"
+            f"_This will be sent when the bot is turned {'OFF' if direction=='OFF' else 'ON'}._",
+            reply_markup=cancel_kb,
+            parse_mode="Markdown"
+        )
+        await state.set_state(Bot8SettingsStates.entering_custom)
+        return
 
-    all_users = list(col_user_tracking.find({}, {"user_id": 1}))
-    sent_count = 0
-    failed_count = 0
+    # Unexpected input — re-offer choice silently
+    await message.answer("⚠️ Please use the buttons provided.", parse_mode="Markdown")
 
-    progress_msg = await message.answer(
-        f"📡 Sending {'maintenance' if is_maintenance_msg else 'online'} notification to {len(all_users)} users..."
+
+@dp.message(Bot8SettingsStates.entering_custom)
+async def b8_custom_input_handler(message: types.Message, state: FSMContext):
+    """Receive custom broadcast text → show preview + confirm inline keyboard."""
+    if not await has_permission(message.from_user.id, "bot8"):
+        await state.clear()
+        return
+
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        await message.answer("❌ Cancelled.", reply_markup=get_bot8_settings_menu())
+        return
+
+    custom_text = (message.text or "").strip()
+    if len(custom_text) < 10:
+        await message.answer("⚠️ Message too short (minimum 10 characters). Please try again.")
+        return
+
+    data = await state.get_data()
+    direction = data.get("b8_direction", "OFF")
+    await state.update_data(b8_custom_text=custom_text)
+
+    preview = custom_text[:300] + ("…" if len(custom_text) > 300 else "")
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ CONFIRM & SEND", callback_data=f"b8c_confirm:{direction}"),
+        InlineKeyboardButton(text="❌ CANCEL",         callback_data="b8c_cancel"),
+    ]])
+    await message.answer(
+        f"📋 **PREVIEW — CUSTOM MESSAGE**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{preview}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👉 Confirm to broadcast this to all users and turn bot {'OFF' if direction=='OFF' else 'ON'}.",
+        reply_markup=confirm_kb,
+        parse_mode="Markdown"
     )
 
-    for user_doc in all_users:
-        uid = user_doc.get("user_id")
-        if not uid:
-            continue
+
+# ─── InlineKeyboard callbacks for template browsing & confirm ────────
+
+@dp.callback_query(F.data.startswith("b8t_pg:"))
+async def b8_template_page_callback(callback: types.CallbackQuery):
+    """Navigate template pages."""
+    _, direction, page_str = callback.data.split(":")
+    page      = int(page_str)
+    templates = _OFFLINE_TEMPLATES if direction == "OFF" else _ONLINE_TEMPLATES
+    kb        = _build_template_kb(templates, page, direction)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("b8t_sel:"))
+async def b8_template_select_callback(callback: types.CallbackQuery, state: FSMContext):
+    """User selected a template — show preview + confirm."""
+    _, direction, idx_str = callback.data.split(":")
+    idx       = int(idx_str)
+    templates = _OFFLINE_TEMPLATES if direction == "OFF" else _ONLINE_TEMPLATES
+    tpl       = templates[idx]
+
+    # Store selection in state
+    await state.update_data(b8_direction=direction, b8_tpl_idx=idx)
+
+    preview = tpl["text"][:400] + ("…" if len(tpl["text"]) > 400 else "")
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ CONFIRM & SEND", callback_data=f"b8t_conf:{direction}:{idx}"),
+        InlineKeyboardButton(text="◀️ BACK",           callback_data=f"b8t_back:{direction}"),
+    ]])
+    await callback.message.edit_text(
+        f"📋 **TEMPLATE PREVIEW**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**{tpl['title']}**\n\n"
+        f"{preview}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Tap ✅ to broadcast this and turn bot {'OFF' if direction=='OFF' else 'ON'}.",
+        reply_markup=confirm_kb,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("b8t_back:"))
+async def b8_template_back_callback(callback: types.CallbackQuery):
+    """Go back to template page 0."""
+    direction = callback.data.split(":")[1]
+    templates = _OFFLINE_TEMPLATES if direction == "OFF" else _ONLINE_TEMPLATES
+    kb        = _build_template_kb(templates, 0, direction)
+    await callback.message.edit_text(
+        f"📋 **SELECT TEMPLATE**\n\n"
+        f"Choose a template for the {'OFFLINE' if direction=='OFF' else 'ONLINE'} broadcast:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("b8t_conf:"))
+async def b8_template_confirm_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Execute broadcast + toggle after template confirmation."""
+    parts     = callback.data.split(":")
+    direction = parts[1]
+    idx       = int(parts[2])
+    templates = _OFFLINE_TEMPLATES if direction == "OFF" else _ONLINE_TEMPLATES
+    text      = templates[idx]["text"]
+
+    await callback.message.edit_text("📡 Executing broadcast…")
+    await callback.answer()
+    await _b8_execute_toggle_from_callback(callback, state, direction, text)
+
+
+@dp.callback_query(F.data.startswith("b8c_confirm:"))
+async def b8_custom_confirm_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Execute broadcast + toggle after custom message confirmation."""
+    direction = callback.data.split(":")[1]
+    data      = await state.get_data()
+    text      = data.get("b8_custom_text", "")
+    if not text:
+        await callback.answer("⚠️ No message found. Please try again.", show_alert=True)
+        return
+    await callback.message.edit_text("📡 Executing broadcast…")
+    await callback.answer()
+    await _b8_execute_toggle_from_callback(callback, state, direction, text)
+
+
+@dp.callback_query(F.data == "b8c_cancel")
+async def b8_custom_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Cancel custom message confirmation."""
+    await state.clear()
+    await callback.message.edit_text("❌ Broadcast cancelled.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "b8t_cancel")
+async def b8_template_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Cancel template selection."""
+    await state.clear()
+    await callback.message.edit_text("❌ Template selection cancelled.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "b8t_noop")
+async def b8_template_noop_callback(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("b8t_custom:"))
+async def b8_template_custom_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Switch from template list to custom message input."""
+    direction = callback.data.split(":")[1]
+    await state.update_data(b8_direction=direction)
+    await state.set_state(Bot8SettingsStates.entering_custom)
+    cancel_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+        resize_keyboard=True
+    )
+    await callback.message.edit_text("✏️ **Type your custom message below:**", parse_mode="Markdown")
+    await callback.message.answer("✏️ Go ahead — type your broadcast message:", reply_markup=cancel_kb)
+    await callback.answer()
+
+
+# ─── Shared executor ──────────────────────────────────────────────────
+
+async def _b8_execute_toggle(message: types.Message, state: FSMContext, direction: str, broadcast_text: str):
+    """Toggle maintenance mode and broadcast to all users (called from reply-keyboard flow)."""
+    turn_on = (direction == "OFF")  # "OFF" means turn maintenance ON
+
+    col_bot8_settings.update_one(
+        {"setting": "maintenance_mode"},
+        {"$set": {"value": turn_on, "updated_at": now_local(), "updated_by": message.from_user.id}},
+        upsert=True
+    )
+    # Save to offline log
+    col_bot8_settings.insert_one({
+        "setting": "offline_event",
+        "direction": direction,
+        "message": broadcast_text[:200],
+        "triggered_by": message.from_user.id,
+        "triggered_at": now_local(),
+    })
+
+    status = "ENABLED" if turn_on else "DISABLED"
+    log_action(f"🛠 MAINTENANCE {status}", message.from_user.id, f"Bot turned {'OFF' if turn_on else 'ON'}")
+
+    all_users  = list(col_user_tracking.find({}, {"user_id": 1}))
+    sent, fail = 0, 0
+    progress   = await message.answer(f"📡 Broadcasting to {len(all_users)} users…")
+    for doc in all_users:
+        uid = doc.get("user_id")
+        if not uid: continue
         try:
             await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown")
-            sent_count += 1
+            sent += 1
             await asyncio.sleep(0.05)
         except Exception:
-            failed_count += 1
-
+            fail += 1
     try:
-        await progress_msg.delete()
+        await progress.delete()
     except Exception:
         pass
 
-    label = "MAINTENANCE" if is_maintenance_msg else "BACK ONLINE"
-    log_action(f"📢 NOTIFY {label}", message.from_user.id, f"Manual notify: {sent_count} sent, {failed_count} failed")
+    await state.clear()
+    await message.answer(
+        f"{'🔴 BOT OFFLINE' if turn_on else '🟢 BOT ONLINE'}\n\n"
+        f"✅ Maintenance mode **{'ENABLED' if turn_on else 'DISABLED'}**.\n\n"
+        f"📊 **Broadcast Result:**\n• ✅ Sent: {sent} users\n• ❌ Failed: {fail} users",
+        reply_markup=get_bot8_settings_menu(),
+        parse_mode="Markdown"
+    )
+
+
+async def _b8_execute_toggle_from_callback(callback: types.CallbackQuery, state: FSMContext, direction: str, broadcast_text: str):
+    """Same as _b8_execute_toggle but starts from a callback query context."""
+    turn_on = (direction == "OFF")
+
+    col_bot8_settings.update_one(
+        {"setting": "maintenance_mode"},
+        {"$set": {"value": turn_on, "updated_at": now_local(), "updated_by": callback.from_user.id}},
+        upsert=True
+    )
+    col_bot8_settings.insert_one({
+        "setting": "offline_event",
+        "direction": direction,
+        "message": broadcast_text[:200],
+        "triggered_by": callback.from_user.id,
+        "triggered_at": now_local(),
+    })
+
+    status = "ENABLED" if turn_on else "DISABLED"
+    log_action(f"🛠 MAINTENANCE {status}", callback.from_user.id, f"Bot turned {'OFF' if turn_on else 'ON'} via template")
+
+    all_users  = list(col_user_tracking.find({}, {"user_id": 1}))
+    sent, fail = 0, 0
+    for doc in all_users:
+        uid = doc.get("user_id")
+        if not uid: continue
+        try:
+            await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+
+    await state.clear()
+    await callback.message.answer(
+        f"{'🔴 BOT OFFLINE' if turn_on else '🟢 BOT ONLINE'}\n\n"
+        f"✅ Maintenance mode **{'ENABLED' if turn_on else 'DISABLED'}**.\n\n"
+        f"📊 **Broadcast Result:**\n• ✅ Sent: {sent} users\n• ❌ Failed: {fail} users",
+        reply_markup=get_bot8_settings_menu(),
+        parse_mode="Markdown"
+    )
+
+
+# ─── BOT STATS ────────────────────────────────────────────────────────
+
+@dp.message(F.text == "📊 BOT STATS")
+async def b8_stats_handler(message: types.Message):
+    """Show Bot 8 live statistics."""
+    if not await has_permission(message.from_user.id, "bot8"):
+        return
+    total_users    = col_user_tracking.count_documents({})
+    total_msa      = col_msa_ids.count_documents({})
+    open_tickets   = col_support_tickets.count_documents({"status": "open"})
+    closed_tickets = col_support_tickets.count_documents({"status": "resolved"})
+    total_bc       = col_broadcasts.count_documents({})
+
+    settings       = col_bot8_settings.find_one({"setting": "maintenance_mode"})
+    is_maint       = settings.get("value", False) if settings else False
+    status_str     = "🔴 Offline (Maintenance)" if is_maint else "🟢 Online"
 
     await message.answer(
-        f"✅ **NOTIFICATION SENT**\n\n"
-        f"📢 **Type:** {'Maintenance Alert' if is_maintenance_msg else 'Back Online Alert'}\n\n"
-        f"📊 **Result:**\n"
-        f"• ✅ Sent: {sent_count} users\n"
-        f"• ❌ Failed: {failed_count} users",
+        f"📊 **BOT 8 LIVE STATS**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📡 **Status:** {status_str}\n\n"
+        f"👥 **Users:**\n"
+        f"• Tracked: `{total_users}`\n"
+        f"• MSA Members: `{total_msa}`\n\n"
+        f"🎫 **Support Tickets:**\n"
+        f"• Open: `{open_tickets}`\n"
+        f"• Resolved: `{closed_tickets}`\n\n"
+        f"📢 **Broadcasts Stored:** `{total_bc}`\n\n"
+        f"🕒 _Snapshot: {now_local().strftime('%b %d, %Y %I:%M %p')}_",
+        reply_markup=get_bot8_settings_menu(),
+        parse_mode="Markdown"
+    )
+
+
+# ─── OFFLINE LOG ──────────────────────────────────────────────────────
+
+@dp.message(F.text == "📜 OFFLINE LOG")
+async def b8_offline_log_handler(message: types.Message):
+    """Show history of bot on/off events."""
+    if not await has_permission(message.from_user.id, "bot8"):
+        return
+    events = list(col_bot8_settings.find(
+        {"setting": "offline_event"},
+        sort=[("triggered_at", -1)],
+    ).limit(10))
+
+    if not events:
+        await message.answer(
+            "📜 **OFFLINE LOG**\n\n_No events recorded yet._",
+            reply_markup=get_bot8_settings_menu(),
+            parse_mode="Markdown"
+        )
+        return
+
+    lines = ["📜 **OFFLINE LOG** _(last 10 events)_\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+    for e in events:
+        ts  = e.get("triggered_at")
+        dir_= e.get("direction", "?")
+        uid = e.get("triggered_by", "?")
+        ts_str = ts.strftime("%b %d  %I:%M %p") if ts else "—"
+        icon = "🔴" if dir_ == "OFF" else "🟢"
+        lines.append(f"{icon} **{'OFFLINE' if dir_=='OFF' else 'ONLINE'}** · {ts_str} · by `{uid}`")
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    await message.answer(
+        "\n".join(lines),
         reply_markup=get_bot8_settings_menu(),
         parse_mode="Markdown"
     )
@@ -1061,7 +1529,8 @@ async def process_category_selection(message: types.Message, state: FSMContext):
         "📸 IG": "IG",
         "📎 IG CC": "IGCC",
         "🔗 YTCODE": "YTCODE",
-        "👥 ALL": "ALL"
+        "👥 ALL": "ALL",
+        "👤 UNKNOWN": "UNKNOWN",
     }
     
     if message.text not in category_map:
@@ -1137,7 +1606,8 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
     
     # Find target users based on category
     if category == "ALL":
-        target_users = list(col_user_tracking.find({}))
+        # Use msa_ids as authoritative source — all verified MSA members
+        target_users = list(col_msa_ids.find({}))
     else:
         target_users = list(col_user_tracking.find({"source": category}))
     
@@ -1499,7 +1969,7 @@ async def show_broadcast_list_page(message: types.Message, state: FSMContext, pa
         category = brd.get('category', 'ALL')
         # Get user count for this category
         if category == "ALL":
-            user_count = col_user_tracking.count_documents({})
+            user_count = col_msa_ids.count_documents({})  # All verified MSA members
         else:
             user_count = col_user_tracking.count_documents({"source": category})
         
@@ -1552,7 +2022,7 @@ async def process_list_search(message: types.Message, state: FSMContext):
         if message.text == "⬅️ MAIN MENU":
             await message.answer(
                 "📋 **Main Menu**",
-                reply_markup=get_main_menu(),
+                reply_markup=await get_main_menu(message.from_user.id),
                 parse_mode="Markdown"
             )
         else:
@@ -1633,7 +2103,7 @@ async def show_edit_broadcast_list(message: types.Message, state: FSMContext, pa
         category = brd.get('category', 'ALL')
         # Get user count for this category
         if category == "ALL":
-            user_count = col_user_tracking.count_documents({})
+            user_count = col_msa_ids.count_documents({})  # All verified MSA members
         else:
             user_count = col_user_tracking.count_documents({"source": category})
         
@@ -1812,7 +2282,15 @@ async def process_edit_confirm(message: types.Message, state: FSMContext):
     message_ids = broadcast.get("message_ids", {})
     new_text = update_data.get("message_text", "")
     message_type = update_data.get("message_type", "text")
-    
+
+    # For button broadcasts: reconstruct inline keyboard so buttons are preserved after edit
+    has_buttons = broadcast.get("has_buttons", False)
+    orig_buttons = broadcast.get("buttons", [])
+    orig_reply_markup = None
+    if has_buttons and orig_buttons:
+        inline_btns = [[InlineKeyboardButton(text=b['text'], url=b['url'])] for b in orig_buttons]
+        orig_reply_markup = InlineKeyboardMarkup(inline_keyboard=inline_btns)
+
     print(f"\n📝 EDITING BROADCAST {broadcast_id}")
     print(f"📊 Updating {len(message_ids)} messages for users...")
     
@@ -1820,50 +2298,75 @@ async def process_edit_confirm(message: types.Message, state: FSMContext):
     edited_count = 0
     failed_count = 0
     
+    # Pre-resolve cross-bot media: if admin sent NEW photo/video via bot10, download bytes once
+    _new_input_media = None
+    _new_file_bytes = None
+    _new_file_name = "media"
+    new_media_type = update_data.get("media_type")
+    new_file_id    = update_data.get("file_id")
+
+    if message_type == "media" and new_file_id and new_media_type:
+        try:
+            _file_info = await bot.get_file(new_file_id)
+            _new_file_bytes = await bot.download_file(_file_info.file_path)
+            if hasattr(_new_file_bytes, "read"):
+                _new_file_bytes = _new_file_bytes.read()
+            _new_file_name = "photo.jpg" if new_media_type == "photo" else (
+                "video.mp4" if new_media_type == "video" else "document.bin"
+            )
+            print(f"📥 Pre-downloaded new {new_media_type} for broadcast edit ({len(_new_file_bytes)} bytes)")
+        except Exception as dl_err:
+            print(f"⚠️ Could not pre-download new media: {dl_err}")
+
+    # Detect original message type from DB record (to know if we should edit caption vs text)
+    orig_media_type = broadcast.get("media_type")  # set when originally sent
+
     for user_id, msg_id in message_ids.items():
         try:
-            if message_type == "text":
-                # Edit text message
+            if message_type == "text" and not orig_media_type:
+                # Pure text broadcast — edit text (preserve inline buttons for button broadcasts)
                 await bot_8.edit_message_text(
                     chat_id=int(user_id),
                     message_id=msg_id,
-                    text=new_text
+                    text=new_text,
+                    reply_markup=orig_reply_markup
+                )
+            elif message_type == "text" and orig_media_type:
+                # Original was media; admin only sent new text → update caption only
+                await bot_8.edit_message_caption(
+                    chat_id=int(user_id),
+                    message_id=msg_id,
+                    caption=new_text,
+                    reply_markup=orig_reply_markup
                 )
             elif message_type == "media":
-                # Edit media caption
-                media_type = update_data.get("media_type")
-                file_id = update_data.get("file_id")
-                
-                if file_id:
-                    # If new media file provided, edit media
-                    from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
-                    
-                    if media_type == "photo":
-                        new_media = InputMediaPhoto(media=file_id, caption=new_text)
-                    elif media_type == "video":
-                        new_media = InputMediaVideo(media=file_id, caption=new_text)
-                    elif media_type == "document":
-                        new_media = InputMediaDocument(media=file_id, caption=new_text)
+                if _new_file_bytes:
+                    # Admin sent new media → cross-bot safe: use BufferedInputFile
+                    from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+                    buf = BufferedInputFile(_new_file_bytes, filename=_new_file_name)
+                    if new_media_type == "photo":
+                        new_media = InputMediaPhoto(media=buf, caption=new_text)
+                    elif new_media_type == "video":
+                        new_media = InputMediaVideo(media=buf, caption=new_text)
                     else:
-                        new_media = None
-                    
-                    if new_media:
-                        await bot_8.edit_message_media(
-                            chat_id=int(user_id),
-                            message_id=msg_id,
-                            media=new_media
-                        )
+                        new_media = InputMediaDocument(media=buf, caption=new_text)
+                    await bot_8.edit_message_media(
+                        chat_id=int(user_id),
+                        message_id=msg_id,
+                        media=new_media
+                    )
                 else:
-                    # Just edit caption
+                    # No new media file — just update caption
                     await bot_8.edit_message_caption(
                         chat_id=int(user_id),
                         message_id=msg_id,
                         caption=new_text
                     )
-            
+
             edited_count += 1
             print(f"✅ Edited message for user {user_id}")
-            
+            await asyncio.sleep(0.03)  # mild rate-limit throttle
+
         except Exception as e:
             failed_count += 1
             print(f"⚠️ Failed to edit message for user {user_id}: {str(e)}")
@@ -1914,7 +2417,7 @@ async def show_delete_broadcast_list(message: types.Message, state: FSMContext, 
         category = brd.get('category', 'ALL')
         # Get user count for this category
         if category == "ALL":
-            user_count = col_user_tracking.count_documents({})
+            user_count = col_msa_ids.count_documents({})  # All verified MSA members
         else:
             user_count = col_user_tracking.count_documents({"source": category})
         
@@ -2083,10 +2586,11 @@ async def confirm_delete_broadcast(message: types.Message, state: FSMContext):
                     await bot_8.delete_message(chat_id=int(user_id), message_id=message_id)
                     deleted_messages_count += 1
                     print(f"✅ Deleted message {message_id} from user {user_id}")
+                    await asyncio.sleep(0.03)  # gentle rate-limit
                 except Exception as e:
                     failed_message_deletes += 1
-                    print(f"⚠️ Failed to delete message from user {user_id}: {str(e)}")
-                    # Continue even if message deletion fails (user might have deleted it already)
+                    print(f"⚠️ Could not delete msg {message_id} for user {user_id}: {str(e)[:60]}")
+                    # Continue — user may have deleted msg themselves or bot was blocked
             
             # Then delete the broadcast record from database
             result = col_broadcasts.delete_one({"broadcast_id": broadcast_id})
@@ -2149,9 +2653,11 @@ async def handle_back_button(message: types.Message, state: FSMContext):
     elif current_state in [
         FindStates.waiting_for_search,
     ]:
+        user_id = message.from_user.id
+        menu = await get_main_menu(user_id)
         await message.answer(
             "✅ Returned to main menu.",
-            reply_markup=get_main_menu(),
+            reply_markup=menu,
             parse_mode="Markdown"
         )
     elif current_state in [
@@ -2228,7 +2734,7 @@ async def handle_back_button(message: types.Message, state: FSMContext):
         # Fallback — any unknown state goes to main menu
         await message.answer(
             "✅ Returned to main menu.",
-            reply_markup=get_main_menu(),
+            reply_markup=await get_main_menu(message.from_user.id),
             parse_mode="Markdown"
         )
 
@@ -2264,9 +2770,10 @@ async def direct_send_broadcast(message: types.Message, state: FSMContext):
     ig_count = col_user_tracking.count_documents({"source": "IG"})
     igcc_count = col_user_tracking.count_documents({"source": "IGCC"})
     ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
-    all_count = col_user_tracking.count_documents({})
+    unknown_count = col_user_tracking.count_documents({"source": "UNKNOWN"})
+    all_count = col_msa_ids.count_documents({})  # All verified MSA members
     
-    print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, ALL={all_count}")
+    print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, ALL={all_count}")
     
     await state.set_state(BroadcastStates.selecting_category)
     await message.answer(
@@ -2276,6 +2783,7 @@ async def direct_send_broadcast(message: types.Message, state: FSMContext):
         f"📸 **IG** - Users from Instagram links ({ig_count} users)\n"
         f"📎 **IG CC** - Users from IG CC links ({igcc_count} users)\n"
         f"🔗 **YTCODE** - Users from YTCODE links ({ytcode_count} users)\n"
+        f"👤 **UNKNOWN** - Users with no referral link ({unknown_count} users)\n"
         f"👥 **ALL** - All users ({all_count} users)\n\n"
         "Type /cancel to abort.",
         reply_markup=get_category_menu(),
@@ -2293,9 +2801,10 @@ async def broadcast_with_buttons_start(message: types.Message, state: FSMContext
     ig_count = col_user_tracking.count_documents({"source": "IG"})
     igcc_count = col_user_tracking.count_documents({"source": "IGCC"})
     ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
-    all_count = col_user_tracking.count_documents({})
+    unknown_count = col_user_tracking.count_documents({"source": "UNKNOWN"})
+    all_count = col_msa_ids.count_documents({})  # All verified MSA members
     
-    print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, ALL={all_count}")
+    print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, ALL={all_count}")
     
     await state.set_state(BroadcastWithButtonsStates.selecting_category)
     await message.answer(
@@ -2305,6 +2814,7 @@ async def broadcast_with_buttons_start(message: types.Message, state: FSMContext
         f"📸 **IG** - Users from Instagram links ({ig_count} users)\n"
         f"📎 **IG CC** - Users from IG CC links ({igcc_count} users)\n"
         f"🔗 **YTCODE** - Users from YTCODE links ({ytcode_count} users)\n"
+        f"👤 **UNKNOWN** - Users with no referral link ({unknown_count} users)\n"
         f"👥 **ALL** - All users ({all_count} users)\n\n"
         "Type /cancel to abort.",
         reply_markup=get_category_menu(),
@@ -2344,7 +2854,8 @@ async def process_button_broadcast_category(message: types.Message, state: FSMCo
         "📸 IG": "IG",
         "📎 IG CC": "IGCC",
         "🔗 YTCODE": "YTCODE",
-        "👥 ALL": "ALL"
+        "👥 ALL": "ALL",
+        "👤 UNKNOWN": "UNKNOWN",
     }
     
     if message.text not in category_map:
@@ -2485,7 +2996,7 @@ async def show_button_broadcast_preview(message: types.Message, state: FSMContex
     
     # Get target users count
     if category == "ALL":
-        target_count = col_user_tracking.count_documents({})
+        target_count = col_msa_ids.count_documents({})  # All verified MSA members
     else:
         target_count = col_user_tracking.count_documents({"source": category})
     
@@ -2530,7 +3041,8 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
         
         # Get target users
         if category == "ALL":
-            target_users = list(col_user_tracking.find({}))
+            # Use msa_ids as authoritative source — all verified MSA members
+            target_users = list(col_msa_ids.find({}))
         else:
             target_users = list(col_user_tracking.find({"source": category}))
         
@@ -2559,25 +3071,95 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
         
         success = 0
         failed = 0
-        
+
+        # Pre-download media once (cross-bot: Bot10 file_id → bytes → Bot8 upload)
+        photo_bytes = None
+        video_bytes = None
+        if message_type == 'photo' and data.get('file_id'):
+            try:
+                photo_file = await bot.get_file(data['file_id'])
+                raw = await bot.download_file(photo_file.file_path)
+                photo_bytes = raw.read()
+            except Exception as dl_err:
+                print(f"⚠️ Could not pre-download photo: {dl_err}")
+        elif message_type == 'video' and data.get('file_id'):
+            try:
+                video_file = await bot.get_file(data['file_id'])
+                raw = await bot.download_file(video_file.file_path)
+                video_bytes = raw.read()
+            except Exception as dl_err:
+                print(f"⚠️ Could not pre-download video: {dl_err}")
+
         # Send to all users
+        sent_message_ids = {}  # Track per-user message IDs so edit/delete work later
         for user_doc in target_users:
             user_id = user_doc['user_id']
             try:
+                sent_msg = None
                 if message_type == 'text':
-                    await bot_8.send_message(user_id, data.get('text'), reply_markup=reply_markup, parse_mode="Markdown")
-                elif message_type == 'photo':
-                    await bot_8.send_photo(user_id, data.get('file_id'), caption=data.get('caption'), reply_markup=reply_markup, parse_mode="Markdown")
-                elif message_type == 'video':
-                    await bot_8.send_video(user_id, data.get('file_id'), caption=data.get('caption'), reply_markup=reply_markup, parse_mode="Markdown")
-                
+                    sent_msg = await bot_8.send_message(
+                        user_id,
+                        _format_broadcast_msg(data.get('text', '')),
+                        reply_markup=reply_markup
+                    )
+                elif message_type == 'photo' and photo_bytes:
+                    caption_text = _format_broadcast_msg(data.get('caption', ''), is_caption=True) if data.get('caption') else None
+                    photo_input = BufferedInputFile(photo_bytes, filename="broadcast_photo.jpg")
+                    if caption_text:
+                        sent_msg = await bot_8.send_photo(user_id, photo_input, caption=caption_text, reply_markup=reply_markup)
+                    else:
+                        sent_msg = await bot_8.send_photo(user_id, photo_input, reply_markup=reply_markup)
+                elif message_type == 'video' and video_bytes:
+                    caption_text = _format_broadcast_msg(data.get('caption', ''), is_caption=True) if data.get('caption') else None
+                    video_input = BufferedInputFile(video_bytes, filename="broadcast_video.mp4")
+                    if caption_text:
+                        sent_msg = await bot_8.send_video(user_id, video_input, caption=caption_text, reply_markup=reply_markup)
+                    else:
+                        sent_msg = await bot_8.send_video(user_id, video_input, reply_markup=reply_markup)
+                else:
+                    # fallback: pure text
+                    sent_msg = await bot_8.send_message(
+                        user_id,
+                        _format_broadcast_msg(data.get('text', data.get('caption', '📢 MSA NODE Broadcast'))),
+                        reply_markup=reply_markup
+                    )
+
+                if sent_msg:
+                    sent_message_ids[str(user_id)] = sent_msg.message_id
                 success += 1
-                
+
                 if len(target_users) > 10:
                     await asyncio.sleep(0.1)
-            except:
+            except Exception:
                 failed += 1
-        
+
+        # Save broadcast record to database
+        try:
+            brd_id, brd_index = get_next_broadcast_id()
+            msg_text_for_db = data.get('text') or data.get('caption', '')
+            brd_doc = {
+                "broadcast_id": brd_id,
+                "index": brd_index,
+                "category": category,
+                "message_text": msg_text_for_db,
+                "message_type": message_type,
+                "has_buttons": True,
+                "buttons": buttons,
+                "created_by": message.from_user.id,
+                "created_at": now_local(),
+                "status": "sent",
+                "sent_count": success,
+                "last_sent": now_local(),
+                "message_ids": sent_message_ids,  # Required for edit/delete support
+            }
+            if message_type in ('photo', 'video'):
+                brd_doc["media_type"] = message_type
+                brd_doc["file_id"] = data.get('file_id')
+            col_broadcasts.insert_one(brd_doc)
+            print(f"✅ Button broadcast saved to DB as {brd_id} with {len(sent_message_ids)} message IDs")
+        except Exception as db_err:
+            print(f"⚠️ Could not save button broadcast to DB: {db_err}")
+
         await status_msg.edit_text(
             f"✅ **BROADCAST COMPLETE**\n\n"
             f"📂 Category: {category}\n"
@@ -2586,7 +3168,7 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
             f"🔘 Buttons: {len(buttons)}",
             parse_mode="Markdown"
         )
-        
+
         await state.clear()
         print(f"✅ Button broadcast sent to {success} users")
     else:
@@ -2613,7 +3195,7 @@ async def show_send_broadcast_list(message: types.Message, state: FSMContext, pa
         category = brd.get('category', 'ALL')
         # Get user count for this category
         if category == "ALL":
-            user_count = col_user_tracking.count_documents({})
+            user_count = col_msa_ids.count_documents({})  # All verified MSA members
         else:
             user_count = col_user_tracking.count_documents({"source": category})
         
@@ -2699,14 +3281,11 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
     
     # Build user filter based on category
     if category == "ALL":
-        # Send to all users who started bot8
-        user_filter = {}
+        # Send to all verified MSA members (authoritative source)
+        target_users = list(col_msa_ids.find({}, {"user_id": 1}))
     else:
         # Send only to users who started via specific source
-        user_filter = {"source": category}
-    
-    # Get target users
-    target_users = list(col_user_tracking.find(user_filter, {"user_id": 1}))
+        target_users = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
     
     if not target_users:
         # Debug information
@@ -2979,7 +3558,7 @@ async def process_find_search(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer(
             "✅ Returned to main menu.",
-            reply_markup=get_main_menu(),
+            reply_markup=await get_main_menu(message.from_user.id),
             parse_mode="Markdown"
         )
         return
@@ -3150,9 +3729,14 @@ async def traffic_handler(message: types.Message):
         ig_count = col_user_tracking.count_documents({"source": "IG"})
         igcc_count = col_user_tracking.count_documents({"source": "IGCC"})
         ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
-        total_count = col_user_tracking.count_documents({})
         
-        print(f"📈 Traffic Stats: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, Total={total_count}")
+        total_count = col_msa_ids.count_documents({})  # authoritative: all verified MSA members
+        
+        # Calculate true unknown by subtracting tracked users from total verified members
+        tracked_sum = yt_count + ig_count + igcc_count + ytcode_count
+        unknown_count = max(0, total_count - tracked_sum)
+        
+        print(f"📈 Traffic Stats: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, Total={total_count}")
         
         # Get Bot 8 information
         try:
@@ -3172,6 +3756,9 @@ async def traffic_handler(message: types.Message):
         igcc_percent = (igcc_count / total_count * 100) if total_count > 0 else 0
         ytcode_percent = (ytcode_count / total_count * 100) if total_count > 0 else 0
         
+        # Calculate UNKNOWN % too
+        unknown_percent = (unknown_count / total_count * 100) if total_count > 0 else 0
+
         # Build traffic report
         traffic_report = (
             "📊 **TRAFFIC ANALYTICS**\n"
@@ -3195,8 +3782,12 @@ async def traffic_handler(message: types.Message):
             f"   └─ {ytcode_count} users ({ytcode_percent:.1f}%)\n"
             f"   └─ YT video MSA CODE prompts\n\n"
             
+            f"👤 **Unknown (No Link)**\n"
+            f"   └─ {unknown_count} users ({unknown_percent:.1f}%)\n"
+            f"   └─ Joined vault without referral link\n\n"
+            
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 **TOTAL USERS:** {total_count}\n"
+            f"👥 **TOTAL VERIFIED MSA MEMBERS:** {total_count}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             
             "🤖 **BOT 8 STATUS**\n"
@@ -3210,18 +3801,29 @@ async def traffic_handler(message: types.Message):
             "• Source tracked on first /start link\n"
             "• Data updated in real-time\n"
             "• Bot 8 handles all user messages\n"
-            "• Bot 10 manages broadcasts only"
+            f"• Last updated: {now_local().strftime('%I:%M:%S %p')}\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🆔 **MSA CODE POOL (9-DIGIT)**\n"
+            f"   └─ Total Possible: 900,000,000\n"
+            f"   └─ Allocated: {total_count:,}\n"
+            f"   └─ Available: {900_000_000 - total_count:,}\n"
+            f"   └─ Used: {(total_count / 900_000_000 * 100):.6f}%"
         )
         
         # Delete loading message and send report
         await loading_msg.delete()
         
-        # Create refresh button
-        refresh_btn = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 REFRESH", callback_data="traffic_refresh")]
-        ])
+        # Reply keyboard with refresh + extra analytics buttons
+        traffic_kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🔄 REFRESH TRAFFIC"), KeyboardButton(text="🏆 TOP ANALYTICS")],
+                [KeyboardButton(text="🔗 CHECK LINKS"), KeyboardButton(text="⬅️ MAIN MENU")]
+            ],
+            resize_keyboard=True
+        )
         
-        await message.answer(traffic_report, parse_mode="Markdown", reply_markup=refresh_btn)
+        await message.answer(traffic_report, parse_mode="Markdown", reply_markup=traffic_kb)
         
     except Exception as e:
         await loading_msg.edit_text(
@@ -3231,98 +3833,157 @@ async def traffic_handler(message: types.Message):
         print(f"❌ Traffic handler error: {e}")
 
 
-@dp.callback_query(F.data == "traffic_refresh")
-async def traffic_refresh_handler(callback: types.CallbackQuery):
-    """Refresh traffic analytics data"""
-    print(f"🔄 USER ACTION: {callback.from_user.first_name} ({callback.from_user.id}) refreshed TRAFFIC analytics")
-    
+@dp.message(F.text == "🔄 REFRESH TRAFFIC")
+async def traffic_refresh_handler(message: types.Message):
+    """Refresh traffic analytics — reply keyboard version"""
+    await traffic_handler(message)
+
+
+@dp.message(F.text == "🏆 TOP ANALYTICS")
+async def top_analytics_handler(message: types.Message):
+    """Show top-performing sources with live rankings"""
+    if not await has_permission(message.from_user.id, "traffic"):
+        return
     try:
-        # Show loading indicator
-        await callback.answer("⏳ Refreshing...", show_alert=False)
-        
-        # Fetch fresh counts from database
-        yt_count = col_user_tracking.count_documents({"source": "YT"})
-        ig_count = col_user_tracking.count_documents({"source": "IG"})
-        igcc_count = col_user_tracking.count_documents({"source": "IGCC"})
+        yt_count     = col_user_tracking.count_documents({"source": "YT"})
+        ig_count     = col_user_tracking.count_documents({"source": "IG"})
+        igcc_count   = col_user_tracking.count_documents({"source": "IGCC"})
         ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
-        total_count = col_user_tracking.count_documents({})
+        total_msa    = col_msa_ids.count_documents({})
         
-        print(f"📈 Refreshed Stats: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, Total={total_count}")
-        
-        # Get Bot 8 information
-        try:
-            bot_8_info = await bot_8.get_me()
-            bot_8_username = f"@{bot_8_info.username}" if bot_8_info.username else "N/A"
-            bot_8_name = bot_8_info.first_name
-            bot_8_status = "🟢 Online"
-        except Exception as e:
-            bot_8_username = "Error"
-            bot_8_name = "Unknown"
-            bot_8_status = "🔴 Offline"
-            print(f"⚠️ Failed to get Bot 8 info: {e}")
-        
-        # Calculate percentages
-        yt_percent = (yt_count / total_count * 100) if total_count > 0 else 0
-        ig_percent = (ig_count / total_count * 100) if total_count > 0 else 0
-        igcc_percent = (igcc_count / total_count * 100) if total_count > 0 else 0
-        ytcode_percent = (ytcode_count / total_count * 100) if total_count > 0 else 0
-        
-        # Get current timestamp
-        now = now_local().strftime("%I:%M:%S %p")
-        
-        # Build updated traffic report
-        traffic_report = (
-            "📊 **TRAFFIC ANALYTICS**\n"
+        # True Unknown calculation
+        tracked_sum = yt_count + ig_count + igcc_count + ytcode_count
+        unknown_count = max(0, total_msa - tracked_sum)
+
+        sources = [
+            ("📺 YT",      yt_count),
+            ("📸 IG",      ig_count),
+            ("📎 IGCC",    igcc_count),
+            ("🔗 YTCODE",  ytcode_count),
+            ("👤 UNKNOWN", unknown_count),
+        ]
+        sources.sort(key=lambda x: x[1], reverse=True)
+
+        # Use total MSA members for the bar denominator, so percentages add up perfectly
+        total_tracked = total_msa
+
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        report = (
+            "🏆 **TOP PERFORMING TRAFFIC SOURCES**\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            
-            "👥 **USER SOURCE BREAKDOWN**\n\n"
-            
-            f"📺 **YouTube Links (YT)**\n"
-            f"   └─ {yt_count} users ({yt_percent:.1f}%)\n"
-            f"   └─ Direct YouTube video links\n\n"
-            
-            f"📸 **Instagram Links (IG)**\n"
-            f"   └─ {ig_count} users ({ig_percent:.1f}%)\n"
-            f"   └─ Instagram bio/post links\n\n"
-            
-            f"📎 **Instagram CC Links (IGCC)**\n"
-            f"   └─ {igcc_count} users ({igcc_percent:.1f}%)\n"
-            f"   └─ IG content continuation links\n\n"
-            
-            f"🔗 **YouTube Code Links (YTCODE)**\n"
-            f"   └─ {ytcode_count} users ({ytcode_percent:.1f}%)\n"
-            f"   └─ YT video MSA CODE prompts\n\n"
-            
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 **TOTAL USERS:** {total_count}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            
-            "🤖 **BOT 8 STATUS**\n"
-            f"   └─ Name: {bot_8_name}\n"
-            f"   └─ Username: {bot_8_username}\n"
-            f"   └─ Status: {bot_8_status}\n"
-            f"   └─ Role: Message Delivery Bot\n\n"
-            
-            "ℹ️ **NOTE:**\n"
-            "• Each user counted once (no duplicates)\n"
-            "• Source tracked on first /start link\n"
-            "• Data updated in real-time\n"
-            "• Bot 8 handles all user messages\n"
-            "• Bot 10 manages broadcasts only\n\n"
-            
-            f"🕒 Last updated: {now}"
+            "Live rankings by tracked user count:\n\n"
         )
-        
-        # Update message with fresh data
-        refresh_btn = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 REFRESH", callback_data="traffic_refresh")]
-        ])
-        
-        await callback.message.edit_text(traffic_report, parse_mode="Markdown", reply_markup=refresh_btn)
-        
+        for idx, (name, cnt) in enumerate(sources):
+            pct = (cnt / total_tracked * 100) if total_tracked > 0 else 0
+            bar_filled = int(pct / 10)
+            bar = "█" * bar_filled + "░" * (10 - bar_filled)
+            report += f"{medals[idx]} **{name}**\n"
+            report += f"   {bar} {cnt} users ({pct:.1f}%)\n\n"
+
+        report += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        report += f"📊 **Total Tracked:** {total_tracked}\n"
+        report += f"👥 **Total MSA Members:** {total_msa}\n"
+
+        # Growth insight
+        top_name, top_cnt = sources[0]
+        report += f"\n📈 **Best source:** {top_name} with {top_cnt} users\n"
+        report += f"🕒 Snapshot: {now_local().strftime('%I:%M:%S %p')}"
+
+        traffic_kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🔄 REFRESH TRAFFIC"), KeyboardButton(text="🏆 TOP ANALYTICS")],
+                [KeyboardButton(text="🔗 CHECK LINKS"), KeyboardButton(text="⬅️ MAIN MENU")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer(report, parse_mode="Markdown", reply_markup=traffic_kb)
     except Exception as e:
-        await callback.answer(f"❌ Refresh failed: {str(e)[:50]}", show_alert=True)
-        print(f"❌ Traffic refresh error: {e}")
+        await message.answer(f"❌ **Error:** {str(e)[:100]}", parse_mode="Markdown")
+
+
+@dp.message(F.text == "🔗 CHECK LINKS")
+async def check_links_handler(message: types.Message):
+    """Check whether traffic-related start links are active / working"""
+    if not await has_permission(message.from_user.id, "traffic"):
+        return
+    loading = await message.answer("⏳ Checking all traffic links...")
+    try:
+        from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest as TBR
+
+        # Retrieve Bot 8 info — confirms Bot 8 is reachable
+        try:
+            b8_info = await bot_8.get_me()
+            b8_ok = True
+            b8_name = b8_info.first_name
+            b8_username = f"@{b8_info.username}" if b8_info.username else "unknown"
+        except Exception as e:
+            b8_ok = False
+            b8_name = "N/A"
+            b8_username = "N/A"
+
+        # Check start parameters are configured in environment
+        import os
+        ig_param      = os.getenv("IG_START_PARAM", "")
+        yt_param      = os.getenv("YT_START_PARAM", "")
+        igcc_param    = os.getenv("IGCC_START_PARAM", "")
+        ytcode_param  = os.getenv("YTCODE_START_PARAM", "")
+
+        def link_status(param_val, label):
+            if not param_val:
+                return f"⚠️ {label}: Not configured"
+            # Don't wrap in backticks — param values may have special Markdown chars
+            safe_val = _esc_md(param_val[:20] + "..." if len(param_val) > 20 else param_val)
+            return f"✅ {label}: {safe_val}"
+
+        # Check vault channel
+        try:
+            channel_id = os.getenv("CHANNEL_ID", "")
+            if channel_id:
+                ch_info = await bot_8.get_chat(channel_id)
+                channel_ok = f"✅ Vault: {ch_info.title} is accessible"
+            else:
+                channel_ok = "⚠️ Vault: CHANNEL_ID not configured"
+        except Exception as e:
+            channel_ok = f"❌ Vault: Cannot access channel — {str(e)[:60]}"
+
+        report = (
+            "🔗 **TRAFFIC LINK STATUS CHECK**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🤖 **Bot 8 Delivery:** {'✅ Online — ' + b8_username if b8_ok else '❌ OFFLINE'}\n\n"
+            "**Start Link Parameters:**\n"
+            f"  {link_status(ig_param, 'IG link')}\n"
+            f"  {link_status(yt_param, 'YT link')}\n"
+            f"  {link_status(igcc_param, 'IGCC link')}\n"
+            f"  {link_status(ytcode_param, 'YTCODE link')}\n\n"
+            f"**Vault Channel:**\n  {channel_ok}\n\n"
+        )
+
+        # Summary
+        issues_found = (not b8_ok) or (not ig_param) or (not yt_param) or (not igcc_param) or (not ytcode_param)
+        if issues_found:
+            report += "⚠️ **Some links/params need attention.**\nCheck ENV variables and bot status.\n"
+        else:
+            report += "✅ **All links and bot connections are operational.**\n"
+
+        report += f"\n🕒 Checked: {now_local().strftime('%I:%M:%S %p')}"
+
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        traffic_kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🔄 REFRESH TRAFFIC"), KeyboardButton(text="🏆 TOP ANALYTICS")],
+                [KeyboardButton(text="🔗 CHECK LINKS"), KeyboardButton(text="⬅️ MAIN MENU")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer(report, parse_mode="Markdown", reply_markup=traffic_kb)
+    except Exception as e:
+        try:
+            await loading.edit_text(f"❌ Check Links Error: {str(e)[:100]}")
+        except Exception:
+            pass
 
 # ==================== SUPPORT PAGINATION CALLBACKS ====================
 @dp.callback_query(F.data.startswith("pending_page_"))
@@ -3555,7 +4216,72 @@ async def bot8_diagnosis(message: types.Message):
             
     except Exception as e:
         info_items.append("Log analysis skipped")
-    
+
+    # ═══════════════════════════════════════
+    # PHASE 7: DATABASE STORAGE SPACE
+    # ═══════════════════════════════════════
+    total_checks += 1
+    db_space_line = ""
+    db_bar_line   = ""
+
+    try:
+        stats      = db.command("dbStats")
+        data_mb    = stats.get("dataSize",    0) / 1_048_576
+        storage_mb = stats.get("storageSize", 0) / 1_048_576
+        index_mb   = stats.get("indexSize",   0) / 1_048_576
+        total_mb   = stats.get("totalSize",   0) / 1_048_576
+        fs_total   = stats.get("fsTotalSize", 0) / 1_048_576
+        fs_used    = stats.get("fsUsedSize",  0) / 1_048_576
+
+        if fs_total > 0:
+            pct    = min(fs_used / fs_total * 100, 100)
+            filled = round(pct / 5)
+            empty  = 20 - filled
+            risk   = ("🔴 CRITICAL" if pct > 90 else
+                      "🟠 HIGH"     if pct > 75 else
+                      "🟡 MODERATE"  if pct > 50 else
+                      "🟢 HEALTHY")
+            bar    = "█" * filled + "░" * empty
+            db_bar_line = (
+                f"**Filesystem:** `[{bar}]` "
+                f"{pct:.1f}% ({fs_used:.0f}MB / {fs_total:.0f}MB) — {risk}"
+            )
+            if pct > 90:
+                issues.append(
+                    f"**STORAGE CRITICAL:** {pct:.1f}% filesystem used "
+                    f"({fs_used:.0f}/{fs_total:.0f}MB) — free space urgently needed"
+                )
+            elif pct > 80:
+                warnings.append(f"Storage high: {pct:.1f}% used ({fs_used:.0f}/{fs_total:.0f}MB)")
+            else:
+                checks_passed += 1
+        else:
+            m0_cap = 512.0
+            pct    = min(total_mb / m0_cap * 100, 100)
+            filled = round(pct / 5)
+            empty  = 20 - filled
+            risk   = ("🔴 CRITICAL" if pct > 90 else
+                      "🟠 HIGH"     if pct > 75 else
+                      "🟡 MODERATE"  if pct > 50 else
+                      "🟢 HEALTHY")
+            bar    = "█" * filled + "░" * empty
+            db_bar_line = (
+                f"**DB Used:** `[{bar}]` "
+                f"{pct:.1f}% of 512MB M0 cap ({total_mb:.1f}MB) — {risk}"
+            )
+            checks_passed += 1
+
+        db_space_line = (
+            f"📦 Data: `{data_mb:.1f}MB`  "
+            f"💾 Storage: `{storage_mb:.1f}MB`  "
+            f"🔖 Indexes: `{index_mb:.1f}MB`"
+        )
+        info_items.append(f"DB space — data:{data_mb:.1f}MB storage:{storage_mb:.1f}MB idx:{index_mb:.1f}MB")
+    except Exception as space_err:
+        db_space_line = ""
+        db_bar_line   = ""
+        info_items.append(f"DB space check skipped: {str(space_err)[:50]}")
+
     # ═══════════════════════════════════════
     # GENERATE COMPREHENSIVE REPORT
     # ═══════════════════════════════════════
@@ -3582,40 +4308,75 @@ async def bot8_diagnosis(message: types.Message):
     report += f"🕐 **Scan Time:** {scan_time}\n"
     report += f"💾 **Database:** {db_status}\n"
     report += f"📊 **Health Score:** {checks_passed}/{total_checks} ({health_percentage}%)\n"
-    report += f"🎯 **Status:** {status_icon} {status_text}\n\n"
+    report += f"🎯 **Status:** {status_icon} {status_text}\n"
+    if db_space_line:
+        report += f"🗄️ **Space:** {db_space_line}\n"
+    if db_bar_line:
+        report += f"📊 {db_bar_line}\n"
+    report += "\n"
     
     # Critical issues section
     if issues:
         report += f"❌ **CRITICAL ISSUES ({len(issues)}):**\n"
         for i, issue in enumerate(issues, 1):
-            report += f"{i}. {issue}\n"
+            report += f"{i}. {_esc_md(issue)}\n"
         report += "\n"
     
     # Warnings section
     if warnings:
         report += f"⚠️ **WARNINGS ({len(warnings)}):**\n"
         for i, warning in enumerate(warnings, 1):
-            report += f"{i}. {warning}\n"
+            report += f"{i}. {_esc_md(warning)}\n"
         report += "\n"
     
     # System info
     if info_items:
         report += "ℹ️ **SYSTEM INFO:**\n"
         for info in info_items[:5]:  # Limit to prevent message overflow
-            report += f"• {info}\n"
+            report += f"• {_esc_md(info)}\n"
         report += "\n"
     
+    # Solutions section
+    solutions = []
+    for issue in issues:
+        il = issue.lower()
+        if "database" in il or "latency" in il:
+            solutions.append("🔧 DB slow: Check MongoDB Atlas cluster load, upgrade tier, or add indexes")
+        if "verification queue" in il or "stuck in queue" in il:
+            solutions.append("🔧 Verification queue: Restart Bot 8, check CHANNEL_ID is correct, verify bot has admin rights in vault")
+        if "ban rate" in il:
+            solutions.append("🔧 High ban rate: Review recent ban reasons in SHOOT panel, check if auto-ban threshold is too low")
+        if "support overload" in il:
+            solutions.append("🔧 Support backlog: Go to 💬 SUPPORT → resolve tickets, or increase response team")
+        if "missing collections" in il:
+            solutions.append("🔧 Missing collections will be auto-created on first write — restart Bot 8 to trigger initialization")
+        if "high error rate" in il:
+            solutions.append("🔧 Error logs: Check DIAGNOSIS → logs for specific error patterns, may need bot restart")
+    for warn in warnings:
+        wl = warn.lower()
+        if "no users found" in wl:
+            solutions.append("💡 No users yet — share start links (IG/YT/IGCC/YTCODE) or wait for vault joins")
+        if "latency" in wl:
+            solutions.append("💡 DB latency elevated — likely temporary; retry in a few minutes")
+        if "support backlog" in wl:
+            solutions.append("💡 Review open tickets in 💬 SUPPORT section")
+
     # Final verdict
     if not issues and not warnings:
         report += "✅ **ALL SYSTEMS OPERATIONAL**\n"
         report += "No issues detected. Bot 8 is healthy."
     elif issues:
         report += "🚨 **ACTION REQUIRED**\n"
-        report += "Critical issues detected. Address immediately to restore full functionality."
+        report += "Critical issues detected. Address immediately."
     else:
         report += "✅ **SYSTEM FUNCTIONAL**\n"
-        report += "Minor warnings detected. Monitor but no immediate action required."
-    
+        report += "Minor warnings — no immediate action needed."
+
+    if solutions:
+        report += "\n\n💡 **POSSIBLE SOLUTIONS:**\n"
+        for s in solutions[:5]:
+            report += f"• {s}\n"
+
     await status_msg.edit_text(report, parse_mode="Markdown")
 
 @dp.message(F.text == "🎛️ BOT 10 DIAGNOSIS")
@@ -3649,8 +4410,8 @@ async def bot10_diagnosis(message: types.Message):
         required_files = {
             "bot10.py": "Main bot script",
             "token.json": "Drive API credentials",
-            "db_config.json": "Database configuration",
-            ".env": "Environment variables"
+            "db_config.json": "Database configuration"
+            # .env intentionally omitted — Render injects env vars directly, no file needed
         }
         
         missing = []
@@ -3669,7 +4430,7 @@ async def bot10_diagnosis(message: types.Message):
             info_items.append(f"All {len(required_files)} config files present")
             
     except Exception as e:
-        issues.append(f"**File System Check Failed:** {str(e)[:80]}")
+        issues.append(f"**File System Check Failed:** {_esc_md(str(e)[:80])}")
     
     # ═══════════════════════════════════════
     # PHASE 2: BACKUP SYSTEM HEALTH
@@ -3709,7 +4470,7 @@ async def bot10_diagnosis(message: types.Message):
                     info_items.append(f"{len(backup_files)} backups stored")
                     
     except Exception as e:
-        warnings.append(f"Backup check error: {str(e)[:60]}")
+        warnings.append(f"Backup check error: {_esc_md(str(e)[:60])}")
     
     # ═══════════════════════════════════════
     # PHASE 3: LOG SYSTEM HEALTH
@@ -3740,7 +4501,7 @@ async def bot10_diagnosis(message: types.Message):
             warnings.append(f"**Admin Errors Detected:** {error_count_bot10} error events in Bot 10 logs.")
             
     except Exception as e:
-        warnings.append(f"Log system check skipped: {str(e)[:50]}")
+        warnings.append(f"Log system check skipped: {_esc_md(str(e)[:50])}")
     
     # ═══════════════════════════════════════
     # PHASE 4: DATABASE CONNECTION
@@ -3760,7 +4521,7 @@ async def bot10_diagnosis(message: types.Message):
             warnings.append(f"**DB Latency High:** {db_latency:.1f}ms (admin operations may be slow)")
             
     except Exception as e:
-        issues.append(f"**DB Connection Error:** {str(e)[:80]}")
+        issues.append(f"**DB Connection Error:** {_esc_md(str(e)[:80])}")
     
     # ═══════════════════════════════════════
     # PHASE 5: ENVIRONMENT & SECURITY
@@ -3769,9 +4530,9 @@ async def bot10_diagnosis(message: types.Message):
     
     try:
         # Check critical environment variables
-        env_vars = ['BOT_10_TOKEN', 'BOT_8_TOKEN', 'MONGO_URI', 'OWNER_ID']
+        env_vars = ['BOT_10_TOKEN', 'BOT_8_TOKEN', 'MONGO_URI', 'MASTER_ADMIN_ID']
         missing_env = []
-        
+
         for var in env_vars:
             if not os.getenv(var):
                 missing_env.append(var)
@@ -3783,7 +4544,7 @@ async def bot10_diagnosis(message: types.Message):
             info_items.append("All environment vars configured")
             
     except Exception as e:
-        warnings.append(f"Environment check skipped: {str(e)[:50]}")
+        warnings.append(f"Environment check skipped: {_esc_md(str(e)[:50])}")
     
     # ═══════════════════════════════════════
     # PHASE 6: DRIVE API STATUS (if using)
@@ -3804,7 +4565,72 @@ async def bot10_diagnosis(message: types.Message):
             
     except Exception as e:
         info_items.append("Drive check skipped")
-    
+
+    # ═══════════════════════════════════════
+    # PHASE 7: DATABASE STORAGE SPACE
+    # ═══════════════════════════════════════
+    total_checks += 1
+    db_space_line = ""
+    db_bar_line   = ""
+
+    try:
+        stats      = db.command("dbStats")
+        data_mb    = stats.get("dataSize",    0) / 1_048_576
+        storage_mb = stats.get("storageSize", 0) / 1_048_576
+        index_mb   = stats.get("indexSize",   0) / 1_048_576
+        total_mb   = stats.get("totalSize",   0) / 1_048_576
+        fs_total   = stats.get("fsTotalSize", 0) / 1_048_576
+        fs_used    = stats.get("fsUsedSize",  0) / 1_048_576
+
+        if fs_total > 0:
+            pct    = min(fs_used / fs_total * 100, 100)
+            filled = round(pct / 5)
+            empty  = 20 - filled
+            risk   = ("🔴 CRITICAL" if pct > 90 else
+                      "🟠 HIGH"     if pct > 75 else
+                      "🟡 MODERATE"  if pct > 50 else
+                      "🟢 HEALTHY")
+            bar    = "█" * filled + "░" * empty
+            db_bar_line = (
+                f"**Filesystem:** `[{bar}]` "
+                f"{pct:.1f}% ({fs_used:.0f}MB / {fs_total:.0f}MB) — {risk}"
+            )
+            if pct > 90:
+                issues.append(
+                    f"**STORAGE CRITICAL:** {pct:.1f}% filesystem used "
+                    f"({fs_used:.0f}/{fs_total:.0f}MB) — free space urgently needed"
+                )
+            elif pct > 80:
+                warnings.append(f"Storage high: {pct:.1f}% used ({fs_used:.0f}/{fs_total:.0f}MB)")
+            else:
+                checks_passed += 1
+        else:
+            m0_cap = 512.0
+            pct    = min(total_mb / m0_cap * 100, 100)
+            filled = round(pct / 5)
+            empty  = 20 - filled
+            risk   = ("🔴 CRITICAL" if pct > 90 else
+                      "🟠 HIGH"     if pct > 75 else
+                      "🟡 MODERATE"  if pct > 50 else
+                      "🟢 HEALTHY")
+            bar    = "█" * filled + "░" * empty
+            db_bar_line = (
+                f"**DB Used:** `[{bar}]` "
+                f"{pct:.1f}% of 512MB M0 cap ({total_mb:.1f}MB) — {risk}"
+            )
+            checks_passed += 1
+
+        db_space_line = (
+            f"📦 Data: `{data_mb:.1f}MB`  "
+            f"💾 Storage: `{storage_mb:.1f}MB`  "
+            f"🔖 Indexes: `{index_mb:.1f}MB`"
+        )
+        info_items.append(f"DB space — data:{data_mb:.1f}MB storage:{storage_mb:.1f}MB idx:{index_mb:.1f}MB")
+    except Exception as space_err:
+        db_space_line = ""
+        db_bar_line   = ""
+        info_items.append(f"DB space check skipped: {_esc_md(str(space_err)[:50])}")
+
     # ═══════════════════════════════════════
     # GENERATE COMPREHENSIVE REPORT
     # ═══════════════════════════════════════
@@ -3831,7 +4657,12 @@ async def bot10_diagnosis(message: types.Message):
     report += f"🕐 **Scan Time:** {scan_time}\n"
     report += f"💻 **Version:** Administrator v2.1\n"
     report += f"📊 **Health Score:** {checks_passed}/{total_checks} ({health_percentage}%)\n"
-    report += f"🎯 **Status:** {status_icon} {status_text}\n\n"
+    report += f"🎯 **Status:** {status_icon} {status_text}\n"
+    if db_space_line:
+        report += f"🗄️ **Space:** {db_space_line}\n"
+    if db_bar_line:
+        report += f"📊 {db_bar_line}\n"
+    report += "\n"
     
     # Critical issues section
     if issues:
@@ -3864,8 +4695,86 @@ async def bot10_diagnosis(message: types.Message):
     else:
         report += "✅ **SYSTEM FUNCTIONAL**\n"
         report += "Minor warnings present. Monitor but system is operational."
-    
-    await status_msg.edit_text(report, parse_mode="Markdown")
+
+    # ═══════════════════════════════════════
+    # AUTO SOLUTIONS
+    # ═══════════════════════════════════════
+    solutions = []
+    combined = issues + warnings
+
+    for item in combined:
+        item_l = item.lower()
+        if "mongodb" in item_l or "database" in item_l or "db" in item_l:
+            solutions.append(
+                "🔧 **DB Connection Failed:** Check `MONGO_URI` in your `.env` / Render env vars. "
+                "Ensure MongoDB Atlas IP Whitelist includes 0.0.0.0/0 (or your server IP). "
+                "Verify cluster is not paused on Atlas dashboard."
+            )
+        if "broadcast" in item_l or "broadcast collection" in item_l:
+            solutions.append(
+                "📢 **Broadcast Issues:** Run `/cleanbroadcasts` to remove stale entries. "
+                "If broadcast stuck, use CANCEL BROADCAST from the broadcast menu."
+            )
+        if "backup" in item_l or "backups" in item_l:
+            solutions.append(
+                "💾 **Backup System:** Trigger a manual backup via BACKUP MENU → CREATE BACKUP. "
+                "Check `bot10_backups` collection exists in MongoDB. "
+                "If Drive backups fail, re-authenticate: delete `token.json` and run drive setup again."
+            )
+        if "drive" in item_l or "token" in item_l:
+            solutions.append(
+                "☁️ **Drive Token Issue:** Delete `token.json` and re-run the Google Drive auth flow. "
+                "Ensure `DRIVE_FOLDER_ID` env var is set correctly."
+            )
+        if "environment" in item_l or "env" in item_l or "missing" in item_l:
+            solutions.append(
+                "⚙️ **Missing Env Vars:** Open Render dashboard → Environment → add the missing variable. "
+                "Redeploy the service after saving."
+            )
+        if "latency" in item_l or "slow" in item_l or "timeout" in item_l:
+            solutions.append(
+                "⏱️ **High Latency:** Upgrade MongoDB Atlas cluster tier (M0→M10). "
+                "Add indexes on frequently queried fields (`user_id`, `source`). "
+                "Check Render region matches Atlas region for low ping."
+            )
+        if "msa" in item_l or "id" in item_l:
+            solutions.append(
+                "🆔 **MSA ID Issues:** Verify `msa_ids` collection is intact. "
+                "Run `/checkvault` from bot8 admin panel to inspect allocations. "
+                "Do NOT manually delete documents from `msa_ids`."
+            )
+        if "ban" in item_l or "banned" in item_l:
+            solutions.append(
+                "🚫 **High Ban Count:** Review ban triggers in bot8 auto-ban logic. "
+                "Use SHOOT MENU → SEARCH USER to inspect individual cases. "
+                "Consider raising ban threshold if false positives are high."
+            )
+
+    if not solutions and (issues or warnings):
+        solutions.append(
+            "🔄 **General Fix:** Restart Bot 10 service on Render. "
+            "If issue persists, check Render logs for stack traces and contact developer."
+        )
+
+    if solutions:
+        unique_solutions = list(dict.fromkeys(solutions))
+        report += "\n\n💡 **POSSIBLE SOLUTIONS:**\n"
+        report += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        for idx, sol in enumerate(unique_solutions, 1):
+            report += f"{idx}. {sol}\n\n"
+
+    if len(report) > 3800:
+        report = report[:3750] + "\n\n_…report truncated_"
+    try:
+        await status_msg.edit_text(report, parse_mode="Markdown")
+    except Exception as _diag_err:
+        try:
+            await status_msg.edit_text(
+                f"❌ **BOT 10 DIAGNOSIS ERROR**\n\n`{str(_diag_err)[:300]}`\n\nCheck Render logs for details.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
 
 def get_shoot_menu():
     """Shoot (Admin Control) submenu"""
@@ -4031,23 +4940,51 @@ async def process_ban_confirm(message: types.Message, state: FSMContext):
                 "username": data.get("username"),
                 "banned_at": now_local(),
                 "banned_by": message.from_user.id,
-                "reason": "Admin action"
+                "reason": "Admin action — Permanent ban",
+                "ban_type": "permanent"
             })
+
+            # Permanently destroy MSA ID — user is no longer an MSA member
+            msa_record = col_msa_ids.find_one({"user_id": user_id})
+            if msa_record:
+                destroyed_id = msa_record.get("msa_id", msa_id)
+                # Archive in permanently_banned_msa before destroying
+                col_permanently_banned_msa.update_one(
+                    {"user_id": user_id},
+                    {"$set": {
+                        "user_id": user_id,
+                        "msa_id": destroyed_id,
+                        "first_name": first_name,
+                        "username": data.get("username"),
+                        "banned_at": now_local(),
+                        "banned_by": message.from_user.id,
+                        "reason": "Permanent ban — MSA membership revoked"
+                    }},
+                    upsert=True
+                )
+                # Destroy MSA ID from active registry
+                col_msa_ids.delete_one({"user_id": user_id})
+                # Remove msa_id from user_verification so they can never re-use it
+                col_user_verification.update_one(
+                    {"user_id": user_id},
+                    {"$unset": {"msa_id": ""}, "$set": {"msa_revoked": True, "msa_revoked_at": now_local()}}
+                )
             
-            # Try to notify user via Bot 8
+            # Notify user and immediately clear their keyboard (permanent ban)
             try:
                 ban_message = (
-                    "🚫 **ACCOUNT BANNED**\n\n"
-                    "Your access to this bot has been restricted.\n\n"
-                    "If you believe this is an error, please contact support using the button below."
+                    "🚫 **ACCOUNT PERMANENTLY BANNED**\n\n"
+                    "Your account has been permanently restricted.\n\n"
+                    "⚠️ All features and buttons are disabled.\n"
+                    "This action is permanent."
                 )
-                
-                support_btn = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="💬 CONTACT SUPPORT", callback_data="banned_support")]
-                ])
-                
-                await bot_8.send_message(user_id, ban_message, reply_markup=support_btn, parse_mode="Markdown")
-            except:
+                # ReplyKeyboardRemove clears their keyboard right away — no buttons at all
+                await bot_8.send_message(
+                    user_id, ban_message,
+                    reply_markup=ReplyKeyboardRemove(),
+                    parse_mode="Markdown"
+                )
+            except Exception:
                 pass  # User might have blocked bot
             
             await state.clear()
@@ -4316,10 +5253,19 @@ async def process_temp_ban_confirm(message: types.Message, state: FSMContext):
                     f"📋 **Note:** Please review our community guidelines to avoid future restrictions."
                 )
                 
-                await bot_8.send_message(user_id, ban_message, parse_mode="Markdown")
-            except:
+                # Push the restricted keyboard immediately so user sees SUPPORT only — no /start needed
+                support_kb = ReplyKeyboardMarkup(
+                    keyboard=[[KeyboardButton(text="📞 SUPPORT")]],
+                    resize_keyboard=True
+                )
+                await bot_8.send_message(
+                    user_id, ban_message,
+                    reply_markup=support_kb,
+                    parse_mode="Markdown"
+                )
+            except Exception:
                 pass  # User might have blocked bot
-            
+
             # Schedule auto-unban
             asyncio.create_task(schedule_auto_unban(user_id, msa_id, ban_duration_hours))
             
@@ -4395,28 +5341,85 @@ async def schedule_auto_unban(user_id: int, msa_id: str, hours: int):
 # UNBAN USER HANDLERS
 # ==========================================
 
+async def show_unban_list(message: types.Message, state: FSMContext, page: int = 0):
+    """Show paginated list of banned users with ban type labels"""
+    PER_PAGE = 5
+    total = col_banned_users.count_documents({})
+    if total == 0:
+        await state.clear()
+        await message.answer(
+            "ℹ️ **NO BANNED USERS**\n\nThere are no currently banned users.",
+            reply_markup=get_shoot_menu(), parse_mode="Markdown"
+        )
+        return
+
+    page = max(0, page)
+    skip = page * PER_PAGE
+    docs = list(col_banned_users.find({}).skip(skip).limit(PER_PAGE))
+    total_pages = (total + PER_PAGE - 1) // PER_PAGE
+
+    report = f"🚫 **BANNED USERS** (Page {page + 1}/{total_pages}) — Total: {total}\n"
+    report += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for i, doc in enumerate(docs, skip + 1):
+        name = _esc_md(doc.get("first_name", "Unknown"))
+        msa = doc.get("msa_id", "N/A")
+        ban_type = doc.get("ban_type", "permanent")
+        banned_at = doc.get("banned_at")
+        dt_str = banned_at.strftime("%b %d") if banned_at else "N/A"
+
+        if ban_type == "temporary":
+            expires = doc.get("ban_expires")
+            if expires:
+                diff = expires - now_local()
+                if diff.total_seconds() > 0:
+                    hrs = diff.seconds // 3600
+                    mins = (diff.seconds % 3600) // 60
+                    exp_str = f"{diff.days}d {hrs}h {mins}m" if diff.days else f"{hrs}h {mins}m"
+                else:
+                    exp_str = "expired"
+            else:
+                exp_str = "?"
+            type_label = f"⏰ TEMP (expires: {exp_str})"
+        else:
+            type_label = "🔴 PERMANENT"
+
+        report += f"*{i}. {name}*  (`{msa}`)\n"
+        report += f"   {type_label}  ·  📅 {dt_str}\n\n"
+
+    report += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    report += "📝 Enter MSA ID or User ID to unban:"
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(KeyboardButton(text="⬅️ PREV PAGE"))
+    if (page + 1) < total_pages:
+        nav_row.append(KeyboardButton(text="➡️ NEXT PAGE"))
+    keyboard = [nav_row] if nav_row else []
+    keyboard.append([KeyboardButton(text="❌ CANCEL")])
+
+    await state.set_state(ShootStates.waiting_for_unban_id)
+    await state.update_data(unban_page=page)
+    await message.answer(report, parse_mode="Markdown",
+                         reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True))
+
+
 @dp.message(F.text == "✅ UNBAN USER")
 async def unban_user_start(message: types.Message, state: FSMContext):
-    """Start unban user flow"""
-    await state.set_state(ShootStates.waiting_for_unban_id)
-    
-    back_keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="❌ CANCEL")]],
-        resize_keyboard=True
-    )
-    
-    await message.answer(
-        "✅ **UNBAN USER**\n\n"
-        "Enter the user's **MSA ID** or **User ID** to unban:\n\n"
-        "This will restore full bot access.\n\n"
-        "Type ⬅️ BACK or ❌ CANCEL to abort.",
-        reply_markup=back_keyboard,
-        parse_mode="Markdown"
-    )
+    """Show paginated banned users list then prompt for unban"""
+    await show_unban_list(message, state, page=0)
 
 @dp.message(ShootStates.waiting_for_unban_id)
 async def process_unban_id(message: types.Message, state: FSMContext):
-    """Process unban user ID input"""
+    """Process unban user ID input or list pagination"""
+    # Pagination navigation for the banned list
+    if message.text and message.text.strip() in ["⬅️ PREV PAGE", "➡️ NEXT PAGE"]:
+        data = await state.get_data()
+        page = data.get("unban_page", 0)
+        page = max(0, page - 1) if "PREV" in message.text else page + 1
+        await show_unban_list(message, state, page=page)
+        return
+
     if message.text and message.text.strip() in ["⬅️ BACK", "❌ CANCEL", "/cancel"]:
         await state.clear()
         await message.answer("✅ Cancelled.", reply_markup=get_shoot_menu(), parse_mode="Markdown")
@@ -4664,13 +5667,16 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
         first_name = data.get("first_name")
         
         try:
-            # Delete from all collections
+            # Delete from all collections (including MSA ID — permanent wipe)
             del1 = col_user_tracking.delete_many({"user_id": user_id})
             del2 = col_banned_users.delete_many({"user_id": user_id})
             del3 = col_support_tickets.delete_many({"user_id": user_id})
             del4 = col_suspended_features.delete_many({"user_id": user_id})
+            del5 = col_msa_ids.delete_many({"user_id": user_id})           # Destroy MSA ID forever
+            del6 = col_user_verification.delete_many({"user_id": user_id}) # Remove verification
             
-            total_deleted = del1.deleted_count + del2.deleted_count + del3.deleted_count + del4.deleted_count
+            total_deleted = (del1.deleted_count + del2.deleted_count + del3.deleted_count
+                            + del4.deleted_count + del5.deleted_count + del6.deleted_count)
             
             await state.clear()
             await message.answer(
@@ -4794,30 +5800,45 @@ async def process_reset_confirm(message: types.Message, state: FSMContext):
         first_name = data.get("first_name")
         
         try:
-            # Reset user data (keep msa_id and user_id)
-            col_user_tracking.update_one(
-                {"user_id": user_id},
-                {
-                    "$set": {
-                        "first_start": now_local(),
-                        "last_start": now_local(),
-                        "source": "RESET",
-                        "username": "reset",
-                        "first_name": "Reset User"
+            # ── Step 1: Retire MSA ID — keeps number permanently taken so it is NEVER reused ──
+            msa_doc = col_msa_ids.find_one({"user_id": user_id})
+            retired_msa_id = msa_id  # fallback to state data value
+            if msa_doc:
+                retired_msa_id = msa_doc.get("msa_id", msa_id)
+                col_msa_ids.update_one(
+                    {"user_id": user_id},
+                    {
+                        "$set": {
+                            "user_id": f"retired_{user_id}_{int(time.time())}",
+                            "retired": True,
+                            "retired_at": now_local(),
+                            "retired_first_name": first_name
+                        }
                     }
-                }
-            )
-            
+                )
+
+            # ── Step 2: Delete verification record — bot8 treats user as brand-new ──
+            col_user_verification.delete_one({"user_id": user_id})
+
+            # ── Step 3: Delete tracking record ──
+            col_user_tracking.delete_one({"user_id": user_id})
+
+            # ── Step 4: Clear any bans / suspensions ──
+            col_banned_users.delete_one({"user_id": user_id})
+            col_suspended_features.delete_one({"user_id": user_id})
+
             await state.clear()
             await message.answer(
-                f"✅ **USER DATA RESET**\n\n"
-                f"👤 {first_name} (`{msa_id}`) data has been reset.\n\n"
-                f"🔄 Reset at: {now_local().strftime('%I:%M:%S %p')}\n\n"
-                f"User will appear as new on next bot interaction.",
+                f"✅ **USER PERMANENTLY ERASED**\n\n"
+                f"👤 {first_name} (`{retired_msa_id}`) has been fully removed.\n\n"
+                f"🗑️ **Deleted:** verification, tracking, bans, suspensions\n"
+                f"🔒 **MSA ID `{retired_msa_id}` retired** — number permanently reserved, never reused\n\n"
+                f"🆕 If this user starts Bot 8 again they will receive a **brand-new MSA ID**.\n\n"
+                f"🕒 Erased at: {now_local().strftime('%I:%M:%S %p')}",
                 reply_markup=get_shoot_menu(),
                 parse_mode="Markdown"
             )
-            print(f"🔄 User {user_id} ({msa_id}) data reset by admin {message.from_user.id}")
+            print(f"🗑️ User {user_id} ({retired_msa_id}) permanently erased by admin {message.from_user.id}")
         
         except Exception as e:
             await message.answer(f"❌ **RESET FAILED:** {str(e)[:100]}", parse_mode="Markdown")
@@ -4895,9 +5916,10 @@ async def process_suspend_id(message: types.Message, state: FSMContext):
         feature_keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="🔍 SEARCH CODE"), KeyboardButton(text="📊 DASHBOARD")],
-                [KeyboardButton(text="📜 RULES"), KeyboardButton(text="📚 GUIDE")],
-                [KeyboardButton(text="📎 SELECT ALL"), KeyboardButton(text="🚫 DESELECT ALL")],
-                [KeyboardButton(text="✅ DONE"), KeyboardButton(text="❌ CANCEL")]
+                [KeyboardButton(text="📺 WATCH TUTORIAL"), KeyboardButton(text="📜 RULES")],
+                [KeyboardButton(text="📖 GUIDE"), KeyboardButton(text="📎 SELECT ALL")],
+                [KeyboardButton(text="🚫 DESELECT ALL"), KeyboardButton(text="✅ DONE")],
+                [KeyboardButton(text="❌ CANCEL")]
             ],
             resize_keyboard=True
         )
@@ -4909,8 +5931,9 @@ async def process_suspend_id(message: types.Message, state: FSMContext):
             f"Click buttons to select/deselect features to suspend:\n\n"
             f"  • 🔍 SEARCH CODE - Hide search button\n"
             f"  • 📊 DASHBOARD - Hide dashboard button\n"
+            f"  • 📺 TUTORIAL - Hide tutorial button\n"
             f"  • 📜 RULES - Hide rules button\n"
-            f"  • 📚 GUIDE - Hide guide button\n\n"
+            f"  • 📖 GUIDE - Hide agent guide button\n\n"
             f"📞 **Note:** SUPPORT button always remains accessible\n\n"
             f"**Selected features will be marked with ✅**\n"
             f"Click **✅ DONE** when finished or **❌ CANCEL** to abort.",
@@ -4971,10 +5994,26 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
                     "💬 **Contact:** If you believe this is an error, please contact support\n\n"
                     "Thank you for your understanding."
                 )
-                await bot_8.send_message(user_id, notification_text, parse_mode="Markdown")
+                # Build and push restricted keyboard immediately — user sees it without /start
+                restricted_keyboard_btns = []
+                for feat, txt in [
+                    ("DASHBOARD",   "📊 DASHBOARD"),
+                    ("SEARCH_CODE", "🔍 SEARCH CODE"),
+                    ("TUTORIAL",    "📺 WATCH TUTORIAL"),
+                    ("GUIDE",       "📖 AGENT GUIDE"),
+                    ("RULES",       "📜 RULES"),
+                ]:
+                    if feat not in suspended_features:
+                        restricted_keyboard_btns.append([KeyboardButton(text=txt)])
+                restricted_keyboard_btns.append([KeyboardButton(text="📞 SUPPORT")])
+                await bot_8.send_message(
+                    user_id, notification_text,
+                    reply_markup=ReplyKeyboardMarkup(keyboard=restricted_keyboard_btns, resize_keyboard=True),
+                    parse_mode="Markdown"
+                )
             except Exception as e:
                 print(f"Failed to send suspension notification: {e}")
-            
+
             await state.clear()
             await message.answer(
                 f"✅ **FEATURES SUSPENDED**\n\n"
@@ -4994,7 +6033,7 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
     # Handle SELECT ALL
     if message.text and "SELECT ALL" in message.text:
         data = await state.get_data()
-        all_features = ["SEARCH_CODE", "DASHBOARD", "RULES", "GUIDE"]
+        all_features = ["SEARCH_CODE", "DASHBOARD", "TUTORIAL", "RULES", "GUIDE"]
         await state.update_data(suspended_features=all_features)
         
         await message.answer(
@@ -5002,6 +6041,7 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
             "**Currently Selected:**\n"
             "  • SEARCH CODE\n"
             "  • DASHBOARD\n"
+            "  • TUTORIAL\n"
             "  • RULES\n"
             "  • GUIDE\n\n"
             "Click ✅ DONE to confirm or ❌ CANCEL to abort.",
@@ -5026,8 +6066,9 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
     feature_map = {
         "🔍 SEARCH CODE": "SEARCH_CODE",
         "📊 DASHBOARD": "DASHBOARD",
+        "📺 WATCH TUTORIAL": "TUTORIAL",
         "📜 RULES": "RULES",
-        "📚 GUIDE": "GUIDE"
+        "📖 GUIDE": "GUIDE"
     }
     
     if message.text in feature_map:
@@ -5285,12 +6326,27 @@ async def process_shoot_search(message: types.Message, state: FSMContext):
         )
         
         if ban_doc:
-            report += f"\n🚫 **Ban Details:**\n  └─ Banned: {ban_date}\n  └─ Reason: {ban_doc.get('reason', 'N/A')}\n"
-        
+            ban_type_s = "⏰ TEMPORARY" if ban_doc.get("ban_type") == "temporary" else "🔴 PERMANENT"
+            ban_exp_s = ""
+            if ban_doc.get("ban_expires"):
+                ban_exp_s = f"\n  └─ Expires: {ban_doc['ban_expires'].strftime('%b %d at %I:%M %p')}"
+            report += (
+                f"\n🚫 **Ban Details:**\n"
+                f"  └─ Type: {ban_type_s}\n"
+                f"  └─ Banned: {ban_date}\n"
+                f"  └─ Reason: {_esc_md(ban_doc.get('reason', 'N/A'))}{ban_exp_s}\n"
+            )
+
+        # MSA allocation date from msa_ids collection
+        msa_alloc = col_msa_ids.find_one({"user_id": user_id})
+        if msa_alloc and msa_alloc.get("assigned_at"):
+            report += f"\n🆔 **MSA Allocated:** {msa_alloc['assigned_at'].strftime('%b %d, %Y at %I:%M:%S %p')}\n"
+
         await loading_msg.delete()
-        await message.answer(report, parse_mode="Markdown")
+        await state.clear()
+        await message.answer(report, reply_markup=get_shoot_menu(), parse_mode="Markdown")
         print(f"🔍 Admin {message.from_user.id} searched user {msa_id}")
-    
+
     except Exception as e:
         await loading_msg.delete()
         await message.answer(f"❌ **ERROR:** {str(e)[:100]}", parse_mode="Markdown")
@@ -5719,19 +6775,41 @@ async def process_reply_id(message: types.Message, state: FSMContext):
         )
         return
     
-    search_id = message.text.strip()
+    search_id = message.text.strip().upper()
     
-    # Try MSA ID first
-    ticket = col_support_tickets.find_one({"msa_id": search_id.upper()})
+    user_id = None
+    user_name = "User"
+    msa_id = search_id if search_id.startswith("MSA") else "N/A"
     
-    # Try Telegram ID
-    if not ticket and search_id.isdigit():
-        ticket = col_support_tickets.find_one({"user_id": int(search_id)})
+    # Check if search term is digit (Telegram ID)
+    is_telegram_id = search_id.isdigit()
     
-    if not ticket:
+    # 1. Try finding in support tickets first
+    ticket = col_support_tickets.find_one({"msa_id": search_id}) if not is_telegram_id else col_support_tickets.find_one({"user_id": int(search_id)})
+    
+    if ticket:
+        user_id = ticket.get('user_id')
+        user_name = ticket.get('user_name', 'User')
+        msa_id = ticket.get('msa_id', msa_id)
+    else:
+        # 2. If not found in tickets, search global MSA users collection
+        if is_telegram_id:
+            user_doc = col_msa_ids.find_one({"user_id": int(search_id)})
+            if user_doc:
+                user_id = user_doc.get("user_id")
+                user_name = user_doc.get("first_name", "User")
+                msa_id = user_doc.get("msa_id", "N/A")
+        else:
+            user_doc = col_msa_ids.find_one({"msa_id": search_id})
+            if user_doc:
+                user_id = user_doc.get("user_id")
+                user_name = user_doc.get("first_name", "User")
+                msa_id = user_doc.get("msa_id", search_id)
+                
+    if not user_id:
         await message.answer(
             f"❌ **User not found!**\n\n"
-            f"No tickets found for ID: `{search_id}`\n\n"
+            f"No records found for ID: `{search_id}`\n\n"
             f"Try again or click ❌ CANCEL",
             parse_mode="Markdown"
         )
@@ -5739,16 +6817,16 @@ async def process_reply_id(message: types.Message, state: FSMContext):
     
     # Store user info and move to message composition
     await state.update_data(
-        reply_user_id=ticket.get('user_id'),
-        reply_user_name=ticket.get('user_name', 'User'),
-        reply_msa_id=ticket.get('msa_id', 'N/A')
+        reply_user_id=user_id,
+        reply_user_name=user_name,
+        reply_msa_id=msa_id
     )
     await state.set_state(SupportStates.waiting_for_reply_message)
     
     await message.answer(
-        f"📨 **Replying to: {ticket.get('user_name')}**\n\n"
-        f"🆔 Telegram ID: `{ticket.get('user_id')}`\n"
-        f"💳 MSA+ ID: `{ticket.get('msa_id')}`\n\n"
+        f"📨 **Messaging: {user_name}**\n\n"
+        f"🆔 Telegram ID: `{user_id}`\n"
+        f"💳 MSA+ ID: `{msa_id}`\n\n"
         f"📝 **Type your message:**\n"
         f"(This will be sent directly to the user)",
         parse_mode="Markdown"
@@ -5884,39 +6962,92 @@ async def process_user_search(message: types.Message, state: FSMContext):
     username = first_ticket.get('username', 'none')
     user_id = first_ticket.get('user_id')
     msa_id = first_ticket.get('msa_id', 'N/A')
+    # Send first page instead of truncated list
+    await show_admin_search_ticket_page(message, user_id, 0)
+
+async def show_admin_search_ticket_page(message_or_cb, user_id: int, page: int):
+    """Show a specific page of a user's ticket history to admin"""
+    tickets = list(col_support_tickets.find({"user_id": user_id}).sort("created_at", -1))
     
-    # Count statuses
+    if not tickets:
+        if isinstance(message_or_cb, types.CallbackQuery):
+            await message_or_cb.answer("No tickets found.", show_alert=True)
+        return
+        
+    total = len(tickets)
+    page = page % total
+    ticket = tickets[page]
+    
+    user_name = ticket.get('user_name', 'Unknown')
+    username = ticket.get('username', 'none')
+    msa_id = ticket.get('msa_id', 'N/A')
+    
     open_count = sum(1 for t in tickets if t.get('status') == 'open')
     resolved_count = sum(1 for t in tickets if t.get('status') == 'resolved')
+    
+    status = ticket.get('status', 'unknown')
+    status_emoji = "⏳ Awaiting Review" if status == "open" else "✅ Resolved"
+    created = ticket.get('created_at', now_local())
+    date_str = created.strftime("%b %d, %Y at %I:%M %p")
+    issue = ticket.get('issue_text', 'No description')
+    ticket_type = ticket.get('ticket_type', 'Text Only')
+    char_count = ticket.get('character_count', 0)
+    support_num = ticket.get('support_count', page + 1)
     
     response = f"🔍 **USER TICKET HISTORY**\n\n"
     response += f"👤 **{user_name}** (@{username})\n"
     response += f"🆔 Telegram ID: `{user_id}`\n"
-    response += f"💳 MSA+ ID: `{msa_id}`\n\n"
-    response += f"📊 **Statistics:**\n"
-    response += f"📋 Total Tickets: {len(tickets)}\n"
-    response += f"⏳ Open: {open_count}\n"
-    response += f"✅ Resolved: {resolved_count}\n\n"
-    response += f"**Recent Tickets:**\n\n"
+    response += f"💳 MSA+ ID: `{msa_id}`\n"
+    response += f"📊 Total: {total} (⏳ {open_count} | ✅ {resolved_count})\n\n"
     
-    for ticket in tickets[:5]:  # Show last 5 tickets
-        status = ticket.get('status', 'unknown')
-        status_emoji = "⏳" if status == "open" else "✅"
-        created = ticket.get('created_at', now_local())
-        date_str = created.strftime("%b %d, %I:%M %p")
-        issue = ticket.get('issue_text', 'No description')[:50]
+    response += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    response += f"🎫 **Ticket #{support_num}** _({page + 1}/{total})_\n\n"
+    response += f"**Status:** {status_emoji}\n"
+    response += f"**Submitted:** {date_str}\n"
+    
+    resolved_at = ticket.get('resolved_at')
+    if resolved_at:
+        response += f"**Resolved:** {resolved_at.strftime('%b %d, %Y at %I:%M %p')}\n"
         
-        response += f"{status_emoji} {date_str}\n"
-        response += f"   {issue}...\n\n"
+    response += f"**Type:** {ticket_type}\n"
+    response += f"**Length:** {char_count} chars\n\n"
+    response += f"📝 **Message:**\n"
+    response += f"_{_esc_md(issue)}_\n\n"
+    response += f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
     
-    if len(tickets) > 5:
-        response += f"_... and {len(tickets) - 5} more tickets_"
-    
-    await message.answer(
-        response,
-        reply_markup=get_support_management_menu(),
-        parse_mode="Markdown"
-    )
+    # Build pagination
+    nav_kb = None
+    if total > 1:
+        prev_pg = (page - 1) % total
+        next_pg = (page + 1) % total
+        nav_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️", callback_data=f"adm_tkt:{user_id}:{prev_pg}"),
+            InlineKeyboardButton(text=f"📄 {page + 1}/{total}", callback_data="adm_noop"),
+            InlineKeyboardButton(text="▶️", callback_data=f"adm_tkt:{user_id}:{next_pg}")
+        ]])
+        
+    if isinstance(message_or_cb, types.Message):
+        await message_or_cb.answer(response, reply_markup=nav_kb, parse_mode="Markdown")
+        await message_or_cb.answer("Use options below or navigate history above:", reply_markup=get_support_management_menu())
+    else:
+        await message_or_cb.message.edit_text(response, reply_markup=nav_kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("adm_tkt:"))
+async def admin_ticket_search_callback(callback: types.CallbackQuery):
+    """Handle pagination for admin ticket search"""
+    try:
+        parts = callback.data.split(":")
+        uid = int(parts[1])
+        page = int(parts[2])
+        await show_admin_search_ticket_page(callback, uid, page)
+        await callback.answer()
+    except Exception as e:
+        print(f"Error in admin ticket pagination: {e}")
+        await callback.answer("Error loading page.", show_alert=True)
+
+@dp.callback_query(F.data == "adm_noop")
+async def admin_noop_callback(callback: types.CallbackQuery):
+    await callback.answer()
 
 # ==========================================
 # 🗑️ DELETE TICKET
@@ -6367,26 +7498,29 @@ async def backup_handler(message: types.Message, state: FSMContext):
         last_backup = "Never"
         backup_status = "❌ No backups yet"
     
+    # Bot 8 backup count
+    b8_backup_count = col_bot8_backups.count_documents({})
+    latest_b8_backup = col_bot8_backups.find_one({}, sort=[("backup_date", -1)])
+    if latest_b8_backup:
+        last_b8_backup = format_datetime(latest_b8_backup['backup_date'])
+        b8_backup_status = f"✅ {b8_backup_count} backups"
+    else:
+        last_b8_backup = "Never"
+        b8_backup_status = "❌ No backups yet"
+
     message_text = (
         "💾 <b>BACKUP MANAGEMENT SYSTEM</b>\n\n"
-        "<b>Current Status:</b>\n"
-        f"🗄️ MongoDB Backups: {backup_status}\n"
-        f"🕒 Last Backup: {last_backup}\n\n"
-        "<b>Features:</b>\n"
-        "📥 BACKUP NOW - Create manual backup\n"
-        "📊 VIEW BACKUPS - List all MongoDB backups\n"
-        "🗓️ MONTHLY STATUS - Check monthly backups\n"
-        "⚙️ AUTO-BACKUP - Monthly auto-backup info\n\n"
-        "<b>Data Backed Up:</b>\n"
-        "• Broadcasts\n"
-        "• User Tracking\n"
-        "• Support Tickets\n"
-        "• Banned Users\n"
-        "• Suspended Features\n"
-        "• Cleanup Logs\n\n"
+        "<b>🤖 Bot 8 Backups:</b>\n"
+        f"  Status: {b8_backup_status}\n"
+        f"  Last: {last_b8_backup}\n\n"
+        "<b>🤖 Bot 10 Backups:</b>\n"
+        f"  Status: {backup_status}\n"
+        f"  Last: {last_backup}\n\n"
+        "<b>Bot 8 Data:</b> msa_ids, user_verification, user_tracking\n"
+        "<b>Bot 10 Data:</b> broadcasts, banned_users, tickets, logs\n\n"
         "<b>Storage:</b> MongoDB (Cloud-Safe)\n"
         "<b>Download:</b> JSON files sent to you\n"
-        "<b>Works On:</b> Render/Heroku/Railway✅\n"
+        "<b>Works On:</b> Render/Heroku/Railway ✅\n"
     )
     
     await message.answer(message_text, reply_markup=get_backup_menu(), parse_mode="HTML")
@@ -6524,9 +7658,11 @@ async def create_backup_mongodb_scalable(backup_type="manual", admin_id=None, pr
             "total_records": backup_summary.get('total_records', 0)
         }
 
-@dp.message(F.text == "📥 BACKUP NOW")
+@dp.message(F.text == "🤖 BOT 10 BACKUP")
 async def backup_now_handler(message: types.Message, state: FSMContext):
-    """Create manual backup with ENTERPRISE SCALABILITY (handles crores of users)"""
+    """Create Bot 10 manual backup — broadcasts, banned, tickets, logs"""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
     status_msg = await message.answer("⏳ <b>Starting Backup...</b>\n\nInitializing enterprise-grade backup system...", parse_mode="HTML")
     
     try:
@@ -6665,9 +7801,9 @@ async def backup_now_handler(message: types.Message, state: FSMContext):
         error_msg = str(e).replace('<', '&lt;').replace('>', '&gt;')
         await status_msg.edit_text(f"❌ <b>BACKUP ERROR</b>\n\n{error_msg}", parse_mode="HTML")
 
-@dp.message(F.text == "📊 VIEW BACKUPS")
+@dp.message(F.text == "📊 BOT 10 HISTORY")
 async def view_backups_handler(message: types.Message):
-    """Show all MongoDB backups with pagination"""
+    """Show Bot 10 MongoDB backups with pagination"""
     await show_backups_page(message, page=1)
 
 async def show_backups_page(message: types.Message, page: int = 1):
@@ -7208,20 +8344,39 @@ async def terminal_refresh(callback: types.CallbackQuery):
 @dp.message(F.text == "👥 ADMINS")
 async def admins_handler(message: types.Message, state: FSMContext):
     """Show admin management menu"""
-    if message.from_user.id != MASTER_ADMIN_ID:
+    if not await has_permission(message.from_user.id, "admins"):
         log_action("🚫 UNAUTHORIZED ACCESS", message.from_user.id, f"{message.from_user.full_name} tried to access ADMINS")
-        await message.answer("⛔ **ACCESS DENIED**\n\nThis feature is restricted to the Master Admin.", reply_markup=await get_main_menu(message.from_user.id))
+        await message.answer("⛔ **ACCESS DENIED**\n\nYou don't have permission to manage admins.", reply_markup=await get_main_menu(message.from_user.id))
         return
 
     await state.clear()
     log_action("👥 ADMINS MENU", message.from_user.id, "Opened admin management")
-    
-    # Count admins
-    admin_count = col_admins.count_documents({})
-    
+
+    # Build admin list
+    admins = list(col_admins.find({}))
+    admin_count = len(admins)
+
+    if admins:
+        lines = []
+        for a in admins:
+            uid    = a['user_id']
+            name   = a.get('name', str(uid))
+            role   = a.get('role', 'Admin')
+            locked = '🔒' if a.get('locked') else '🔓'
+            # Show name only once; avoid "1028732 (1028732)" display bug
+            if name == str(uid):
+                lines.append(f"{locked} 👤 `{uid}` — {role}")
+            else:
+                lines.append(f"{locked} 👤 {name} (`{uid}`) — {role}")
+        admin_list_text = "\n".join(lines)
+    else:
+        admin_list_text = "_No admins found._"
+
     await message.answer(
-        f"👥 **ADMIN MANAGEMENT**\n\n"
+        f"👥 **ADMIN MANAGEMENT**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Total Admins: {admin_count}\n\n"
+        f"{admin_list_text}\n\n"
         "Select an option:",
         reply_markup=get_admin_menu(),
         parse_mode="Markdown"
@@ -7286,9 +8441,23 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
+    # Prefer @username, then full_name so the admin list shows readable labels
+    try:
+        chat = await bot.get_chat(user_id)
+        uname = getattr(chat, 'username', None)
+        if uname:
+            admin_name = f"@{uname}"
+        elif getattr(chat, 'full_name', None):
+            admin_name = chat.full_name
+        else:
+            admin_name = str(user_id)
+    except Exception:
+        admin_name = str(user_id)
+
     # Create admin record with default Admin role (LOCKED by default)
     admin_doc = {
         "user_id": user_id,
+        "name": admin_name,
         "role": "Admin",
         "permissions": ["broadcast", "support"],  # Safe defaults - use PERMISSIONS menu to add more
         "added_by": message.from_user.id,
@@ -7304,7 +8473,8 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
         
         await message.answer(
             f"✅ ADMIN ADDED SUCCESSFULLY!\n\n"
-            f"👤 User ID: {user_id}\n"
+            f"👤 Name: {admin_name}\n"
+            f"🆔 User ID: `{user_id}`\n"
             f"👔 Role: Admin\n"
             f"🔐 Default Permissions: Broadcast, Support\n"
             f"🔒 Status: LOCKED (Inactive)\n"
@@ -7331,56 +8501,53 @@ async def remove_admin_handler(message: types.Message, state: FSMContext):
     """Remove an admin"""
     log_action("➖ REMOVE ADMIN", message.from_user.id, "Starting admin removal")
     
-    # List current admins
-    admins = list(col_admins.find({}))
+    # List current admins excluding MASTER_ADMIN_ID and anyone with "Owner" role
+    admins = list(col_admins.find({
+        "user_id": {"$ne": MASTER_ADMIN_ID},
+        "role": {"$ne": "Owner"}
+    }))
     if not admins:
         await message.answer(
-            "⚠️ No admins found in the system.",
+            "⚠️ No other admins found in the system.",
             reply_markup=get_admin_menu(),
             parse_mode="Markdown"
         )
         return
     
-    # Create keyboard with admin buttons - 10 at a time
     # Store page in state (default to page 0)
     page = 0
     await state.update_data(admin_remove_page=page)
     
     # Pagination: 10 admins per page
-    per_page = 10
-    total_pages = (len(admins) + per_page - 1) // per_page  # Ceiling division
-    start_idx = page * per_page
-    end_idx = min(start_idx + per_page, len(admins))
+    ITEMS_PER_PAGE = 10
+    total_pages = max(1, (len(admins) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins))
     page_admins = admins[start_idx:end_idx]
     
     # Create buttons for current page
     admin_buttons = []
     for admin in page_admins:
-        user_id = admin['user_id']
-        role = admin.get('role', 'Admin')
-        # Format: "UserID - Role"
-        button_text = f"{user_id} - {role}"
-        admin_buttons.append([KeyboardButton(text=button_text)])
-    
+        admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
+
     # Add navigation buttons if needed
     nav_buttons = []
-    if total_pages > 1:
-        if page > 0:
-            nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-        if page < total_pages - 1:
-            nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-    
+    if page > 0:
+        nav_buttons.append(KeyboardButton(text="⬅️ PREV ADMINS"))
+    if page < total_pages - 1:
+        nav_buttons.append(KeyboardButton(text="➡️ NEXT ADMINS"))
+
     if nav_buttons:
         admin_buttons.append(nav_buttons)
-    
+
     # Add back button
     admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-    
+
     select_kb = ReplyKeyboardMarkup(
         keyboard=admin_buttons,
         resize_keyboard=True
     )
-    
+
     await message.answer(
         f"➖ **REMOVE ADMIN**\n\n"
         f"📋 **Select admin to remove:**\n"
@@ -7405,47 +8572,50 @@ async def process_remove_admin_id(message: types.Message, state: FSMContext):
         return
     
     # Handle pagination
-    if message.text in ["⬅️ PREV", "NEXT ➡️"]:
+    if message.text in ["⬅️ PREV ADMINS", "➡️ NEXT ADMINS"]:
         data = await state.get_data()
         current_page = data.get("admin_remove_page", 0)
         
-        if message.text == "⬅️ PREV":
+        if message.text == "⬅️ PREV ADMINS":
             new_page = max(0, current_page - 1)
         else:  # NEXT
             new_page = current_page + 1
         
         await state.update_data(admin_remove_page=new_page)
         
-        # Reload admin list with new page
-        admins = list(col_admins.find({}))
-        per_page = 10
-        total_pages = (len(admins) + per_page - 1) // per_page
-        start_idx = new_page * per_page
-        end_idx = min(start_idx + per_page, len(admins))
+        # Reload admin list with new page, excluding Owner / MASTER_ADMIN_ID
+        admins = list(col_admins.find({
+            "user_id": {"$ne": MASTER_ADMIN_ID},
+            "role": {"$ne": "Owner"}
+        }))
+        ITEMS_PER_PAGE = 10
+        total_pages = max(1, (len(admins) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        
+        # Cap new_page just in case
+        new_page = min(new_page, max(0, total_pages - 1))
+        
+        start_idx = new_page * ITEMS_PER_PAGE
+        end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins))
         page_admins = admins[start_idx:end_idx]
         
         # Create buttons
         admin_buttons = []
         for admin in page_admins:
-            user_id = admin['user_id']
-            role = admin.get('role', 'Admin')
-            button_text = f"{user_id} - {role}"
-            admin_buttons.append([KeyboardButton(text=button_text)])
-        
+            admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
+
         # Navigation
         nav_buttons = []
-        if total_pages > 1:
-            if new_page > 0:
-                nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-            if new_page < total_pages - 1:
-                nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-        
+        if new_page > 0:
+            nav_buttons.append(KeyboardButton(text="⬅️ PREV ADMINS"))
+        if new_page < total_pages - 1:
+            nav_buttons.append(KeyboardButton(text="➡️ NEXT ADMINS"))
+
         if nav_buttons:
             admin_buttons.append(nav_buttons)
         admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-        
+
         select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
-        
+
         await message.answer(
             f"➖ **REMOVE ADMIN**\n\n"
             f"📋 **Select admin to remove:**\n"
@@ -7456,15 +8626,10 @@ async def process_remove_admin_id(message: types.Message, state: FSMContext):
         )
         return
     
-    # Parse user ID from button text format: "UserID - Role" or plain ID
+    # Parse user ID from button text
     try:
-        if " - " in message.text:
-            # Button format: extract user ID before " - "
-            user_id = int(message.text.split(" - ")[0].strip())
-        else:
-            # Plain ID format
-            user_id = int(message.text.strip())
-    except ValueError:
+        user_id = _parse_admin_uid(message.text)
+    except (ValueError, IndexError):
         await message.answer(
             "⚠️ Invalid selection. Please select an admin from the buttons.",
             parse_mode="Markdown"
@@ -7565,49 +8730,45 @@ async def permissions_handler(message: types.Message, state: FSMContext):
     """Manage admin permissions - show admin list"""
     log_action("🔐 PERMISSIONS", message.from_user.id, "Managing admin permissions")
     
-    # Get all admins
-    admins = list(col_admins.find({}))
+    # Get all admins excluding Master Admin
+    admins = list(col_admins.find({"user_id": {"$ne": MASTER_ADMIN_ID}}))
     if not admins:
         await message.answer(
-            "⚠️ No admins found.",
+            "⚠️ No other admins found.",
             reply_markup=get_admin_menu()
         )
         return
     
-    # Pagination: 10 admins per page
+    # Pagination: 5 admins per page
     page = 0
     await state.update_data(permission_page=page)
     
-    per_page = 10
-    total_pages = (len(admins) + per_page - 1) // per_page
-    start_idx = page * per_page
-    end_idx = min(start_idx + per_page, len(admins))
+    ITEMS_PER_PAGE = 5
+    total_pages = max(1, (len(admins) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins))
     page_admins = admins[start_idx:end_idx]
     
     # Create buttons for current page
     admin_buttons = []
     for admin in page_admins:
-        user_id = admin['user_id']
-        role = admin.get('role', 'Admin')
-        button_text = f"{user_id} - {role}"
-        admin_buttons.append([KeyboardButton(text=button_text)])
-    
+        admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
+
     # Add navigation buttons if needed
     nav_buttons = []
-    if total_pages > 1:
-        if page > 0:
-            nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-        if page < total_pages - 1:
-            nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-    
+    if page > 0:
+        nav_buttons.append(KeyboardButton(text="⬅️ PREV ADMINS"))
+    if page < total_pages - 1:
+        nav_buttons.append(KeyboardButton(text="➡️ NEXT ADMINS"))
+
     if nav_buttons:
         admin_buttons.append(nav_buttons)
-    
+
     # Add back button
     admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-    
+
     select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
-    
+
     await message.answer(
         f"🔐 MANAGE PERMISSIONS\n\n"
         f"Select admin to manage:\n"
@@ -7630,11 +8791,11 @@ async def process_permission_admin_id(message: types.Message, state: FSMContext)
         return
     
     # Handle pagination
-    if message.text in ["⬅️ PREV", "NEXT ➡️"]:
+    if message.text in ["⬅️ PREV ADMINS", "➡️ NEXT ADMINS"]:
         data = await state.get_data()
         current_page = data.get("permission_page", 0)
         
-        if message.text == "⬅️ PREV":
+        if message.text == "⬅️ PREV ADMINS":
             new_page = max(0, current_page - 1)
         else:  # NEXT
             new_page = current_page + 1
@@ -7642,35 +8803,35 @@ async def process_permission_admin_id(message: types.Message, state: FSMContext)
         await state.update_data(permission_page=new_page)
         
         # Reload admin list with new page
-        admins = list(col_admins.find({}))
-        per_page = 10
-        total_pages = (len(admins) + per_page - 1) // per_page
-        start_idx = new_page * per_page
-        end_idx = min(start_idx + per_page, len(admins))
+        admins = list(col_admins.find({"user_id": {"$ne": MASTER_ADMIN_ID}}))
+        ITEMS_PER_PAGE = 5
+        total_pages = max(1, (len(admins) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        
+        # Cap new_page just in case
+        new_page = min(new_page, max(0, total_pages - 1))
+        
+        start_idx = new_page * ITEMS_PER_PAGE
+        end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins))
         page_admins = admins[start_idx:end_idx]
         
         # Create buttons
         admin_buttons = []
         for admin in page_admins:
-            user_id = admin['user_id']
-            role = admin.get('role', 'Admin')
-            button_text = f"{user_id} - {role}"
-            admin_buttons.append([KeyboardButton(text=button_text)])
-        
+            admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
+
         # Navigation
         nav_buttons = []
-        if total_pages > 1:
-            if new_page > 0:
-                nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-            if new_page < total_pages - 1:
-                nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-        
+        if new_page > 0:
+            nav_buttons.append(KeyboardButton(text="⬅️ PREV ADMINS"))
+        if new_page < total_pages - 1:
+            nav_buttons.append(KeyboardButton(text="➡️ NEXT ADMINS"))
+
         if nav_buttons:
             admin_buttons.append(nav_buttons)
         admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-        
+
         select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
-        
+
         await message.answer(
             f"🔐 MANAGE PERMISSIONS\n\n"
             f"Select admin to manage:\n"
@@ -7680,23 +8841,22 @@ async def process_permission_admin_id(message: types.Message, state: FSMContext)
         )
         return
     
-    # Parse User ID from button text format "UserID - Role"
+    # Parse user ID from button text
     try:
-        if " - " in message.text:
-            user_id_str = message.text.split(" - ")[0].strip()
-            user_id = int(user_id_str)
-        else:
-            user_id = int(message.text.strip())
-    except ValueError:
+        user_id = _parse_admin_uid(message.text)
+    except (ValueError, IndexError):
         await message.answer("⚠️ Invalid User ID.")
         return
-    
+
     admin_doc = col_admins.find_one({"user_id": user_id})
     if not admin_doc:
         await message.answer(f"⚠️ User {user_id} is not an admin.")
         return
-    
-    await state.update_data(permission_admin_id=user_id)
+
+    await state.update_data(
+        permission_admin_id=user_id,
+        permission_admin_name=admin_doc.get('name', str(user_id))
+    )
     
     # Get current permissions
     current_perms = admin_doc.get('permissions', [])
@@ -7704,7 +8864,7 @@ async def process_permission_admin_id(message: types.Message, state: FSMContext)
     # Store initial permissions in state
     await state.update_data(current_permissions=current_perms.copy())
     
-    # Define all available permissions (9 Bot 10 features)
+    # Define all available permissions (10 Bot 10 features)
     all_permissions = {
         'broadcast': '📢 BROADCAST',
         'find': '🔍 FIND',
@@ -7713,7 +8873,9 @@ async def process_permission_admin_id(message: types.Message, state: FSMContext)
         'shoot': '📸 SHOOT',
         'support': '💬 SUPPORT',
         'backup': '💾 BACKUP',
-        'terminal': '🖥️ TERMINAL'
+        'terminal': '🖥️ TERMINAL',
+        'admins': '👥 ADMINS',
+        'bot8': '🤖 BOT 8 SETTINGS'
     }
     
     # Create toggle buttons for each permission
@@ -7740,8 +8902,8 @@ async def process_permission_admin_id(message: types.Message, state: FSMContext)
     
     await message.answer(
         f"🔐 MANAGE PERMISSIONS\n\n"
-        f"Admin: {user_id}\n"
-        f"Role: {admin_doc.get('role', 'Admin')}\n\n"
+        f"👤 Admin: {admin_doc.get('name', str(user_id))} (`{user_id}`)\n"
+        f"👔 Role: {admin_doc.get('role', 'Admin')}\n\n"
         f"Toggle permissions below:\n"
         f"✅ = Enabled | ❌ = Disabled\n\n"
         f"Click permissions to toggle, then SAVE CHANGES",
@@ -7764,6 +8926,7 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
     # Get current data
     data = await state.get_data()
     user_id = data.get("permission_admin_id")
+    admin_name = data.get("permission_admin_name", str(user_id))
     current_perms = data.get("current_permissions", [])
     
     # Permission mapping
@@ -7775,23 +8938,40 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
         '📸 SHOOT': 'shoot',
         '💬 SUPPORT': 'support',
         '💾 BACKUP': 'backup',
-        '🖥️ TERMINAL': 'terminal'
+        '🖥️ TERMINAL': 'terminal',
+        '👥 ADMINS': 'admins',
+        '🤖 BOT 8 SETTINGS': 'bot8'
     }
     
     # Handle SAVE CHANGES
     if message.text == "💾 SAVE CHANGES":
+        # Check if admin is locked
+        admin_doc = col_admins.find_one({"user_id": user_id})
+        if admin_doc and admin_doc.get("locked", False):
+            await message.answer(
+                f"🚫 **ACTION BLOCKED**\n\n"
+                f"👤 Admin: {admin_name} (`{user_id}`)\n\n"
+                f"This admin is currently **LOCKED**.\n"
+                f"You cannot assign or save new permissions to a locked account.\n\n"
+                f"💡 Use **🔒 LOCK/UNLOCK USER** to unlock them first.",
+                reply_markup=get_admin_menu(),
+                parse_mode="Markdown"
+            )
+            await state.clear()
+            return
+
         # Update database
         try:
             col_admins.update_one(
                 {"user_id": user_id},
-                {"$set": {"permissions": current_perms}}
+                {"$set": {"permissions": current_perms, "updated_at": now_local()}}
             )
             log_action("🔐 PERMISSIONS UPDATED", message.from_user.id,
                       f"Updated permissions for {user_id}")
             
             await message.answer(
                 f"✅ PERMISSIONS SAVED\n\n"
-                f"Admin: {user_id}\n"
+                f"👤 Admin: {admin_name} (`{user_id}`)\n"
                 f"New permissions: {', '.join(current_perms) if current_perms else 'None'}",
                 reply_markup=get_admin_menu()
             )
@@ -7843,7 +9023,9 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
         'shoot': '📸 SHOOT',
         'support': '💬 SUPPORT',
         'backup': '💾 BACKUP',
-        'terminal': '🖥️ TERMINAL'
+        'terminal': '🖥️ TERMINAL',
+        'admins': '👥 ADMINS',
+        'bot8': '🤖 BOT 8 SETTINGS'
     }
     
     perm_buttons = []
@@ -7865,7 +9047,7 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
     
     await message.answer(
         f"🔐 MANAGE PERMISSIONS\n\n"
-        f"Admin: {user_id}\n\n"
+        f"👤 Admin: {admin_name} (`{user_id}`)\n\n"
         f"Toggle permissions below:\n"
         f"✅ = Enabled | ❌ = Disabled\n\n"
         f"Click permissions to toggle, then SAVE CHANGES\n\n"
@@ -7873,26 +9055,19 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
         reply_markup=perm_kb
     )
 
-@dp.message(AdminStates.selecting_permissions)
-async def process_permission_selection(message: types.Message, state: FSMContext):
-    """DEPRECATED - Old permission selection handler"""
-    # Redirect to admin menu
-    await state.clear()
-    await message.answer(
-        "⚠️ This handler is deprecated. Use 🔐 PERMISSIONS instead.",
-        reply_markup=get_admin_menu()
-    )
-
-
 @dp.message(F.text == "👔 MANAGE ROLES")
 async def manage_roles_handler(message: types.Message, state: FSMContext):
     """Change admin roles - with pagination"""
     log_action("👔 MANAGE ROLES", message.from_user.id, "Managing admin roles")
     
-    admins = list(col_admins.find({}))
+    # Exclude Master Admin and Owners from the list
+    admins = list(col_admins.find({
+        "user_id": {"$ne": MASTER_ADMIN_ID},
+        "role": {"$ne": "Owner"}
+    }))
     if not admins:
         await message.answer(
-            "⚠️ No admins found.",
+            "⚠️ No other admins found.",
             reply_markup=get_admin_menu()
         )
         return
@@ -7901,27 +9076,23 @@ async def manage_roles_handler(message: types.Message, state: FSMContext):
     page = 0
     await state.update_data(role_page=page, admins_list=admins)
     
-    per_page = 10
-    total_pages = (len(admins) + per_page - 1) // per_page
-    start_idx = page * per_page
-    end_idx = min(start_idx + per_page, len(admins))
+    ITEMS_PER_PAGE = 10
+    total_pages = max(1, (len(admins) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins))
     page_admins = admins[start_idx:end_idx]
     
     # Create admin buttons
     admin_buttons = []
     for admin in page_admins:
-        user_id = admin['user_id']
-        role = admin.get('role', 'Admin')
-        button_text = f"{user_id} - {role}"
-        admin_buttons.append([KeyboardButton(text=button_text)])
+        admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
     
     # Navigation buttons
     nav_buttons = []
-    if total_pages > 1:
-        if page > 0:
-            nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-        if page < total_pages - 1:
-            nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
+    if page > 0:
+        nav_buttons.append(KeyboardButton(text="⬅️ PREV ADMINS"))
+    if page < total_pages - 1:
+        nav_buttons.append(KeyboardButton(text="➡️ NEXT ADMINS"))
     
     if nav_buttons:
         admin_buttons.append(nav_buttons)
@@ -7936,7 +9107,7 @@ async def manage_roles_handler(message: types.Message, state: FSMContext):
         f"{f' (Page {page + 1}/{total_pages})' if total_pages > 1 else ''}",
         reply_markup=select_kb
     )
-    await state.set_state(AdminStates.selecting_role)
+    await state.set_state(AdminStates.waiting_for_role_admin_id)
 
 @dp.message(AdminStates.waiting_for_role_admin_id)
 async def process_role_admin_id(message: types.Message, state: FSMContext):
@@ -7978,9 +9149,15 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
         msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for admin in page_admins:
             uid = admin['user_id']
+            name = admin.get('name', str(uid))
             role = admin.get('role', 'Admin')
             ban_info = admin.get('ban_info', {})
-            msg += f"👤 ID: {uid}\n"
+            
+            if name != str(uid):
+                msg += f"👤 **{name}** (`{uid}`)\n"
+            else:
+                msg += f"👤 **{uid}**\n"
+                
             msg += f"👔 Role: {role}\n"
             msg += f"📅 Banned: {format_datetime(ban_info.get('banned_at'))}\n"
             msg += f"👨‍💼 By: {ban_info.get('banned_by', 'Unknown')}\n"
@@ -7997,32 +9174,33 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
         await message.answer(msg, reply_markup=ReplyKeyboardMarkup(keyboard=list_kb_buttons, resize_keyboard=True))
         return
 
-    # ── Role selection pagination (uses ⬅️ PREV / NEXT ➡️) ──
+    # ── Role selection pagination (uses ⬅️ PREV ADMINS / ➡️ NEXT ADMINS) ──
     admins_list = data.get('admins_list', [])
     
-    if message.text in ["⬅️ PREV", "NEXT ➡️"]:
+    if message.text in ["⬅️ PREV ADMINS", "➡️ NEXT ADMINS"]:
         current_page = data.get("role_page", 0)
-        new_page = max(0, current_page - 1) if message.text == "⬅️ PREV" else current_page + 1
+        new_page = max(0, current_page - 1) if message.text == "⬅️ PREV ADMINS" else current_page + 1
         await state.update_data(role_page=new_page)
         
-        per_page = 10
-        total_pages = (len(admins_list) + per_page - 1) // per_page
-        start_idx = new_page * per_page
-        end_idx = min(start_idx + per_page, len(admins_list))
+        ITEMS_PER_PAGE = 10
+        total_pages = max(1, (len(admins_list) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        
+        # Cap new_page just in case
+        new_page = min(new_page, max(0, total_pages - 1))
+        
+        start_idx = new_page * ITEMS_PER_PAGE
+        end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins_list))
         page_admins = admins_list[start_idx:end_idx]
         
         admin_buttons = []
         for admin in page_admins:
-            uid = admin['user_id']
-            role = admin.get('role', 'Admin')
-            admin_buttons.append([KeyboardButton(text=f"{uid} - {role}")])
+            admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
         
         nav_buttons = []
-        if total_pages > 1:
-            if new_page > 0:
-                nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-            if new_page < total_pages - 1:
-                nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
+        if new_page > 0:
+            nav_buttons.append(KeyboardButton(text="⬅️ PREV ADMINS"))
+        if new_page < total_pages - 1:
+            nav_buttons.append(KeyboardButton(text="➡️ NEXT ADMINS"))
         if nav_buttons:
             admin_buttons.append(nav_buttons)
         admin_buttons.append([KeyboardButton(text="🔙 BACK")])
@@ -8036,27 +9214,23 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
         )
         return
     
-    # ── Parse User ID from button text ──
+    # ── Parse user ID from button text ──
     try:
-        if " - " in message.text:
-            user_id_str = message.text.split(" - ")[0].strip()
-            user_id = int(user_id_str)
-        else:
-            user_id = int(message.text.strip())
+        user_id = _parse_admin_uid(message.text)
     except (ValueError, IndexError):
         await message.answer("⚠️ Invalid selection.")
         return
-    
+
     admin_doc = col_admins.find_one({"user_id": user_id})
     if not admin_doc:
         await message.answer(f"⚠️ User {user_id} is not an admin.")
         return
-    
+
     await state.update_data(role_admin_id=user_id)
     
     role_kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="� OWNER")],
+            [KeyboardButton(text="👑 OWNER")],
             [KeyboardButton(text="🔴 MANAGER"), KeyboardButton(text="🟡 ADMIN")],
             [KeyboardButton(text="🟢 MODERATOR"), KeyboardButton(text="🔵 SUPPORT")],
             [KeyboardButton(text="🔙 BACK")]
@@ -8066,7 +9240,7 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
     
     await message.answer(
         f"👔 CHANGE ROLE\n\n"
-        f"👤 User: {user_id}\n"
+        f"👤 Admin: {admin_doc.get('name', str(user_id))} (`{user_id}`)\n"
         f"📋 Current Role: {admin_doc.get('role', 'Admin')}\n\n"
         "Select new role:",
         reply_markup=role_kb
@@ -8107,9 +9281,7 @@ async def process_role_selection(message: types.Message, state: FSMContext):
 
             admin_buttons = []
             for admin in page_admins:
-                uid = admin['user_id']
-                role = admin.get('role', 'Admin')
-                admin_buttons.append([KeyboardButton(text=f"{uid} - {role}")])
+                admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
 
             nav_buttons = []
             if total_pages > 1:
@@ -8132,9 +9304,9 @@ async def process_role_selection(message: types.Message, state: FSMContext):
             )
             return
 
-        # Parse User ID from button text
+        # Parse user ID from button text
         try:
-            user_id = int(message.text.split(" - ")[0].strip()) if " - " in message.text else int(message.text.strip())
+            user_id = _parse_admin_uid(message.text)
         except (ValueError, IndexError):
             await message.answer("⚠️ Invalid selection.")
             return
@@ -8251,29 +9423,29 @@ async def process_role_selection(message: types.Message, state: FSMContext):
         return
 
     # ── REGULAR ROLE UPDATE ──
-    col_admins.update_one(
-        {"user_id": user_id},
-        {"$set": {"role": new_role, "updated_at": now_local()}}
-    )
-
     admin_doc = col_admins.find_one({"user_id": user_id})
     is_locked = admin_doc.get('locked', False) if admin_doc else True
-
-    log_action("👔 ROLE CHANGED", message.from_user.id, f"Changed {user_id} to {new_role} (Locked: {is_locked})")
+    admin_name = admin_doc.get('name', str(user_id)) if admin_doc else str(user_id)
 
     if is_locked:
         await message.answer(
-            f"✅ **ROLE SAVED (PENDING UNLOCK)**\n\n"
-            f"👤 User: `{user_id}`\n"
-            f"👔 Role: **{new_role}**\n"
-            f"🔒 Status: LOCKED\n\n"
-            f"Role change is saved. The user will be notified of their role\n"
-            f"**only when unlocked** — not before.",
+            f"🚫 **ACTION BLOCKED**\n\n"
+            f"👤 Admin: {admin_name} (`{user_id}`)\n\n"
+            f"This admin is currently **LOCKED**.\n"
+            f"You cannot assign a new role to a locked account.\n\n"
+            f"💡 Use **🔒 LOCK/UNLOCK USER** to unlock them first.",
             reply_markup=get_admin_menu(),
             parse_mode="Markdown"
         )
         await state.clear()
         return
+
+    col_admins.update_one(
+        {"user_id": user_id},
+        {"$set": {"role": new_role, "updated_at": now_local()}}
+    )
+
+    log_action("👔 ROLE CHANGED", message.from_user.id, f"Changed {user_id} to {new_role}")
 
     # ── NOTIFY UNLOCKED ADMIN OF NEW ROLE ──
     _ROLE_NOTIFY = {
@@ -8354,7 +9526,7 @@ async def process_role_selection(message: types.Message, state: FSMContext):
 # ==========================================
 # 👑 OWNER TRANSFER FLOW (triple confirm + password)
 # ==========================================
-_OWNER_TRANSFER_PASSWORD = "99insanebeing45"
+_OWNER_TRANSFER_PASSWORD = os.getenv("OWNER_TRANSFER_PW", "")  # Set OWNER_TRANSFER_PW on Render; never hardcode here
 
 @dp.message(AdminStates.owner_transfer_first_confirm)
 async def owner_transfer_step1(message: types.Message, state: FSMContext):
@@ -8466,53 +9638,51 @@ async def owner_transfer_step3(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-@dp.message(F.text == "🔒 LOCK/UNLOCK USER")
-async def lock_unlock_user_handler(message: types.Message, state: FSMContext):
-    """Lock/unlock admin activation - with pagination"""
-    log_action("🔒 LOCK/UNLOCK USER", message.from_user.id, "Managing admin lock status")
-
-    admins = list(col_admins.find({}))
+async def _send_lock_unlock_page(message: types.Message, state: FSMContext, page: int = 0):
+    """Helper to send the lock/unlock paginated keyboard"""
+    # Exclude Master Admin and Owners from the list
+    admins = list(col_admins.find({
+        "user_id": {"$ne": MASTER_ADMIN_ID},
+        "role": {"$ne": "Owner"}
+    }))
     if not admins:
-        await message.answer(
-            "⚠️ No admins found.",
-            reply_markup=get_admin_menu()
-        )
+        await message.answer("⚠️ No other admins found.", reply_markup=get_admin_menu())
         return
 
-    # Pagination: 10 admins per page
-    page = 0
+    ITEMS_PER_PAGE = 10
+    total_pages = max(1, (len(admins) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    
+    # Keep page within bounds
+    page = max(0, min(page, total_pages - 1))
     await state.update_data(lock_page=page, lock_admins_list=admins)
 
-    per_page = 10
-    total_pages = (len(admins) + per_page - 1) // per_page
-    start_idx = page * per_page
-    end_idx = min(start_idx + per_page, len(admins))
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins))
     page_admins = admins[start_idx:end_idx]
 
-    # Create admin buttons with lock status
     admin_buttons = []
     for admin in page_admins:
-        user_id = admin['user_id']
-        role = admin.get('role', 'Admin')
+        uid = admin['user_id']
+        name = admin.get('name', str(uid))
         is_locked = admin.get('locked', False)
         lock_icon = "🔒" if is_locked else "🔓"
-        button_text = f"{lock_icon} {user_id} - {role}"
-        admin_buttons.append([KeyboardButton(text=button_text)])
-    
-    # Navigation buttons
+        if name != str(uid):
+            admin_buttons.append([KeyboardButton(text=f"{lock_icon} {name} ({uid})")])
+        else:
+            admin_buttons.append([KeyboardButton(text=f"{lock_icon} ({uid})")])
+
     nav_buttons = []
-    if total_pages > 1:
-        if page > 0:
-            nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-        if page < total_pages - 1:
-            nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-    
+    if page > 0:
+        nav_buttons.append(KeyboardButton(text="⬅️ PREV ADMINS"))
+    if page < total_pages - 1:
+        nav_buttons.append(KeyboardButton(text="➡️ NEXT ADMINS"))
+
     if nav_buttons:
         admin_buttons.append(nav_buttons)
     admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-    
+
     select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
-    
+
     await message.answer(
         f"🔒 LOCK/UNLOCK ADMIN\n\n"
         f"🔒 = LOCKED (Inactive - Cannot access Bot 10)\n"
@@ -8524,83 +9694,39 @@ async def lock_unlock_user_handler(message: types.Message, state: FSMContext):
     )
     await state.set_state(AdminStates.waiting_for_lock_user_id)
 
+@dp.message(F.text == "🔒 LOCK/UNLOCK USER")
+async def lock_unlock_user_handler(message: types.Message, state: FSMContext):
+    """Lock/unlock admin activation - with pagination"""
+    log_action("🔒 LOCK/UNLOCK USER", message.from_user.id, "Managing admin lock status")
+    await _send_lock_unlock_page(message, state, 0)
+
 @dp.message(AdminStates.waiting_for_lock_user_id)
-async def process_lock_toggle(message: types.Message, state: FSMContext):
-    """Process admin lock toggle - with pagination"""
+async def process_lock_admin_selection(message: types.Message, state: FSMContext):
+    """Admin selected from pagination for lock/unlock. Show the action menu."""
     if message.text in ["❌ CANCEL", "⬅️ BACK", "🔙 BACK", "/cancel"]:
         await state.clear()
-        await message.answer(
-            "✅ Cancelled.",
-            reply_markup=get_admin_menu()
-        )
+        await message.answer("✅ Cancelled.", reply_markup=get_admin_menu())
         return
     
     data = await state.get_data()
-    admins_list = data.get('lock_admins_list', [])
+    current_page = data.get("lock_page", 0)
     
     # Handle pagination
-    if message.text in ["⬅️ PREV", "NEXT ➡️"]:
-        current_page = data.get("lock_page", 0)
-        
-        if message.text == "⬅️ PREV":
-            new_page = max(0, current_page - 1)
-        else:
-            new_page = current_page + 1
-        
-        await state.update_data(lock_page=new_page)
-        
-        per_page = 10
-        total_pages = (len(admins_list) + per_page - 1) // per_page
-        start_idx = new_page * per_page
-        end_idx = min(start_idx + per_page, len(admins_list))
-        page_admins = admins_list[start_idx:end_idx]
-        
-        # Create buttons
-        admin_buttons = []
-        for admin in page_admins:
-            user_id = admin['user_id']
-            role = admin.get('role', 'Admin')
-            is_locked = admin.get('locked', False)
-            lock_icon = "🔒" if is_locked else "🔓"
-            button_text = f"{lock_icon} {user_id} - {role}"
-            admin_buttons.append([KeyboardButton(text=button_text)])
-        
-        # Navigation
-        nav_buttons = []
-        if total_pages > 1:
-            if new_page > 0:
-                nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-            if new_page < total_pages - 1:
-                nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-        
-        if nav_buttons:
-            admin_buttons.append(nav_buttons)
-        admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-        
-        select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
-        
-        await message.answer(
-            f"🔒 LOCK/UNLOCK ADMIN\n\n"
-            f"🔒 = LOCKED (Inactive)\n"
-            f"🔓 = UNLOCKED (Active)\n\n"
-            f"Select admin to toggle:\n"
-            f"Showing {start_idx + 1}-{end_idx} of {len(admins_list)} admins"
-            f"{f' (Page {new_page + 1}/{total_pages})' if total_pages > 1 else ''}",
-            reply_markup=select_kb
-        )
+    if message.text in ["⬅️ PREV ADMINS", "➡️ NEXT ADMINS"]:
+        new_page = max(0, current_page - 1) if message.text == "⬅️ PREV ADMINS" else current_page + 1
+        await _send_lock_unlock_page(message, state, new_page)
         return
     
-    # Parse User ID from button text format: "🔒/🔓 UserID - Role"
+    # Parse user ID from lock button text
     try:
-        # Remove lock icon and extract user ID
-        text_parts = message.text.split(" ", 1)  # Split after first space (icon)
-        if len(text_parts) > 1:
-            id_part = text_parts[1].split(" - ")[0].strip()
-            user_id = int(id_part)
-        else:
-            user_id = int(message.text.strip())
+        user_id = _parse_admin_uid(message.text)
     except (ValueError, IndexError):
         await message.answer("⚠️ Invalid selection.")
+        return
+    
+    # Prevent modifying Master Admin
+    if user_id == MASTER_ADMIN_ID:
+        await message.answer("🚫 You cannot lock or unlock the Master Admin.")
         return
     
     admin_doc = col_admins.find_one({"user_id": user_id})
@@ -8608,10 +9734,76 @@ async def process_lock_toggle(message: types.Message, state: FSMContext):
         await message.answer(f"⚠️ User {user_id} is not an admin.")
         return
     
-    # Toggle lock status
-    current_lock = admin_doc.get('locked', False)
-    new_lock = not current_lock
+    admin_name = admin_doc.get('name', str(user_id))
+    is_locked = admin_doc.get('locked', False)
     
+    # Store target
+    await state.update_data(target_lock_admin_id=user_id, target_lock_admin_name=admin_name)
+    await state.set_state(AdminStates.waiting_for_lock_action)
+    
+    status_text = "🔒 LOCKED" if is_locked else "🔓 UNLOCKED"
+    toggle_text = "🔓 UNLOCK" if is_locked else "🔒 LOCK"
+    
+    action_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=toggle_text)],
+            [KeyboardButton(text="❌ CANCEL")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer(
+        f"🔒 **LOCK MANAGEMENT**\n\n"
+        f"👤 Admin: {admin_name} (`{user_id}`)\n"
+        f"Current Status: **{status_text}**\n\n"
+        f"Select action below:",
+        reply_markup=action_kb,
+        parse_mode="Markdown"
+    )
+
+@dp.message(AdminStates.waiting_for_lock_action)
+async def execute_lock_action(message: types.Message, state: FSMContext):
+    """Execute the lock/unlock action and return to pagination list."""
+    if message.text == "❌ CANCEL":
+        data = await state.get_data()
+        current_page = data.get("lock_page", 0)
+        # Return to the paginated lock/unlock view
+        await _send_lock_unlock_page(message, state, current_page)
+        return
+    
+    data = await state.get_data()
+    user_id = data.get("target_lock_admin_id")
+    admin_name = data.get("target_lock_admin_name", str(user_id))
+    
+    if not user_id:
+        await message.answer("⚠️ Session expired.", reply_markup=get_admin_menu())
+        await state.clear()
+        return
+        
+    admin_doc = col_admins.find_one({"user_id": user_id})
+    if not admin_doc:
+        await message.answer(f"⚠️ User {user_id} is no longer an admin.")
+        return
+        
+    current_lock = admin_doc.get('locked', False)
+    
+    if message.text == "🔒 LOCK":
+        if current_lock:
+            await message.answer("⚠️ Admin is already locked.")
+            await _send_lock_unlock_page(message, state, data.get("lock_page", 0))
+            return
+        new_lock = True
+    elif message.text == "🔓 UNLOCK":
+        if not current_lock:
+            await message.answer("⚠️ Admin is already unlocked.")
+            await _send_lock_unlock_page(message, state, data.get("lock_page", 0))
+            return
+        new_lock = False
+    else:
+        await message.answer("⚠️ Invalid action. Use 🔒 LOCK or 🔓 UNLOCK.")
+        return
+    
+    # Toggle lock status in DB
     col_admins.update_one(
         {"user_id": user_id},
         {"$set": {"locked": new_lock, "updated_at": now_local()}}
@@ -8691,8 +9883,8 @@ async def process_lock_toggle(message: types.Message, state: FSMContext):
         )
         try:
             await bot.send_message(user_id, notify_text, parse_mode="Markdown")
-            # Send menu immediately after notification
-            admin_menu_kb = get_admin_menu()
+            # Send personal dynamic menu immediately after notification
+            admin_menu_kb = await get_main_menu(user_id)
             await bot.send_message(
                 user_id,
                 "📋 Your menu has been restored:",
@@ -8706,10 +9898,11 @@ async def process_lock_toggle(message: types.Message, state: FSMContext):
         f"✅ STATUS UPDATED\n\n"
         f"👤 User: {user_id}\n"
         f"{icon} Status: {status_text}\n\n"
-        f"{'⚠️ This admin CANNOT access Bot 10 until unlocked!' if new_lock else '✅ This admin can now access Bot 10!'}",
-        reply_markup=get_admin_menu()
+        f"{'⚠️ This admin CANNOT access Bot 10 until unlocked!' if new_lock else '✅ This admin can now access Bot 10!'}"
     )
-    await state.clear()
+    
+    # Stay on the same paginated keyboard to allow continuous toggling
+    await _send_lock_unlock_page(message, state, data.get("lock_page", 0))
 
 
 @dp.message(F.text == "🚫 BAN CONFIG")
@@ -8783,11 +9976,8 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
         # Create buttons
         admin_buttons = []
         for admin in page_admins:
-            user_id = admin['user_id']
-            role = admin.get('role', 'Admin')
-            button_text = f"{user_id} - {role}"
-            admin_buttons.append([KeyboardButton(text=button_text)])
-        
+            admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
+
         # Navigation
         nav_buttons = []
         if total_pages > 1:
@@ -8795,13 +9985,13 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
                 nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
             if page < total_pages - 1:
                 nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-        
+
         if nav_buttons:
             admin_buttons.append(nav_buttons)
         admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-        
+
         select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
-        
+
         await message.answer(
             f"🚫 BAN ADMIN\n\n"
             f"Select admin to BAN:\n"
@@ -8842,11 +10032,8 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
         # Create buttons
         admin_buttons = []
         for admin in page_admins:
-            user_id = admin['user_id']
-            role = admin.get('role', 'Admin')
-            button_text = f"{user_id} - {role}"
-            admin_buttons.append([KeyboardButton(text=button_text)])
-        
+            admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
+
         # Navigation
         nav_buttons = []
         if total_pages > 1:
@@ -8854,13 +10041,13 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
                 nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
             if page < total_pages - 1:
                 nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-        
+
         if nav_buttons:
             admin_buttons.append(nav_buttons)
         admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-        
+
         select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
-        
+
         await message.answer(
             f"✅ UNBAN ADMIN\n\n"
             f"Select admin to UNBAN:\n"
@@ -8941,93 +10128,120 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
 
 
 @dp.message(F.text == "📋 LIST ADMINS")
-async def list_admins_handler(message: types.Message):
-    """List all admins with detailed report"""
+async def list_admins_handler(message: types.Message, state: FSMContext):
+    """Paginated admin list using ReplyKeyboardMarkup."""
     log_action("📋 LIST ADMINS", message.from_user.id, "Viewing admin list")
     
-    admins = list(col_admins.find({}).sort("added_at", -1))
+    # Store page in state (default to page 0)
+    await state.update_data(admin_list_page=0)
+    await _send_admin_list_page(message, state, 0)
+
+
+async def _send_admin_list_page(message: types.Message, state: FSMContext, page: int):
+    """Build and send a paginated admin list page with ReplyKeyboardMarkup."""
+    # List current admins excluding anyone with "Owner" role
+    admins = list(col_admins.find({
+        "role": {"$ne": "Owner"}
+    }).sort("added_at", -1))
     
-    # Always include master admin if not in list
-    master_in_list = any(admin['user_id'] == MASTER_ADMIN_ID for admin in admins)
-    if not master_in_list:
-        # Add master admin to the list
-        master_admin = {
-            "user_id": MASTER_ADMIN_ID,
-            "role": "Super Admin",
-            "permissions": ["all"],
-            "added_at": None,
-            "added_by": "SYSTEM",
-            "locked": False  # Master admin never locked
-        }
-        admins.insert(0, master_admin)
+    if not admins:
+        await message.answer(
+            "⚠️ No admins found in the system.",
+            reply_markup=get_admin_menu(),
+            parse_mode="Markdown"
+        )
+        return
+
+    # Pagination: 10 admins per page
+    ITEMS_PER_PAGE = 10
+    total_pages = max(1, (len(admins) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
     
-    # Create detailed report - NO MARKDOWN
-    admin_msg = f"📋 ADMIN REPORT\n\n"
-    admin_msg += f"📊 Total Admins: {len(admins)}\n\n"
-    admin_msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    # Cap page just in case
+    page = min(page, max(0, total_pages - 1))
+    await state.update_data(admin_list_page=page)
     
-    # Group by role
-    by_role = {}
-    for admin in admins:
-        role = admin.get('role', 'Admin')
-        if role not in by_role:
-            by_role[role] = []
-        by_role[role].append(admin)
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins))
+    page_admins = admins[start_idx:end_idx]
+
+    # ── Text header ──────────────────────────────────────────────────
+    role_icons = {"Super Admin": "🔴", "Manager": "🟣",
+                  "Admin": "🟡", "Moderator": "🟢", "Support": "🔵"}
+    lines = [
+        f"👥 **ADMIN MANAGEMENT**",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Total Admins: {len(admins)}  |  Page {page+1}/{total_pages}\n"
+    ]
     
-    # Role icons
-    role_icons = {
-        "Super Admin": "🔴",
-        "Owner": "🟠",
-        "Admin": "🟡",
-        "Moderator": "🟢",
-        "Support": "🔵"
-    }
-    
-    # Display each role group
-    for role in ["Super Admin", "Owner", "Admin", "Moderator", "Support"]:
-        if role in by_role:
-            role_admins = by_role[role]
-            icon = role_icons.get(role, "👤")
-            admin_msg += f"{icon} {role} ({len(role_admins)})\n\n"
+    for a in page_admins:
+        uid    = a['user_id']
+        name   = a.get('name', str(uid))
+        role   = a.get('role', 'Admin')
+        locked = a.get('locked', False)
+        perms  = a.get('permissions', [])
+        added_raw = a.get('added_at')
+        
+        icon   = role_icons.get(role, "👤")
+        lock_status = "🔒 **LOCKED** (Inactive)" if locked else "🔓 **UNLOCKED** (Active)"
+        # Permissions format
+        perm_text = ", ".join(perms) if perms else "None"
+
+        # Date format (12-hour AM/PM)
+        if added_raw:
+            try:
+                date_text = added_raw.strftime('%b %d, %Y — %I:%M %p')
+            except AttributeError:
+                # Fallback if it's already a string
+                date_text = str(added_raw)
+        else:
+            date_text = "Unknown"
             
-            for admin in role_admins:
-                user_id = admin['user_id']
-                perms = admin.get('permissions', [])
-                added_at = admin.get('added_at')
-                added_by = admin.get('added_by', 'Unknown')
-                is_locked = admin.get('locked', False)
-                
-                admin_msg += f"  👤 ID: {user_id}\n"
-                
-                # Lock status - NOT shown for Owner or Super Admin
-                if role not in ["Owner", "Super Admin"]:
-                    if is_locked:
-                        admin_msg += f"  🔒 Status: LOCKED (Inactive)\n"
-                    else:
-                        admin_msg += f"  🔓 Status: UNLOCKED (Active)\n"
-                
-                # Permissions
-                if perms:
-                    perm_str = ", ".join(perms)
-                    admin_msg += f"  🔐 Perms: {perm_str}\n"
-                
-                # Added info
-                if added_at:
-                    admin_msg += f"  📅 Added: {format_datetime(added_at)}\n"
-                else:
-                    admin_msg += f"  📅 Added: Master (Built-in)\n"
-                    
-                if added_by and added_by != "Unknown":
-                    admin_msg += f"  👨‍💼 By: {added_by}\n"
-                
-                admin_msg += "\n"
-            
-            admin_msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        if name != str(uid):
+            lines.append(f"{icon} **{name}** ({uid})")
+        else:
+            lines.append(f"{icon} **{uid}**")
+        lines.append(f"👔 Role: **{role}**")
+        lines.append(f"⚡ Status: {lock_status}")
+        lines.append(f"🔐 Perms: {perm_text}")
+        lines.append(f"📅 Added: {date_text}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+    text = "\n".join(lines)
+
+    # ── ReplyKeyboard Pagination ────────────────────────────────────
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(KeyboardButton(text="⬅️ PREV LIST"))
+    if page < total_pages - 1:
+        nav_buttons.append(KeyboardButton(text="NEXT LIST ➡️"))
+        
+    kb_buttons = []
+    if nav_buttons:
+        kb_buttons.append(nav_buttons)
+    kb_buttons.append([KeyboardButton(text="🔙 BACK")])
+
+    list_kb = ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True)
+
+    await message.answer(text, reply_markup=list_kb, parse_mode="Markdown")
+    await state.set_state(AdminStates.waiting_for_admin_search)
+
+@dp.message(AdminStates.waiting_for_admin_search)
+async def process_admin_list_nav(message: types.Message, state: FSMContext):
+    """Handle pagination for the admin list."""
+    if message.text in ["❌ CANCEL", "⬅️ BACK", "🔙 BACK", "/cancel"]:
+        await state.clear()
+        await message.answer("✅ Returned to menu.", reply_markup=get_admin_menu())
+        return
+        
+    data = await state.get_data()
+    current_page = data.get("admin_list_page", 0)
     
-    await message.answer(
-        admin_msg,
-        reply_markup=get_admin_menu()
-    )
+    if message.text == "⬅️ PREV LIST":
+        await _send_admin_list_page(message, state, current_page - 1)
+    elif message.text == "NEXT LIST ➡️":
+        await _send_admin_list_page(message, state, current_page + 1)
+    else:
+        await message.answer("⚠️ Please use the buttons provided.")
 
 # ──────────────────────────────────────────────────────────────
 # 📖 GUIDE SYSTEM — two-choice selector + paginated admin guide
@@ -9776,6 +10990,182 @@ async def schedule_daily_cleanup():
         # Wait 1 hour before checking again (prevents multiple runs)
         await asyncio.sleep(3600)
 
+
+# ==========================================
+# BOT 8 BACKUP HANDLERS
+# ==========================================
+
+async def create_backup_bot8(backup_type="manual", admin_id=None, progress_callback=None):
+    """Create Bot 8 specific backup: msa_ids, user_verification, user_tracking, permanently_banned_msa."""
+    import json as _json
+    now = now_local()
+    timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+    BATCH_SIZE = 10000
+    collections_to_backup = [
+        ("msa_ids", col_msa_ids),
+        ("user_verification", col_user_verification),
+        ("user_tracking", col_user_tracking),
+        ("permanently_banned_msa", col_permanently_banned_msa),
+    ]
+    collections_data = {}
+    collection_counts = {}
+    total_records = 0
+    start_time = now_local()
+    try:
+        for col_name, collection in collections_to_backup:
+            if progress_callback:
+                await progress_callback(f"📦 Backing up {col_name}...")
+            total_count = collection.count_documents({})
+            collection_counts[col_name] = total_count
+            total_records += total_count
+            records = []
+            cursor = collection.find({}).batch_size(BATCH_SIZE)
+            for doc in cursor:
+                if "_id" in doc:
+                    doc["_id"] = str(doc["_id"])
+                records.append(doc)
+            collections_data[col_name] = records
+        processing_time = (now_local() - start_time).total_seconds()
+        period = "AM" if now.hour < 12 else "PM"
+        backup_summary = {
+            "bot": "bot8",
+            "backup_date": now,
+            "backup_type": backup_type,
+            "timestamp": timestamp,
+            "year": now.year,
+            "month": now.strftime("%B"),
+            "month_year_key": now.strftime("%B_%Y"),
+            "day": now.day,
+            "window_key": now.strftime("%Y-%m-%d_") + period,
+            "period": period,
+            "created_by": admin_id or MASTER_ADMIN_ID,
+            "total_records": total_records,
+            "collection_counts": collection_counts,
+            "processing_time": processing_time,
+            "collections": collections_data,
+        }
+        result = col_bot8_backups.insert_one(backup_summary)
+        # Keep max 60 backups
+        backup_count = col_bot8_backups.count_documents({})
+        if backup_count > 60:
+            old_backups = list(col_bot8_backups.find({}).sort("backup_date", 1).limit(backup_count - 60))
+            old_ids = [b["_id"] for b in old_backups]
+            col_bot8_backups.delete_many({"_id": {"$in": old_ids}})
+        return {
+            "success": True,
+            "backup_id": str(result.inserted_id),
+            "timestamp": timestamp,
+            "total_records": total_records,
+            "collection_counts": collection_counts,
+            "processing_time": processing_time,
+            "collections": collections_data,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "total_records": 0}
+
+
+@dp.message(F.text == "🤖 BOT 8 BACKUP")
+async def bot8_backup_now_handler(message: types.Message, state: FSMContext):
+    """Create Bot 8 manual backup — msa_ids, verifications, user tracking."""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
+    status_msg = await message.answer("⏳ <b>Bot 8 Backup Starting...</b>", parse_mode="HTML")
+    try:
+        async def progress_update(status_text):
+            try:
+                await status_msg.edit_text(f"⏳ <b>Bot 8 Backup in Progress...</b>\n\n{status_text}", parse_mode="HTML")
+            except:
+                pass
+        backup_data = await create_backup_bot8(backup_type="manual", admin_id=message.from_user.id, progress_callback=progress_update)
+        if not backup_data.get("success"):
+            err = backup_data.get("error", "Unknown error").replace("<", "&lt;").replace(">", "&gt;")
+            await status_msg.edit_text(f"❌ <b>BOT 8 BACKUP FAILED</b>\n\n{err}", parse_mode="HTML")
+            return
+        processing_time = backup_data.get("processing_time", 0)
+        timestamp = backup_data["timestamp"]
+        await status_msg.edit_text(f"✅ <b>Bot 8 backup stored!</b> Preparing download...", parse_mode="HTML")
+        import json as _j
+        complete_json = _j.dumps(backup_data, indent=2, ensure_ascii=False, default=str)
+        complete_size = len(complete_json.encode("utf-8"))
+        MAX_FILE_SIZE = 40 * 1024 * 1024
+        if complete_size > MAX_FILE_SIZE:
+            import gzip
+            compressed = gzip.compress(complete_json.encode("utf-8"))
+            complete_file = BufferedInputFile(compressed, filename=f"bot8_backup_{timestamp}.json.gz")
+            size_text = f"{len(compressed)/(1024*1024):.1f}MB (compressed)"
+        else:
+            complete_file = BufferedInputFile(complete_json.encode("utf-8"), filename=f"bot8_backup_{timestamp}.json")
+            size_text = f"{complete_size/(1024*1024):.1f}MB"
+        cc = backup_data.get("collection_counts", {})
+        await message.answer_document(
+            complete_file,
+            caption=(
+                f"📦 <b>BOT 8 COMPLETE BACKUP</b>\n\n"
+                f"📅 Date: {timestamp}\n"
+                f"📊 Total Records: {backup_data['total_records']:,}\n"
+                f"💾 Size: {size_text}\n"
+                f"⏱️ Processing: {processing_time:.2f}s\n\n"
+                f"<b>Collections:</b>\n"
+                f"🆔 msa_ids: {cc.get('msa_ids',0):,}\n"
+                f"✅ user_verification: {cc.get('user_verification',0):,}\n"
+                f"📊 user_tracking: {cc.get('user_tracking',0):,}\n"
+                f"🚫 permanently_banned: {cc.get('permanently_banned_msa',0):,}"
+            ),
+            parse_mode="HTML"
+        )
+        await status_msg.edit_text(
+            f"✅ <b>BOT 8 BACKUP COMPLETE</b>\n\n"
+            f"📅 {timestamp}\n"
+            f"📊 {backup_data['total_records']:,} records\n"
+            f"⏱️ {processing_time:.2f}s\n"
+            f"💾 Stored in: bot8_backups collection",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        err = str(e).replace("<", "&lt;").replace(">", "&gt;")
+        await status_msg.edit_text(f"❌ <b>BOT 8 BACKUP ERROR</b>\n\n{err}", parse_mode="HTML")
+
+
+@dp.message(F.text == "📊 BOT 8 HISTORY")
+async def bot8_history_handler(message: types.Message):
+    """Show Bot 8 backup history grouped by month/year."""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
+    try:
+        total_backups = col_bot8_backups.count_documents({})
+        if total_backups == 0:
+            await message.answer(
+                "📊 <b>BOT 8 BACKUP HISTORY</b>\n\nNo backups yet. Use 🤖 BOT 8 BACKUP to create one.",
+                parse_mode="HTML"
+            )
+            return
+        backups = list(col_bot8_backups.find({}).sort("backup_date", -1).limit(20))
+        # Group by month_year_key
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for b in backups:
+            key = b.get("month_year_key", b.get("month", "Unknown") + "_" + str(b.get("year", "")))
+            grouped[key].append(b)
+        msg = f"📊 <b>BOT 8 BACKUP HISTORY</b> ({total_backups} total)\n\n"
+        for month_key, blist in grouped.items():
+            label = month_key.replace("_", " ")
+            msg += f"📅 <b>{label}</b>\n"
+            for b in blist:
+                dt = format_datetime(b["backup_date"])
+                bt = b.get("backup_type", "manual").title()
+                tr = b.get("total_records", 0)
+                cc = b.get("collection_counts", {})
+                msg += (
+                    f"  • {dt} [{bt}] — {tr:,} records\n"
+                    f"    🆔 MSA IDs: {cc.get('msa_ids',0):,}  |  👤 Users: {cc.get('user_tracking',0):,}\n"
+                )
+            msg += "\n"
+        msg += "<i>Showing latest 20 backups</i>"
+        await message.answer(msg, parse_mode="HTML", reply_markup=get_backup_menu())
+    except Exception as e:
+        err = str(e).replace("<", "&lt;").replace(">", "&gt;")
+        await message.answer(f"❌ <b>ERROR</b>\n\n{err}", parse_mode="HTML")
+
 async def schedule_monthly_backup():
     """Run automatic Bot 10 backup every 12 hours into bot10_backups collection."""
     while True:
@@ -9789,6 +11179,14 @@ async def schedule_monthly_backup():
             # ✅ Dedup: skip if a backup for this 12 h window already exists
             if col_bot10_backups.count_documents({"window_key": window_key}) > 0:
                 print(f"⚠️  Bot10 auto-backup SKIPPED — window {window_key} already stored")
+                # Still run bot8 auto-backup if not already done
+                if col_bot8_backups.count_documents({"window_key": window_key, "bot": "bot8"}) == 0:
+                    try:
+                        b8_data = await create_backup_bot8(backup_type="automatic_12h")
+                        if b8_data.get("success"):
+                            print(f"✅ Bot 8 auto-backup OK — {b8_data['total_records']:,} records")
+                    except Exception as b8e:
+                        print(f"❌ Bot 8 auto-backup error: {b8e}")
                 await asyncio.sleep(12 * 3600)
                 continue
 
@@ -9796,6 +11194,15 @@ async def schedule_monthly_backup():
             print(f"💾 BOT 10 AUTO-BACKUP STARTING")
             print(f"💾 Time: {timestamp_label}")
             print(f"💾 ═══════════════════════════════════════\n")
+
+            # Bot 8 auto-backup (separate)
+            try:
+                if col_bot8_backups.count_documents({"window_key": window_key, "bot": "bot8"}) == 0:
+                    b8r = await create_backup_bot8(backup_type="automatic_12h")
+                    if b8r.get("success"):
+                        print(f"✅ Bot 8 auto-backup — {b8r['total_records']:,} records")
+            except Exception as b8e:
+                print(f"❌ Bot 8 auto-backup error: {b8e}")
 
             try:
                 backup_data = await create_backup_mongodb_scalable(backup_type="automatic_12h")
@@ -9976,6 +11383,30 @@ async def bot10_auto_heal(error_type: str, error: Exception) -> bool:
             bot10_health["consecutive_failures"] = 0
             return True
 
+        # Telegram bad request — "can't parse entities" (markdown error) → silent suppress
+        elif "can't parse entities" in err_str or "parse entities" in err_str or "byte offset" in err_str:
+            print("📝 [AUTO-HEAL] Markdown parse error — silently suppressed (no user impact)")
+            bot10_health["auto_healed"] += 1
+            bot10_health["consecutive_failures"] = 0
+            return True
+
+        # Telegram bad request — message edit failures (too old, deleted, already same content)
+        elif any(k in err_str for k in ["message can't be edited", "message is not modified", "message to edit not found"]):
+            print("✏️ [AUTO-HEAL] Edit-message error suppressed — message is old/deleted/unchanged")
+            bot10_health["auto_healed"] += 1
+            bot10_health["consecutive_failures"] = 0
+            return True
+
+        # Telegram bad request — bad request misc (bot blocked, chat not found, etc.)
+        elif "bad request" in err_str and any(k in err_str for k in [
+            "chat not found", "user not found", "bot was blocked",
+            "deactivated", "kicked", "not enough rights", "member list is inaccessible"
+        ]):
+            print("🤖 [AUTO-HEAL] Telegram user/chat issue suppressed (user-side, not our fault)")
+            bot10_health["auto_healed"] += 1
+            bot10_health["consecutive_failures"] = 0
+            return True
+
         else:
             print(f"❓ [AUTO-HEAL] Unknown error type, cannot auto-heal: {error_type}")
             return False
@@ -9985,8 +11416,10 @@ async def bot10_auto_heal(error_type: str, error: Exception) -> bool:
         return False
 
 
-async def bot10_global_error_handler(update: types.Update, exception: Exception):
+async def bot10_global_error_handler(event: types.ErrorEvent):
     """Global error handler — catches ALL unhandled errors in bot10 handlers"""
+    update = event.update
+    exception = event.exception
     try:
         bot10_health["errors_caught"] += 1
         bot10_health["last_error"] = now_local()
@@ -10009,9 +11442,20 @@ async def bot10_global_error_handler(update: types.Update, exception: Exception)
         else:
             severity = "ERROR"
 
-        # Notify owner if not healed or if critical
-        if not healed or severity == "CRITICAL":
+        # Suppress noisy Telegram operational errors — never notify owner for these
+        _silent_patterns = [
+            "can't parse entities", "message can't be edited",
+            "message is not modified", "message to edit not found",
+            "chat not found", "user not found",
+            "bot was blocked", "deactivated", "kicked"
+        ]
+        is_silent = any(p in err_msg.lower() for p in _silent_patterns)
+
+        # Notify owner if not healed or if critical (but never for silent patterns)
+        if (not healed or severity == "CRITICAL") and not is_silent:
             await notify_master_admin(err_type, err_msg, severity, healed)
+        elif is_silent:
+            print(f"🔕 [BOT10] Silent error suppressed (no owner alert): {err_type}")
 
         print(f"🏥 [BOT10] Error handled. Auto-healed: {healed}")
         return True
@@ -10108,6 +11552,12 @@ def load_bot10_state():
             print(f"♻️ [STATE] Previous session found — Last shutdown: {last_shutdown}")
             print(f"♻️ [STATE] Previous uptime was {h}h {m}m")
             print(f"♻️ [STATE] Previous errors caught: {state.get('health_stats', {}).get('errors_caught', 0)}")
+            # Restore cumulative health counters from previous session
+            prev_stats = state.get("health_stats", {})
+            bot10_health["errors_caught"]       += prev_stats.get("errors_caught", 0)
+            bot10_health["auto_healed"]         += prev_stats.get("auto_healed", 0)
+            bot10_health["owner_notified"]      += prev_stats.get("owner_notified", 0)
+            bot10_health["consecutive_failures"] = 0  # Reset on clean restart
             return state
         else:
             print("🆕 [STATE] No previous state found — fresh start")
@@ -10129,6 +11579,35 @@ async def state_auto_save_loop():
         except Exception as e:
             print(f"⚠️ [STATE SAVE] Error: {e}")
 
+
+# ==========================================
+# AUTO CLEANUP JOBS
+# ==========================================
+
+async def cleanup_resolved_tickets_loop():
+    """Automatically deletes tickets that have been resolved for over 7 days to keep DB lean"""
+    print("🧹 [CLEANUP] Scheduled Ticket Auto-Cleanup started")
+    while True:
+        try:
+            # Run cleanup check every 24 hours
+            seven_days_ago = now_local() - datetime.timedelta(days=7)
+            
+            result = col_support_tickets.delete_many({
+                "status": "resolved",
+                "resolved_at": {"$lt": seven_days_ago}
+            })
+            
+            if result.deleted_count > 0:
+                print(f"🧹 [CLEANUP] Automatically deleted {result.deleted_count} old resolved tickets.")
+                
+            # Sleep exactly 24 hours
+            await asyncio.sleep(86400)
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"⚠️ [CLEANUP ERROR] Failed to clean tickets: {e}")
+            await asyncio.sleep(3600)  # Retry in 1 hour if failed
 
 # ==========================================
 # DAILY REPORT SYSTEM (8:40 AM & 8:40 PM)
