@@ -55,6 +55,8 @@ if sys.platform == 'win32':
 # Redirect Streams
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
+
+
 # Timezone support
 try:
     import pytz as _pytz
@@ -137,111 +139,32 @@ def update_env_file(key, value):
     except Exception as e:
         print(f"⚠️ Env update failed: {e}")
 
-def load_secrets_from_db():
-    """Fetches BOT_TOKEN, OWNER_ID, and Google Files from MongoDB."""
-    try:
-        if not MONGO_URI:
-            print("❌ Error: MONGO_URI missing from environment.")
-            return None, 0, ""
-
-        print("🔄 Fetching secrets from MongoDB...")
-        client = pymongo.MongoClient(
-            MONGO_URI,
-            serverSelectionTimeoutMS=15000,
-            socketTimeoutMS=30000,
-            connectTimeoutMS=15000,
-            retryWrites=True,
-            retryReads=True
-        )
-        db = client["MSANodeDB"]
-        secrets = db["bot_secrets"].find_one({"bot": "bot4"})
-        
-        if not secrets:
-            print("❌ Error: Secrets document not found in db['bot_secrets']!")
-            return None, 0, ""
-
-        # Extract Config
-        token = secrets.get("BOT_TOKEN")
-        owner = int(secrets.get("OWNER_ID", 0))
-        folder_id = secrets.get("PARENT_FOLDER_ID", "")
-
-        # Restore Files (credentials.json, token.pickle)
-        files = secrets.get("files", {})
-        for fname, b64_data in files.items():
-            try:
-                with open(fname, "wb") as f:
-                    f.write(base64.b64decode(b64_data))
-                print(f"✅ Restored: {fname}")
-            except Exception as e:
-                print(f"⚠️ Failed to restore {fname}: {e}")
-
-        client.close()
-        return token, owner, folder_id
-
-    except Exception as e:
-        print(f"❌ DB Secrets Load Error: {e}")
-        # Fallthrough to local fallback
-    
-    # === LOCAL FALLBACK & AUTO-SEED ===
-    print("⚠️ DB Fetch Failed/Empty. Attempting Local Fallback...")
-    
+def load_secrets_from_env():
+    """Load BOT_TOKEN and OWNER_ID directly from bot4.env (no MongoDB)."""
     token = os.getenv("BOT_4_TOKEN") or os.getenv("BOT_TOKEN")
-    owner_str = os.getenv("OWNER_ID", "0")
-    folder_id = os.getenv("PARENT_FOLDER_ID", "")
-    
-    if token and owner_str:
-        print("✅ Found Local Secrets in .env")
-        owner = int(owner_str)
-        
-        # AUTO-SEED DB to prevent future failures
-        try:
-            print("🚀 Auto-Seeding MongoDB with Local Secrets...")
-            client = pymongo.MongoClient(
-                MONGO_URI,
-                serverSelectionTimeoutMS=15000,
-                socketTimeoutMS=30000,
-                connectTimeoutMS=15000,
-                retryWrites=True,
-                retryReads=True
-            )
-            db = client["MSANodeDB"]
-            col = db["bot_secrets"]
-            
-            # Read Files for encoding
-            files_data = {}
-            for f in ['credentials.json', 'token.pickle', 'db_config.json', '.env']:
-                 if os.path.exists(f):
-                     with open(f, "rb") as file:
-                         files_data[f] = base64.b64encode(file.read()).decode('utf-8')
-            
-            secret_doc = {
-                "bot": "bot4",
-                "BOT_TOKEN": token,
-                "OWNER_ID": str(owner),
-                "PARENT_FOLDER_ID": folder_id,
-                "files": files_data,
-                "updated_at": datetime.now()
-            }
-            
-            col.update_one({"bot": "bot4"}, {"$set": secret_doc}, upsert=True)
-            print("✅ MongoDB Auto-Seeded Successfully.")
-            client.close()
-        except Exception as seed_err:
-             print(f"⚠️ Auto-Seed Failed: {seed_err}")
-             
-        return token, owner, folder_id
-        
-    return None, 0, ""
+    owner = int(os.getenv("OWNER_ID", "0"))
+    if token:
+        print("✅ Secrets loaded from bot4.env")
+    else:
+        print("❌ BOT_4_TOKEN not found in bot4.env — check the file.")
+    return token, owner
 
 # Load Secrets
-BOT_TOKEN, OWNER_ID, PARENT_FOLDER_ID = load_secrets_from_db()
+BOT_TOKEN, OWNER_ID = load_secrets_from_env()
+
+# Google Drive config — only used for PDF upload, not for backup/DB
+PARENT_FOLDER_ID = os.getenv("PARENT_FOLDER_ID", "")
+CREDENTIALS_FILE = "credentials.json"
+TOKEN_FILE        = "token.pickle"
+ADMIN_PASSWORD   = os.getenv("ADMIN_PASSWORD", "")   # Set on Render; never hardcode here
+
+# In-memory set of owner IDs that have completed password auth this session
+_admin_authenticated: set = set()
 
 if not BOT_TOKEN:
     print("❌ FATAL: BOT_4_TOKEN could not be loaded. Exiting.")
     sys.exit(1)
 
-CREDENTIALS_FILE = 'credentials.json'
-TOKEN_FILE = 'token.pickle'
 
 START_TIME = time.time() 
 
@@ -256,9 +179,19 @@ col_trash = None
 col_locked = None
 col_trash_locked = None
 col_admins = None
+col_bot4_state = None
 db_client = None
 
 # prepare_secrets() - DEPRECATED (Moved to DB loading)
+
+# ==========================================
+# 🔐 OWNER TRANSFER PASSWORD
+# ==========================================
+OWNER_TRANSFER_PW = os.getenv("OWNER_TRANSFER_PW", "")  # Set OWNER_TRANSFER_PW on Render; never hardcode here
+# Env var takes priority. On Render, set OWNER_TRANSFER_PW in environment variables.
+# Also stored in MongoDB bot_secrets under key 'OWNER_TRANSFER_PW'.
+
+ADMIN_PAGE_SIZE = 10  # Admins per page in paginated lists
 
 async def handle_health(request):
     return web.Response(text="CORE 4 (PDF INFRASTRUCTURE) IS ACTIVE")
@@ -273,7 +206,7 @@ def run_health_server():
         print(f"📡 Health Server Note: {e}")
 
 def connect_db():
-    global col_pdfs, col_trash, col_locked, col_trash_locked, col_admins, col_banned, db_client
+    global col_pdfs, col_trash, col_locked, col_trash_locked, col_admins, col_banned, col_bot4_state, db_client
     try:
         db_client = pymongo.MongoClient(
             MONGO_URI,
@@ -294,6 +227,7 @@ def connect_db():
         col_trash_locked = db["trash_locked"] # NEW: Locked Content Bin
         col_admins = db["admins_bot4"]
         col_banned = db["banned_list"]
+        col_bot4_state = db["bot4_state"]
         db_client.server_info()
         print("✅ Connected to MongoDB successfully")
         return True
@@ -309,6 +243,7 @@ col_locked = None
 col_trash_locked = None
 col_admins = None
 col_banned = None
+col_bot4_state = None
 db_client = None
 
 # Attempt connection
@@ -327,15 +262,14 @@ PERMISSION_MAP = {
     "\U0001F4C4 Generate PDF": "gen_pdf",
     "\U0001F517 Get Link": "get_link",
     "\U0001F4CB Show Library": "show_lib",
-    "📂 GDrive Explorer": "drive_access",
     "\u270F\uFE0F Edit PDF": "edit_pdf",
     "\U0001F4CA Storage Info": "storage_info",
     "\U0001FA7A System Diagnosis": "sys_diag",
     "\U0001F4BB Live Terminal": "live_term",
-    "\u267B\uFE0F Recycle Bin": "recycle_bin",
     "\U0001F5D1 Remove PDF": "remove_pdf",
     "\u26A0\uFE0F NUKE ALL DATA": "nuke_data",
-    "\U0001F465 Admin Config": "manage_admins", # Usually Owner only, but configurable
+    "⚙️ Admin Config": "manage_admins", # Usually Owner only, but configurable
+    "\U0001F48E Full Guide": "elite_help",
 }
 
 # Default Permissions (All True by default or False? request implies toggle-able. 
@@ -421,18 +355,20 @@ class SecurityMiddleware(BaseMiddleware):
         # "if any other started this bot 4 instant notify who starting it"
         if event.text and event.text.startswith("/start"):
             if uid != OWNER_ID and not is_admin(uid):
+                 now_dt = now_local()
                  alert = (
-                     f"🚨 **SECURITY ALERT: UNAUTHORIZED ACCESS**\n"
+                     f"🚨 <b>UNAUTHORIZED ACCESS ATTEMPT</b>\n"
                      f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                     f"👤 **Name:** {user.full_name}\n"
-                     f"🆔 **ID:** `{uid}`\n"
-                     f"🔗 **Username:** @{user.username if user.username else 'N/A'}\n"
-                     f"🕐 **Time:** {datetime.now().strftime('%I:%M:%S %p')}\n"
+                     f"👤 <b>Name:</b> {user.full_name}\n"
+                     f"🆔 <b>ID:</b> <code>{uid}</code>\n"
+                     f"🔗 <b>Username:</b> @{user.username if user.username else 'N/A'}\n"
+                     f"📅 <b>Date:</b> <code>{now_dt.strftime('%b %d, %Y')}</code>\n"
+                     f"🕐 <b>Time:</b> <code>{now_dt.strftime('%I:%M:%S %p')}</code>\n"
                      f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                     f"⚠️ *Access was blocked.*"
+                     f"⛔ <i>Access silently blocked.</i>"
                  )
                  try:
-                     await bot.send_message(OWNER_ID, alert)
+                     await bot.send_message(OWNER_ID, alert, parse_mode='HTML')
                  except: pass
 
         # 4. PERMISSION ENFORCEMENT
@@ -467,6 +403,7 @@ class BotState(StatesGroup):
     deleting_pdf = State()
     confirm_overwrite = State()
     confirm_nuke = State()
+    waiting_for_nuke_2 = State()
     waiting_for_range = State()
     choosing_retrieval_mode = State()
     choosing_retrieval_method = State() # NEW: Single vs Bulk
@@ -491,35 +428,22 @@ class BotState(StatesGroup):
     # Lock Config
     waiting_for_lock_admin = State()
     waiting_for_lock_toggle = State()
-    browsing_drive = State()
+    # Owner Transfer
+    waiting_for_owner_pw_first = State()
+    waiting_for_owner_pw_confirm = State()
+    # Admin session authentication (password gate on /start)
+    waiting_for_admin_pw_1 = State()
+    waiting_for_admin_pw_2 = State()
     # library states
-    browsing_library = State() # NEW
-    searching_library = State() # NEW
-    
-    # Recycle Bin States
-    bin_category_select = State() # NEW: Choose PDF vs Locked
-    bin_menu = State() 
-    bin_viewing = State()
-    bin_choosing_method = State() # NEW: For "Single vs Bulk"
-    bin_restoring = State()
-    bin_purging = State()
-    bin_confirm_purge = State()
-    
-    # Database Management States
-    databases_menu = State()
-    mongo_management = State()
-    env_management = State()
-    waiting_for_mongo_url = State()
-    waiting_for_mongo_alias = State()
-    waiting_for_env_key = State()
-    waiting_for_env_value = State()
-    waiting_for_env_file = State()
-    waiting_for_remove_mongo_confirm = State()
-    waiting_for_switch_index = State() # NEW
-    waiting_for_remove_index = State() # NEW # NEW
-    waiting_for_env_file_selection = State() # NEW
-    waiting_for_env_replacement_content = State() # NEW
-    waiting_for_granular_option = State() # NEW: For Granular .env Edit
+    browsing_library = State()
+    searching_library = State()
+    # generate pdf: paginated recent codes
+    browsing_recent_codes = State()
+    # elite help guide
+    viewing_elite_help = State()
+    # Paginated admin list
+    viewing_admin_list = State()
+
 
 def get_main_menu(user_id=None):
     # Determine Permissions
@@ -541,61 +465,52 @@ def get_main_menu(user_id=None):
             allowed_keys = set() 
 
     builder = ReplyKeyboardBuilder()
-    
-    # Helper to check if button should be shown
+
     def is_allowed(btn_text):
-        # If button text is in MAP, check if its key is in allowed_keys
-        # If button text is NOT in MAP, it is allowed by default (e.g. "Databases" if not mapped)
         if btn_text in PERMISSION_MAP:
-             key = PERMISSION_MAP[btn_text]
-             return key in allowed_keys
-        return True # Allow unmapped buttons (like Back, or new features not yet secured)
+            return PERMISSION_MAP[btn_text] in allowed_keys
+        return True
 
-    # 1. CORE OPERATIONS
-    row1 = []
-    if is_allowed("\U0001F4C4 Generate PDF"): row1.append(KeyboardButton(text="\U0001F4C4 Generate PDF"))
-    if is_allowed("\U0001F517 Get Link"): row1.append(KeyboardButton(text="\U0001F517 Get Link"))
-    if row1: builder.row(*row1)
-    
-    # 2. VISIBILITY
-    row2 = []
-    if is_allowed("\U0001F4CB Show Library"): row2.append(KeyboardButton(text="\U0001F4CB Show Library"))
-    if is_allowed("📂 GDrive Explorer"): row2.append(KeyboardButton(text="📂 GDrive Explorer"))
-    if row2: builder.row(*row2)
+    def btn(t): return KeyboardButton(text=t)
 
-    # 3. MAINTENANCE
-    row3 = []
-    if is_allowed("\u270F\uFE0F Edit PDF"): row3.append(KeyboardButton(text="\u270F\uFE0F Edit PDF"))
-    if is_allowed("\U0001F4CA Storage Info"): row3.append(KeyboardButton(text="\U0001F4CA Storage Info"))
-    if row3: builder.row(*row3)
-    
-    # 4. DIAGNOSIS
-    row4 = []
-    if is_allowed("\U0001FA7A System Diagnosis"): row4.append(KeyboardButton(text="\U0001FA7A System Diagnosis"))
-    if is_allowed("\U0001F4BB Live Terminal"): row4.append(KeyboardButton(text="\U0001F4BB Live Terminal"))
-    if row4: builder.row(*row4)
-    
-    # 5. SAFETY
-    row5 = []
-    if is_allowed("\u267B\uFE0F Recycle Bin"): row5.append(KeyboardButton(text="\u267B\uFE0F Recycle Bin"))
-    if is_allowed("\U0001F5D1 Remove PDF"): row5.append(KeyboardButton(text="\U0001F5D1 Remove PDF"))
-    if row5: builder.row(*row5)
-    
-    # 6. CONFIG
-    row6 = []
-    # Standardize on Gear Emoji for Admin Config to match handler
-    if is_allowed("⚙️ Admin Config"): row6.append(KeyboardButton(text="⚙️ Admin Config"))
-    if is_allowed("\u26A0\uFE0F NUKE ALL DATA"): row6.append(KeyboardButton(text="\u26A0\uFE0F NUKE ALL DATA"))
-    if row6: builder.row(*row6)
+    # ROW 1: Generate PDF | Get Link
+    r1 = []
+    if is_allowed("📄 Generate PDF"): r1.append(btn("📄 Generate PDF"))
+    if is_allowed("🔗 Get Link"):      r1.append(btn("🔗 Get Link"))
+    if r1: builder.row(*r1)
 
-    # 7. EXTRAS & BACKUP
-    row7 = []
-    row7.append(KeyboardButton(text="📦 Backup")) # New Instant Backup
-    row7.append(KeyboardButton(text="🗄️ Databases"))
-    builder.row(*row7)
+    # ROW 2: Show Library | Edit PDF
+    r2 = []
+    if is_allowed("📋 Show Library"):  r2.append(btn("📋 Show Library"))
+    if is_allowed("✏️ Edit PDF"):    r2.append(btn("✏️ Edit PDF"))
+    if r2: builder.row(*r2)
 
-    # 8. HELP (Bottom Single Row)
-    builder.row(KeyboardButton(text="\U0001F48E Elite Help"))
+    # ROW 3: Storage Info | Remove PDF
+    r3 = []
+    if is_allowed("📊 Storage Info"):  r3.append(btn("📊 Storage Info"))
+    if is_allowed("🗑 Remove PDF"):    r3.append(btn("🗑 Remove PDF"))
+    if r3: builder.row(*r3)
+
+    # ROW 4: System Diagnosis | Live Terminal
+    r4 = []
+    if is_allowed("🩺 System Diagnosis"): r4.append(btn("🩺 System Diagnosis"))
+    if is_allowed("💻 Live Terminal"):     r4.append(btn("💻 Live Terminal"))
+    if r4: builder.row(*r4)
+
+    # ROW 5: Admin Config | Backup
+    r5 = []
+    if is_allowed("⚙️ Admin Config"): r5.append(btn("⚙️ Admin Config"))
+    r5.append(btn("📦 Backup"))
+    builder.row(*r5)
+
+    # ROW 6: NUKE + Full Guide (paired in 2-column layout)
+    r6 = []
+    if is_allowed("\u26A0\uFE0F NUKE ALL DATA"):
+        r6.append(btn("\u26A0\uFE0F NUKE ALL DATA"))
+    if is_allowed("\U0001F48E Full Guide"):
+        r6.append(btn("\U0001F48E Full Guide"))
+    # Also ensure the button text matches the one in PERMISSION_MAP
+    if r6: builder.row(*r6)
 
     return builder.as_markup(resize_keyboard=True)
 
@@ -605,13 +520,26 @@ def generate_progress_bar(percentage):
     bar = "▓" * filled_length + "░" * (10 - filled_length)
     return f"|{bar}| {percentage:.1f}%"
 
-def get_formatted_file_list(docs, limit=30):
+
+def _get_unique_docs():
+    """Returns all PDF documents sorted by timestamp, keeping only the newest for each code."""
+    raw_docs = list(col_pdfs.find().sort("timestamp", -1))
+    seen = set()
+    unique_docs = []
+    for d in raw_docs:
+        c = d.get('code')
+        if c and c not in seen:
+            seen.add(c)
+            unique_docs.append(d)
+    return unique_docs
+
+def get_formatted_file_list(docs, limit=30, start_index=1):
     """Generates a clean, consistent HTML list of files with indices and hyperlinks."""
     if not docs:
         return ["_No files found._"]
         
     lines = []
-    for idx, doc in enumerate(docs[:limit], 1):
+    for idx, doc in enumerate(docs[:limit], start_index):
         code = doc.get('code', 'UNK')
         ts = doc.get('timestamp')
         date_str = ts.strftime('%d-%b %I:%M %p') if ts else "?"
@@ -626,7 +554,7 @@ def get_formatted_file_list(docs, limit=30):
         # User requested: "enhance links display"
         
         if link:
-            line = f"<b>{idx}. {code}</b>{restored_mark}\n<i>{date_str}</i> • <a href='{link}'>🔗 Drive Link</a>"
+            line = f"<b>{idx}. {code}</b>{restored_mark}\n<i>{date_str}</i> • <a href='{link}'>🔗 Access</a>"
         else:
             line = f"<b>{idx}. {code}</b>{restored_mark}\n<i>{date_str}</i>"
             
@@ -646,6 +574,57 @@ def get_formatted_file_list(docs, limit=30):
 
 # ENTERPRISE: DAILY STATS TRACKING
 DAILY_STATS_BOT4 = {"pdfs_generated": 0, "pdfs_deleted": 0, "errors": 0, "links_retrieved": 0}
+_DEFAULT_DAILY_STATS = {"pdfs_generated": 0, "pdfs_deleted": 0, "errors": 0, "links_retrieved": 0}
+
+# ==========================================
+# 💾 PERSISTENT STATE HELPERS
+# ==========================================
+
+async def _persist_stats():
+    """Save DAILY_STATS_BOT4 to MongoDB so it survives restarts (fire-and-forget)."""
+    if col_bot4_state is None:
+        return
+    try:
+        col_bot4_state.update_one(
+            {"_id": "daily_stats"},
+            {"$set": {
+                "stats": DAILY_STATS_BOT4,
+                "date": now_local().strftime('%Y-%m-%d'),
+                "updated": datetime.now()
+            }},
+            upsert=True
+        )
+    except Exception as e:
+        logging.warning(f"_persist_stats failed: {e}")
+
+async def _load_persisted_stats():
+    """
+    Load DAILY_STATS_BOT4 from MongoDB on startup.
+    Resets automatically if the stored date is different from today (new day).
+    """
+    global DAILY_STATS_BOT4
+    if col_bot4_state is None:
+        print("⚠️ State collection unavailable — using fresh daily stats.")
+        return
+    try:
+        rec = col_bot4_state.find_one({"_id": "daily_stats"})
+        if rec:
+            saved_date = rec.get("date", "")
+            today = now_local().strftime('%Y-%m-%d')
+            if saved_date == today:
+                DAILY_STATS_BOT4 = {**_DEFAULT_DAILY_STATS, **rec.get("stats", {})}
+                print(f"✅ Daily stats restored from DB: {DAILY_STATS_BOT4}")
+            else:
+                # New day — start fresh
+                DAILY_STATS_BOT4 = dict(_DEFAULT_DAILY_STATS)
+                await _persist_stats()
+                print(f"🔄 New day detected — daily stats reset (was {saved_date}, now {today}).")
+        else:
+            DAILY_STATS_BOT4 = dict(_DEFAULT_DAILY_STATS)
+            await _persist_stats()
+            print("🆕 No saved stats found — initialized fresh.")
+    except Exception as e:
+        logging.warning(f"_load_persisted_stats failed: {e}")
 
 # ENTERPRISE: INSTANT ERROR NOTIFICATION
 async def notify_error_bot4(error_type, details):
@@ -680,6 +659,7 @@ async def notify_error_bot4(error_type, details):
         
         # Increment error counter
         DAILY_STATS_BOT4["errors"] += 1
+        asyncio.create_task(_persist_stats())
     except Exception as e:
         logging.error(f"Failed to send error alert: {e}")
 
@@ -687,7 +667,7 @@ async def notify_error_bot4(error_type, details):
 
 async def system_guardian():
     """
-    Auto-healer: checks DB and Drive every 30 min.
+    Auto-healer: checks DB every 30 min.
     On failure, attempts reconnect + notifies owner. Escalates on repeated failures.
     """
     print("🛡️ System Guardian (Auto-Healer): Online")
@@ -695,14 +675,12 @@ async def system_guardian():
     while True:
         try:
             db_client.server_info()
-            get_drive_service()
             if consecutive_failures > 0:
-                # Recovered — notify owner
                 try:
                     await bot.send_message(
                         OWNER_ID,
                         f"✅ <b>BOT 4 AUTO-HEALER: RECOVERED</b>\n\n"
-                        f"All systems back online after {consecutive_failures} failure(s).\n"
+                        f"Database back online after {consecutive_failures} failure(s).\n"
                         f"🕐 {now_local().strftime('%I:%M %p  ·  %b %d, %Y')}",
                         parse_mode="HTML"
                     )
@@ -711,17 +689,15 @@ async def system_guardian():
             consecutive_failures = 0
         except Exception as e:
             consecutive_failures += 1
-            print(f"⚠️ Guardian: System issue detected (#{consecutive_failures}): {e}")
+            print(f"⚠️ Guardian: DB issue detected (#{consecutive_failures}): {e}")
 
-            # Attempt DB reconnect
             reconnected = await asyncio.to_thread(connect_db)
             reconnect_status = "✅ Reconnected" if reconnected else "❌ Still Down"
 
-            # Escalating alert
             if consecutive_failures == 1 or consecutive_failures % 3 == 0:
                 await notify_error_bot4(
                     f"Auto-Healer Alert (failure #{consecutive_failures})",
-                    f"DB/Drive issue: {e}\nDB Reconnect: {reconnect_status}"
+                    f"DB issue: {e}\nDB Reconnect: {reconnect_status}"
                 )
 
         await asyncio.sleep(1800)  # Every 30 minutes
@@ -809,21 +785,472 @@ def generate_system_backup():
         logging.error(f"Backup Gen Error: {e}")
         return None
 
+# ==========================================
+# 🚀 HANDLERS
+# ==========================================
+
+@dp.message(Command("start"))
+@dp.message(F.text == "🔙 Back to Menu")
+async def start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if is_banned(user_id): return
+
+    if is_admin(user_id):
+        await state.clear()
+        reply_markup = get_main_menu(user_id)
+        if user_id == OWNER_ID:
+            greeting = "💎 <b>MSA NODE BOT 4</b>\nAt your command, Master."
+        else:
+            admin_doc = col_admins.find_one({"user_id": user_id}) or col_admins.find_one({"user_id": str(user_id)})
+            role = admin_doc.get("role", "Authorized Admin") if admin_doc else "Authorized Admin"
+            name = message.from_user.full_name
+            greeting = (
+                f"💎 <b>MSA NODE SYSTEMS</b>\n"
+                f"ASSIGNED BY 👑 <b>OWNER:</b> MSA\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🛡️ <b>ACCESS GRANTED</b>\n"
+                f"👤 <b>Officer:</b> {name}\n"
+                f"🔰 <b>Rank:</b> <code>{role}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🚀 System initialized."
+            )
+        await message.answer(greeting, reply_markup=reply_markup, parse_mode="HTML")
+        return
+
+    # Stranger flood check
+    now = time.time()
+    if user_id not in START_TRACKER or (now - START_TRACKER[user_id][0] > 60):
+        START_TRACKER[user_id] = [now, 1]
+    else:
+        START_TRACKER[user_id][1] += 1
+    if START_TRACKER[user_id][1] > 5:
+        if not is_banned(user_id):
+            try:
+                if col_banned is not None:
+                    col_banned.insert_one({"user_id": user_id, "reason": "Auto-Ban: Spamming /start", "timestamp": datetime.now()})
+            except Exception as e:
+                logging.error(f"Auto-ban insert failed: {e}")
+            try: await bot.send_message(OWNER_ID, f"🚨 <b>AUTO-BANNED</b> `{user_id}` — spamming /start.", parse_mode="HTML")
+            except: pass
+    return
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🔐 ADMIN PASSWORD GATE (owner-only, one-time per session, double confirmation)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dp.message(BotState.waiting_for_admin_pw_1)
+async def admin_pw_first(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    # Cancel = skip auth this session (owner ID already verified by /start gate)
+    if message.text and message.text.strip() == "❌ Cancel":
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await start(message, state)
+        return
+    try: await message.delete()
+    except: pass
+    data = await state.get_data()
+    attempts = data.get("pw_attempts", 0)
+    if not ADMIN_PASSWORD:
+        # Env var not configured — skip auth silently
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await start(message, state)
+        return
+    if message.text == ADMIN_PASSWORD:
+        await state.update_data(pw_first_ok=True, pw_attempts=0)
+        await state.set_state(BotState.waiting_for_admin_pw_2)
+        await message.answer("✅ Password accepted.\n\nEnter password again to confirm:", parse_mode="HTML")
+    else:
+        attempts += 1
+        remaining = 3 - attempts
+        if remaining <= 0:
+            await state.clear()
+            await message.answer(
+                "❌ Too many failed attempts. Use /start to try again.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            await state.update_data(pw_attempts=attempts)
+            await message.answer(
+                f"❌ Incorrect password. <b>{remaining}</b> attempt(s) remaining.",
+                parse_mode="HTML",
+            )
+
+
+@dp.message(BotState.waiting_for_admin_pw_2)
+async def admin_pw_second(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    # Cancel = skip auth this session (owner ID already verified by /start gate)
+    if message.text and message.text.strip() == "❌ Cancel":
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await start(message, state)
+        return
+    try: await message.delete()
+    except: pass
+    if message.text == ADMIN_PASSWORD:
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        # Simulate a fresh /start
+        await start(message, state)
+    else:
+        await state.clear()
+        await message.answer(
+            "❌ Passwords did not match. Authentication failed.\n\nUse /start to try again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+
+# ==========================================
+# 📄 PDF GENERATION
+# ==========================================
+
+@dp.message(F.text == "📄 Generate PDF")
+async def gen_btn(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await state.update_data(raw_script="")
+    # Load all codes for paginated recent list
+    all_codes = []
+    try:
+        all_docs_rc = list(col_pdfs.find({}, {"code": 1, "restored": 1}).sort("timestamp", -1))
+        for i, d in enumerate(all_docs_rc, 1):
+            if "code" in d:
+                marker = " <b>[R]</b>" if d.get('restored', False) else ""
+                all_codes.append(f"{i}. <code>{d['code']}</code>{marker}")
+    except: pass
+    await state.update_data(raw_script="", recent_codes=all_codes, rc_page=0)
+    await _render_gen_recent(message, state, all_codes, 0)
+
+
+async def _render_gen_recent(message, state, all_codes, page):
+    """Render the Generate PDF entry prompt with paginated recent codes."""
+    PER_PAGE = 15
+    total = len(all_codes)
+    max_page = max(0, (total - 1) // PER_PAGE) if total else 0
+    page = max(0, min(page, max_page))
+    page_codes = all_codes[page * PER_PAGE:(page + 1) * PER_PAGE]
+    await state.update_data(rc_page=page)
+    header = (
+        "🔑 <b>AUTHENTICATED.</b>\n\n"
+        "Enter your <b>Project Code</b> to begin:"
+    )
+    if page_codes:
+        s = page * PER_PAGE + 1
+        e = page * PER_PAGE + len(page_codes)
+        header += f"\n\n🕒 <b>Recent (Latest ↓ · #{s}–{e} of {total}):</b>\n"
+        header += "\n".join(page_codes)
+    builder = ReplyKeyboardBuilder()
+    nav = []
+    if page > 0:       nav.append(KeyboardButton(text="◀ PREV CODES"))
+    if page < max_page: nav.append(KeyboardButton(text="▶ MORE CODES"))
+    if nav: builder.row(*nav)
+    builder.row(KeyboardButton(text="🔙 Back to Menu"))
+    await message.answer(header, reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML")
+    await state.set_state(BotState.waiting_for_code)
+
+@dp.message(BotState.waiting_for_code)
+async def code_input(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Back to Menu": return await start(message, state)
+    if message.text in ("◀ PREV CODES", "▶ MORE CODES"):
+        _d = await state.get_data()
+        _pg = _d.get("rc_page", 0) + (-1 if "PREV" in message.text else 1)
+        return await _render_gen_recent(message, state, _d.get("recent_codes", []), _pg)
+    code = message.text.strip().upper()
+    if col_pdfs.find_one({"code": code}):
+        await message.answer(
+            f"⛔ <b>ERROR: Code <code>{code}</code> Already Exists!</b>\n"
+            f"Please enter a DIFFERENT Project Code:",
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True),
+            parse_mode="HTML"
+        )
+        return
+    await state.update_data(code=code)
+    await message.answer(
+        f"🖋 <b>Code <code>{code}</code> Available.</b>\n📝 <b>Awaiting Content...</b>\nPaste your script or data now, Master.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True),
+        parse_mode="HTML"
+    )
+    await state.set_state(BotState.processing_script)
+
+@dp.message(BotState.processing_script, F.text)
+async def merge_script(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Back to Menu": return await start(message, state)
+    data = await state.get_data()
+    updated = data.get('raw_script', '') + "\n\n" + message.text
+    await state.update_data(raw_script=updated)
+    if not data.get('timer_active'):
+        await state.update_data(timer_active=True)
+        async def auto_finish(uid, st):
+            await asyncio.sleep(5)
+            await finalize_pdf(uid, st)
+        asyncio.create_task(auto_finish(message.from_user.id, state))
+
+async def finalize_pdf(user_id, state):
+    global DAILY_STATS_BOT4
+    data = await state.get_data()
+    code = data.get('code')
+    script = data.get('raw_script', '').strip()
+    if not script or not code: return
+    msg = await bot.send_message(user_id, "⏳ <b>Compiling Assets...</b>", parse_mode="HTML")
+    filename = f"{code}.pdf"
+    try:
+        await asyncio.to_thread(create_goldmine_pdf, script, filename)
+
+        # Upload to Google Drive and get shareable link
+        link = ""
+        if os.path.exists(CREDENTIALS_FILE):
+            try:
+                link = await asyncio.to_thread(upload_to_drive, filename)
+            except Exception as drive_err:
+                logging.warning(f"Drive upload failed for {code}: {drive_err}")
+                link = ""
+        else:
+            logging.warning("credentials.json not found — skipping Drive upload.")
+
+        # Save to MongoDB with link
+        col_pdfs.delete_many({"code": code})
+        col_pdfs.insert_one({"code": code, "link": link, "timestamp": datetime.now()})
+
+        # Send PDF file + link to user
+        caption = f"✅ <b>READY</b>\nCode: <code>{code}</code>"
+        if link:
+            caption += f"\n🔗 <a href='{link}'>Drive Link</a>"
+        await bot.send_document(user_id, FSInputFile(filename), caption=caption, parse_mode="HTML")
+        DAILY_STATS_BOT4["pdfs_generated"] += 1
+        asyncio.create_task(_persist_stats())
+        await msg.delete()
+        await asyncio.sleep(2)
+        if os.path.exists(filename):
+            try: os.remove(filename)
+            except: pass
+    except Exception as e:
+        await bot.send_message(user_id, f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await notify_error_bot4("PDF Generation Failed", f"Code: {code} | Error: {e}")
+        DAILY_STATS_BOT4["errors"] += 1
+        asyncio.create_task(_persist_stats())
+    await state.clear()
+
+
+# ==========================================
+# 📋 SHOW LIBRARY
+# ==========================================
+
+@dp.message(F.text == "📋 Show Library")
+async def show_library(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer(
+        "📚 <b>VAULT LIBRARY ACCESS</b>\nSelect your preferred viewing mode:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📋 DISPLAY ALL"), KeyboardButton(text="🔍 SEARCH")],
+                      [KeyboardButton(text="🔙 Back to Menu")]],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+    await state.set_state(BotState.browsing_library)
+    await state.update_data(lib_mode="menu")
+
+@dp.message(BotState.browsing_library)
+async def handle_library_logic(message: types.Message, state: FSMContext):
+    text = message.text
+    if text == "🔙 Back to Menu": return await start(message, state)
+    data = await state.get_data()
+    mode = data.get("lib_mode", "menu")
+    if mode == "menu":
+        if text == "📋 DISPLAY ALL":
+            await state.update_data(lib_mode="display", page=0)
+            await render_library_page(message, state, page=0)
+        elif text == "🔍 SEARCH":
+            docs = list(col_pdfs.find().sort("timestamp", 1))  # ascending: #1 = oldest
+            list_lines = get_formatted_file_list(docs, limit=30)
+            list_text = "\n".join(list_lines)
+            if len(list_text) > 3500: list_text = list_text[:3500] + "\n..."
+            await message.answer(
+                f"{list_text}\n\n🔍 <b>SEARCH</b>\nEnter a <b>Code</b> (e.g., <code>S19</code>) or <b>Index Number</b>.",
+                reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")], [KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True),
+                parse_mode="HTML", disable_web_page_preview=True
+            )
+            await state.set_state(BotState.searching_library)
+        else:
+            await message.answer("⚠️ Invalid option.")
+    elif mode == "display":
+        current_page = data.get("page", 0)
+        if text == "⬅️ BACK":
+            await state.update_data(lib_mode="menu")
+            await show_library(message, state)
+        elif text == "➡️ NEXT":
+            await render_library_page(message, state, page=current_page + 1)
+        elif text == "⬅️ PREV":
+            await render_library_page(message, state, page=current_page - 1)
+        else:
+            await message.answer("⚠️ Use navigation buttons.")
+
+async def render_library_page(message, state, page):
+    limit = 20
+    docs = list(col_pdfs.find().sort("timestamp", 1))
+    total_docs = len(docs)
+    max_page = max(0, (total_docs - 1) // limit)
+    page = max(0, min(page, max_page))
+    page_docs = docs[page * limit:(page + 1) * limit]
+    lines = []
+    for i, doc in enumerate(page_docs):
+        abs_idx = page * limit + i + 1
+        code = doc.get("code")
+        ts = doc.get("timestamp")
+        date_str = ts.strftime('%d-%b %I:%M %p') if ts else "?"
+        link = doc.get('link')
+        if link:
+            lines.append(f"<b>{abs_idx}. {code}</b>\n<i>{date_str}</i> • <a href='{link}'>🔗 Link</a>")
+        else:
+            lines.append(f"<b>{abs_idx}. {code}</b>\n<i>{date_str}</i>")
+    header = (
+        f"📋 <b>LIBRARY INDEX</b> (Page {page+1}/{max_page+1})\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(lines) +
+        f"\n━━━━━━━━━━━━━━━━━━━━\n📊 Total: {total_docs} Files"
+    ) if lines else "📋 Library is empty."
+    await state.update_data(page=page)
+    builder = ReplyKeyboardBuilder()
+    row_btns = []
+    if page > 0: row_btns.append(KeyboardButton(text="⬅️ PREV"))
+    if page < max_page: row_btns.append(KeyboardButton(text="➡️ NEXT"))
+    if row_btns: builder.row(*row_btns)
+    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
+    await message.answer(header, reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML", disable_web_page_preview=True)
+
+@dp.message(BotState.searching_library)
+async def handle_library_search(message: types.Message, state: FSMContext):
+    text = message.text.strip().upper()
+    if text in ("🔙 BACK TO MENU", "🔙 BACK TO MENU"): return await start(message, state)
+    if text == "⬅️ BACK":
+        await show_library(message, state)
+        return
+    all_docs = list(col_pdfs.find().sort("timestamp", 1))
+    doc = None
+    if text.isdigit():
+        idx = int(text)
+        if 1 <= idx <= len(all_docs):
+            doc = all_docs[idx - 1]
+    if not doc:
+        doc = next((d for d in all_docs if d.get('code') == text), None)
+    if doc:
+        code = doc.get('code')
+        link = doc.get('link', '')
+        ts = doc.get('timestamp')
+        date_str = ts.strftime('%d-%b-%Y %I:%M %p') if ts else "Unknown"
+        link_line = f"\n🔗 <b>Link:</b>\n{link}" if link else "\n🔗 <b>Link:</b> <i>Not set</i>"
+        await message.answer(
+            f"💎 <b>VAULT ITEM</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Code:</b> <code>{code}</code>\n"
+            f"📅 <b>Added:</b> <code>{date_str}</code>\n"
+            f"📂 <b>Status:</b> Active{link_line}\n━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="HTML", disable_web_page_preview=True
+        )
+        await message.answer("🔍 Search another or '🔙 Back to Menu'.")
+    else:
+        await message.answer(f"❌ Record <code>{text}</code> not found.", parse_mode="HTML")
+
+
+# ==========================================
+# 📊 STORAGE INFO
+# ==========================================
+
+@dp.message(F.text == "📊 Storage Info")
+async def storage_info(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    wait_msg = await message.answer("⏳ <b>Running System Scan...</b>", parse_mode="HTML")
+    start_t = time.time()
+    try:
+        t0 = time.time()
+        db_client.server_info()
+        t_mongo = (time.time() - t0) * 1000
+        now_ts = now_local()
+        # Live collection counts
+        pdf_count    = col_pdfs.count_documents({})         if col_pdfs         is not None else 0
+        trash_count  = col_trash.count_documents({})        if col_trash        is not None else 0
+        locked_count = col_locked.count_documents({})       if col_locked       is not None else 0
+        admin_count  = col_admins.count_documents({})       if col_admins       is not None else 0
+        banned_count = col_banned.count_documents({})       if col_banned       is not None else 0
+        t_lock_count = col_trash_locked.count_documents({}) if col_trash_locked is not None else 0
+        # Admin breakdown
+        try:
+            active_admins = col_admins.count_documents({"locked": False})
+            locked_admins = col_admins.count_documents({"locked": True})
+        except: active_admins = locked_admins = 0
+        # Latest backup
+        try:
+            _db = db_client["MSANodeDB"]
+            last_bup  = _db["bot4_monthly_backups"].find_one({}, sort=[("date", -1)])
+            bup_month = last_bup["month"] if last_bup else "None"
+            bup_count = _db["bot4_monthly_backups"].count_documents({})
+        except: bup_month = "?"; bup_count = 0
+        # Latest PDF
+        try:
+            latest_pdf  = col_pdfs.find_one({}, sort=[("timestamp", -1)])
+            latest_code = latest_pdf.get("code","?") if latest_pdf else "None"
+            latest_ts   = latest_pdf.get("timestamp") if latest_pdf else None
+            latest_date = latest_ts.strftime("%b %d, %Y  %I:%M %p") if latest_ts else "—"
+        except: latest_code = "?"; latest_date = "?"
+        health    = "🟢 Excellent" if t_mongo < 150 else ("🟡 Degraded" if t_mongo < 500 else "🔴 Critical")
+        scan_time = time.time() - start_t
+        msg = (
+            f"📊 <b>STORAGE ANALYTICS — LIVE</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 <code>{now_ts.strftime('%b %d, %Y  %I:%M %p')}</code>\n"
+            f"💚 DB: {health}  ⏱ <code>{t_mongo:.1f}ms</code>\n\n"
+            f"📁 <b>PDF VAULT</b>\n"
+            f"• Active PDFs: <code>{pdf_count}</code>\n"
+            f"• Archived: <code>{trash_count}</code>  Locked: <code>{locked_count}</code>  Locked-Archived: <code>{t_lock_count}</code>\n"
+            f"• Latest: <code>{latest_code}</code> · <code>{latest_date}</code>\n\n"
+            f"👥 <b>ADMINS</b>\n"
+            f"• Total: <code>{admin_count}</code>  (🟢 {active_admins} active  🔴 {locked_admins} locked)\n"
+            f"• Banned: <code>{banned_count}</code>\n\n"
+            f"📦 <b>BACKUPS</b>\n"
+            f"• Monthly records: <code>{bup_count}</code> | Last: <code>{bup_month}</code>\n\n"
+            f"📈 <b>SESSION</b>\n"
+            f"• PDFs gen: <code>{DAILY_STATS_BOT4['pdfs_generated']}</code>  "
+            f"Links: <code>{DAILY_STATS_BOT4['links_retrieved']}</code>  "
+            f"Errors: <code>{DAILY_STATS_BOT4['errors']}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{'✅ <b>ALL SYSTEMS OPERATIONAL</b>' if t_mongo < 500 else '⚠️ <b>HIGH LATENCY DETECTED</b>'}"
+        )
+        await wait_msg.delete()
+        await message.answer(msg, parse_mode="HTML")
+    except Exception as e:
+        await wait_msg.edit_text(f"⚠️ <b>Scan Error:</b> <code>{e}</code>", parse_mode="HTML")
+
+
 @dp.message(F.text == "📦 Backup")
 async def backup_menu_btn(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
-    
+
+    # Live stats preview
+    pdf_count   = col_pdfs.count_documents({})   if col_pdfs   is not None else 0
+    admin_count = col_admins.count_documents({}) if col_admins is not None else 0
+    banned_count= col_banned.count_documents({}) if col_banned is not None else 0
+    trash_count = col_trash.count_documents({})  if col_trash  is not None else 0
+    now_str = now_local().strftime("%b %d, %Y  ·  %I:%M %p")
+
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="📄 Text Report"), KeyboardButton(text="💾 JSON Dump"))
+    builder.row(KeyboardButton(text="📅 Backup History"))
     builder.row(KeyboardButton(text="🔙 Back to Menu"))
-    
+
     await message.answer(
-        "📦 **BACKUP & RECOVERY**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Select Backup Format:\n\n"
-        "📄 **Text Report**: Human-readable summary of all data.\n"
-        "💾 **JSON Dump**: Full database export for restoring the bot.\n\n"
-        "<i>Files are automatically uploaded to Google Drive.</i>",
+        f"📦 <b>BACKUP &amp; RECOVERY</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 <b>Now:</b> <code>{now_str}</code>\n\n"
+        f"📊 <b>CURRENT SNAPSHOT</b>\n"
+        f"• 📚 Active PDFs: <code>{pdf_count}</code>\n"
+        f"• 🗑 Recycle Bin: <code>{trash_count}</code>\n"
+        f"• 👥 Admins: <code>{admin_count}</code>\n"
+        f"• 🚫 Banned: <code>{banned_count}</code>\n\n"
+        f"📄 <b>Text Report</b> — Human-readable summary.\n"
+        f"💾 <b>JSON Dump</b> — Full export for restore.\n"
+        f"📅 <b>Backup History</b> — View all past backup records.\n\n"
+        f"<i>All backups stored in MongoDB + sent to Owner.</i>",
         reply_markup=builder.as_markup(resize_keyboard=True),
         parse_mode="HTML"
     )
@@ -831,120 +1258,190 @@ async def backup_menu_btn(message: types.Message, state: FSMContext):
 @dp.message(F.text == "📄 Text Report")
 async def handle_backup_text(message: types.Message):
     if not is_admin(message.from_user.id): return
-    
-    msg = await message.answer("⏳ **Generating Text Report...**")
-    
-    # Run in thread
+
+    msg = await message.answer("⏳ <b>Generating Text Report...</b>", parse_mode="HTML")
     filename = await asyncio.to_thread(generate_system_backup)
-    
+
     if filename and os.path.exists(filename):
         try:
-            # Upload to Drive
-            link = await asyncio.to_thread(upload_to_drive, filename)
-            
+            now_ts = now_local()
+            pdf_count   = col_pdfs.count_documents({})   if col_pdfs   is not None else 0
+            admin_count = col_admins.count_documents({}) if col_admins is not None else 0
             caption = (
-                f"🛡 <b>SYSTEM REPORT SECURED</b>\n"
-                f"📅 <code>{datetime.now().strftime('%Y-%m-%d %H:%M')}</code>\n"
-                f"☁️ <a href='{link}'><b>Google Drive Link</b></a>"
+                f"🛡 <b>MSANODE SYSTEM REPORT</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📅 <b>Generated:</b> <code>{now_ts.strftime('%b %d, %Y  ·  %I:%M %p')}</code>\n"
+                f"📚 <b>PDFs:</b> <code>{pdf_count}</code>  |  "
+                f"👥 <b>Admins:</b> <code>{admin_count}</code>\n"
+                f"💾 <b>Storage:</b> MongoDB Atlas\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>Human-readable snapshot of all data.</i>"
             )
-            await message.answer_document(
-                FSInputFile(filename), 
-                caption=caption,
-                parse_mode="HTML"
-            )
-            os.remove(filename) 
+            await message.answer_document(FSInputFile(filename), caption=caption, parse_mode="HTML")
+            os.remove(filename)
             await msg.delete()
         except Exception as e:
-            await msg.edit_text(f"❌ Upload Failed: {e}")
+            await msg.edit_text(f"❌ Failed: <code>{e}</code>", parse_mode="HTML")
     else:
-        await msg.edit_text("❌ Generation Failed.")
+        await msg.edit_text("❌ <b>Generation Failed.</b>", parse_mode="HTML")
 
 @dp.message(F.text == "💾 JSON Dump")
 async def handle_backup_json(message: types.Message):
     if not is_admin(message.from_user.id): return
-    
-    msg = await message.answer("⏳ **Exporting Database...**")
-    
+
+    msg = await message.answer("⏳ <b>Exporting Full Database...</b>", parse_mode="HTML")
+
     try:
+        now_ts = now_local()
+        date_label = now_ts.strftime("%Y-%m-%d")
         data = {
-            "timestamp": datetime.now().isoformat(),
-            "pdfs": list(col_pdfs.find({}, {"_id": 0})) if col_pdfs is not None else [],
-            "admins": list(col_admins.find({}, {"_id": 0})) if col_admins is not None else [],
-            "banned": list(col_banned.find({}, {"_id": 0})) if col_banned is not None else [],
-            "trash": list(col_trash.find({}, {"_id": 0})) if col_trash is not None else [],
-            "trash_locked": list(col_trash_locked.find({}, {"_id": 0})) if col_trash_locked is not None else []
+            "backup_type":  "manual_json",
+            "generated_at": now_ts.strftime("%b %d, %Y  ·  %I:%M %p"),
+            "pdfs":         list(col_pdfs.find({}, {"_id": 0}))         if col_pdfs         is not None else [],
+            "trash":        list(col_trash.find({}, {"_id": 0}))        if col_trash        is not None else [],
+            "locked":       list(col_locked.find({}, {"_id": 0}))       if col_locked       is not None else [],
+            "trash_locked": list(col_trash_locked.find({}, {"_id": 0})) if col_trash_locked is not None else [],
+            "admins":       list(col_admins.find({}, {"_id": 0}))       if col_admins       is not None else [],
+            "banned":       list(col_banned.find({}, {"_id": 0}))       if col_banned       is not None else [],
         }
-        
-        filename = f"MSANODE_FULL_DUMP_{datetime.now().strftime('%Y-%m-%d')}.json"
-        
-        # Write JSON
+
+        filename = f"MSANODE_DUMP_{date_label}.json"
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, default=str)
-            
-        # Upload
-        link = await asyncio.to_thread(upload_to_drive, filename)
-        
+
+        # Save dedup-safe metadata record
+        try:
+            db = db_client["MSANodeDB"]
+            db["bot4_backups"].update_one(
+                {"date": date_label, "type": "json_dump"},
+                {"$set": {
+                    "date":          date_label,
+                    "type":          "json_dump",
+                    "pdf_count":     len(data["pdfs"]),
+                    "admin_count":   len(data["admins"]),
+                    "banned_count":  len(data["banned"]),
+                    "trash_count":   len(data["trash"]),
+                    "locked_count":  len(data["locked"]),
+                    "created_at":    now_ts
+                }},
+                upsert=True
+            )
+        except Exception as db_err:
+            print(f"⚠️ Backup DB record failed: {db_err}")
+
         caption = (
             f"💾 <b>FULL DATABASE DUMP</b>\n"
-            f"📅 <code>{datetime.now().strftime('%Y-%m-%d %H:%M')}</code>\n"
-            f"🔢 <b>Records:</b> {len(data['pdfs']) + len(data['trash'])} PDFs\n"
-            f"☁️ <a href='{link}'><b>Google Drive Link</b></a>\n\n"
-            f"⚠️ <i>Keep this file safe! It contains your entire bot data.</i>"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 <b>Generated:</b> <code>{now_ts.strftime('%b %d, %Y  ·  %I:%M %p')}</code>\n\n"
+            f"📊 <b>CONTENTS</b>\n"
+            f"• 📚 Active PDFs: <code>{len(data['pdfs'])}</code>\n"
+            f"• 🗑 Recycle Bin: <code>{len(data['trash'])}</code>\n"
+            f"• 🔒 Locked PDFs: <code>{len(data['locked'])}</code>\n"
+            f"• 👥 Admins: <code>{len(data['admins'])}</code>\n"
+            f"• 🚫 Banned: <code>{len(data['banned'])}</code>\n\n"
+            f"💾 <b>Storage:</b> MongoDB Atlas\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <i>Keep this file safe — full bot restore data.</i>"
         )
-        
-        await message.answer_document(
-            FSInputFile(filename),
-            caption=caption,
-            parse_mode="HTML"
-        )
-        
+
+        await message.answer_document(FSInputFile(filename), caption=caption, parse_mode="HTML")
         os.remove(filename)
         await msg.delete()
-        
+
     except Exception as e:
-        await msg.edit_text(f"❌ Export Failed: {e}")
+        await msg.edit_text(f"❌ <b>Export Failed:</b> <code>{e}</code>", parse_mode="HTML")
+
+
+@dp.message(F.text == "📅 Backup History")
+async def backup_history_btn(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    wait_msg = await message.answer("⏳ <b>Fetching Backup Records...</b>", parse_mode="HTML")
+    try:
+        _db = db_client["MSANodeDB"]
+        monthly = list(_db["bot4_monthly_backups"].find({}, {"_id": 0}).sort("date", -1).limit(12))
+        manual  = list(_db["bot4_backups"].find({}, {"_id": 0}).sort("created_at", -1).limit(10))
+        lines = [
+            "📅 <b>BACKUP HISTORY</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "\n📆 <b>MONTHLY AUTO-BACKUPS</b>",
+        ]
+        if monthly:
+            for i, b in enumerate(monthly, 1):
+                month  = b.get("month", "?")
+                dt     = b.get("date")
+                dt_str = dt.strftime("%b %d, %Y  %I:%M %p") if hasattr(dt, "strftime") else str(dt)[:19]
+                pdfs   = b.get("pdf_count", "?")
+                lines.append(f"  {i}. 📦 <b>{month}</b> | 📅 {dt_str} | PDFs: <code>{pdfs}</code>")
+        else:
+            lines.append("  <i>No monthly backups yet.</i>")
+        lines.append("\n💾 <b>MANUAL / WEEKLY BACKUPS</b>")
+        if manual:
+            for i, b in enumerate(manual, 1):
+                btype  = b.get("type", "manual")
+                dt     = b.get("created_at")
+                dt_str = dt.strftime("%b %d, %Y  %I:%M %p") if hasattr(dt, "strftime") else str(dt)[:19]
+                pdfs   = b.get("pdf_count", "?")
+                lines.append(f"  {i}. 📄 <b>{btype}</b> | 📅 {dt_str} | PDFs: <code>{pdfs}</code>")
+        else:
+            lines.append("  <i>No manual backups found.</i>")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📊 Monthly: <code>{len(monthly)}</code> | Manual/Weekly: <code>{len(manual)}</code>")
+        msg_text = "\n".join(lines)
+        if len(msg_text) > 4000:
+            msg_text = msg_text[:4000] + "\n..."
+        await wait_msg.delete()
+        await message.answer(msg_text, parse_mode="HTML")
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
 async def weekly_backup():
     while True:
-        now = datetime.now()
+        now = now_local()
         days_until_sunday = (6 - now.weekday()) % 7
         if days_until_sunday == 0 and now.hour >= 3: days_until_sunday = 7
         target = now.replace(hour=3, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
-        
-        # Calculate seconds to wait
         wait_seconds = (target - now).total_seconds()
-        # logging.info(f"⏳ System: Weekly Backup scheduled in {wait_seconds/3600:.1f} hours.")
-        await asyncio.sleep(wait_seconds)
-        
+        await asyncio.sleep(max(wait_seconds, 1))
+
         try:
-            # Reuse the comprehensive backup generator
             filename = await asyncio.to_thread(generate_system_backup)
-            
             if filename:
-                # Upload to Drive (Monthly Vault)
-                link = await asyncio.to_thread(upload_to_drive, filename)
-                
+                now_ts = now_local()
+                date_label = now_ts.strftime("%Y-%m-%d")
+                pdf_count   = col_pdfs.count_documents({})   if col_pdfs   is not None else 0
+                admin_count = col_admins.count_documents({}) if col_admins is not None else 0
+
+                try:
+                    db = db_client["MSANodeDB"]
+                    db["bot4_backups"].update_one(
+                        {"date": date_label, "type": "weekly"},
+                        {"$set": {
+                            "date":        date_label,
+                            "type":        "weekly",
+                            "pdf_count":   pdf_count,
+                            "admin_count": admin_count,
+                            "created_at":  now_ts
+                        }},
+                        upsert=True
+                    )
+                except Exception as db_err:
+                    print(f"⚠️ Weekly backup DB record failed: {db_err}")
+
                 caption = (
                     f"🛡 <b>WEEKLY AUTO-BACKUP</b>\n"
-                    f"📅 <code>{datetime.now().strftime('%Y-%m-%d')}</code>\n"
-                    f"☁️ <a href='{link}'><b>Google Drive Link</b></a>"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📅 <b>Date:</b> <code>{now_ts.strftime('%b %d, %Y  ·  %I:%M %p')}</code>\n"
+                    f"📚 <b>PDFs:</b> <code>{pdf_count}</code>  |  "
+                    f"👥 <b>Admins:</b> <code>{admin_count}</code>\n"
+                    f"💾 <b>Storage:</b> MongoDB Atlas"
                 )
-                
-                # Send to Owner
                 try:
-                    await bot.send_document(
-                        OWNER_ID, 
-                        FSInputFile(filename), 
-                        caption=caption, 
-                        parse_mode="HTML"
-                    )
+                    await bot.send_document(OWNER_ID, FSInputFile(filename), caption=caption, parse_mode="HTML")
                 except Exception as e:
-                    logging.error(f"Failed to DM Owner backup: {e}")
-                    
-                # Cleanup
+                    logging.error(f"Weekly backup DM failed: {e}")
                 if os.path.exists(filename):
-                     os.remove(filename)
-            
+                    os.remove(filename)
+
         except Exception as e:
             await notify_error_bot4("Weekly Backup Failed", str(e))
 
@@ -1260,1223 +1757,135 @@ def create_goldmine_pdf(text, filename):
     # Build PDF
     doc.build(story, onFirstPage=draw_canvas_extras, onLaterPages=draw_canvas_extras)
 
+
 def get_drive_service():
+    """Authenticate and return a Google Drive service object."""
     creds = None
     if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'rb') as t: creds = pickle.load(t)
+        with open(TOKEN_FILE, 'rb') as t:
+            creds = pickle.load(t)
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token: creds.refresh(Request())
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, ['https://www.googleapis.com/auth/drive.file'])
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS_FILE,
+                ['https://www.googleapis.com/auth/drive.file']
+            )
             creds = flow.run_local_server(port=8080)
-        with open(TOKEN_FILE, 'wb') as t: pickle.dump(creds, t)
+        with open(TOKEN_FILE, 'wb') as t:
+            pickle.dump(creds, t)
     return build('drive', 'v3', credentials=creds)
 
-def upload_to_drive(filename):
-    service = get_drive_service()
+
+def _ensure_drive_folder(service, folder_name, parent_id=None):
+    """
+    Ensures a folder exists inside a parent folder. 
+    Returns the folder ID.
+    """
+    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
     
-    # Generate dynamic folder name (e.g., "JANUARY 2026")
-    # User Request: "HANUARY 2026" format
-    month_name = datetime.now().strftime('%B %Y').upper()
-    folder_name = month_name
-    
-    # Check if folder exists
-    if PARENT_FOLDER_ID:
-        query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and '{PARENT_FOLDER_ID}' in parents and trashed = false"
-    else:
-        query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        
     results = service.files().list(q=query, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     folders = results.get('files', [])
     
     if folders:
-        target_folder_id = folders[0]['id']
-    else:
-        folder_metadata = {
-            'name': folder_name,
-            'mimeType': 'application/vnd.google-apps.folder'
-        }
-        if PARENT_FOLDER_ID:
-            folder_metadata['parents'] = [PARENT_FOLDER_ID]
-            
-        folder = service.files().create(body=folder_metadata, fields='id').execute()
-        target_folder_id = folder.get('id')
-        print(f"◈ System: Created new monthly vault: {folder_name}")
-
-    # Upload file
-    media = MediaIoBaseUpload(io.FileIO(filename, 'rb'), mimetype='application/pdf')
-    file_metadata = {'name': filename, 'parents': [target_folder_id]}
-    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True).execute()
-    
-    service.permissions().create(fileId=file.get('id'), body={'type': 'anyone', 'role': 'reader'}).execute()
-    
-    return file.get('webViewLink')
-
-def download_from_drive(filename):
-    """Downloads a file from Drive by name to local storage."""
-    service = get_drive_service()
-    
-    # 1. Search for file by name (Global search to find it in subfolders)
-    # We remove 'parents' check because files are inside Month Folders, not the root.
-    query = f"name = '{filename}' and mimeType = 'application/pdf' and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-    files = results.get('files', [])
-    
-    if not files:
-        return None
-        
-    file_id = files[0]['id']
-    
-    # 2. Download content
-    request = service.files().get_media(fileId=file_id)
-    fh = io.FileIO(filename, 'wb')
-    downloader = MediaIoBaseDownload(fh, request)
-    
-    done = False
-    while done is False:
-        status, done = downloader.next_chunk()
-        
-    return filename
-
-def get_recycle_bin_id(service):
-    """Finds or creates 'Recycle Bin' folder inside the Vault."""
-    if PARENT_FOLDER_ID:
-        query = f"mimeType='application/vnd.google-apps.folder' and name='Recycle Bin' and '{PARENT_FOLDER_ID}' in parents and trashed=false"
-    else:
-        # Fallback: Search globally if no parent defined (Not ideal, but prevents crash)
-        query = "mimeType='application/vnd.google-apps.folder' and name='Recycle Bin' and trashed=false"
-        
-    results = service.files().list(q=query, fields="files(id)").execute()
-    files = results.get('files', [])
-    
-    if files:
-        return files[0]['id']
+        return folders[0]['id']
     else:
         # Create it
         metadata = {
-            'name': 'Recycle Bin',
+            'name': folder_name,
             'mimeType': 'application/vnd.google-apps.folder'
         }
-        if PARENT_FOLDER_ID:
-            metadata['parents'] = [PARENT_FOLDER_ID]
+        if parent_id:
+            metadata['parents'] = [parent_id]
             
-        folder = service.files().create(body=metadata, fields='id').execute()
+        folder = service.files().create(body=metadata, fields='id', supportsAllDrives=True).execute()
+        print(f"◈ Drive: Created folder '{folder_name}'")
         return folder.get('id')
 
-def move_to_recycle_bin(filename):
-    """Moves a file to the Recycle Bin folder in Drive."""
-    service = get_drive_service()
-    
-    # 1. Search for file by name
-    query = f"name = '{filename}' and mimeType = 'application/pdf' and trashed = false"
-    results = service.files().list(q=query, fields="files(id, parents)").execute()
-    files = results.get('files', [])
-    
-    if not files:
-        return False
+def upload_to_drive(filename):
+    """Upload a PDF to a YEAR/MONTH sub-folder structure inside PARENT_FOLDER_ID."""
+    try:
+        service = get_drive_service()
         
-    bin_id = get_recycle_bin_id(service)
-    
-    # 2. Move file
-    try:
-        for f in files:
-            # Move key: addParents = bin, removeParents = current
-            prev_parents = ",".join(f.get('parents', []))
-            service.files().update(
-                fileId=f['id'],
-                addParents=bin_id,
-                removeParents=prev_parents,
-                fields='id, parents'
-            ).execute()
-        return True
-    except:
-        return False
-
-def rename_file_in_drive(old_filename, new_filename):
-    """Renames a file in Drive."""
-    service = get_drive_service()
-    
-    # 1. Search for file
-    query = f"name = '{old_filename}' and mimeType = 'application/pdf' and trashed = false"
-    results = service.files().list(q=query, fields="files(id)").execute()
-    files = results.get('files', [])
-    
-    if not files:
-        return False
-    
-    # 2. Rename (first match)
-    file_id = files[0]['id']
-    try:
-        service.files().update(
-            fileId=file_id,
-            body={'name': new_filename},
-            fields='id, name'
+        # 1. Get Root (PARENT_FOLDER_ID from env, or Root of Drive if None)
+        root_id = PARENT_FOLDER_ID if PARENT_FOLDER_ID else None
+        
+        # 2. Ensure YEAR Folder (e.g. "2026")
+        year_str = datetime.now().strftime('%Y')
+        year_folder_id = _ensure_drive_folder(service, year_str, root_id)
+        
+        # 3. Ensure MONTH Folder (e.g. "FEBRUARY")
+        month_str = datetime.now().strftime('%B').upper()
+        month_folder_id = _ensure_drive_folder(service, month_str, year_folder_id)
+        
+        # 4. Upload File to Month Folder
+        print(f"◈ Uploading to: {year_str}/{month_str}")
+        media = MediaIoBaseUpload(io.FileIO(filename, 'rb'), mimetype='application/pdf')
+        file_metadata = {'name': filename, 'parents': [month_folder_id]}
+        
+        file = service.files().create(
+            body=file_metadata, media_body=media,
+            fields='id, webViewLink', supportsAllDrives=True
         ).execute()
-        return True
-    except:
-        return False
 
-def empty_drive_folder(folder_id):
-    """Permanently deletes all files in a folder."""
-    service = get_drive_service()
-    
-    deleted_count = 0
-    page_token = None
-    
-    while True:
-        # Search for all children
-        q = f"'{folder_id}' in parents and trashed = false"
-        results = service.files().list(q=q, fields="nextPageToken, files(id)", pageToken=page_token).execute()
-        items = results.get('files', [])
-        
-        for item in items:
-            try:
-                service.files().delete(fileId=item['id']).execute()
-                deleted_count += 1
-            except:
-                pass
-        
-        page_token = results.get('nextPageToken')
-        if not page_token:
-            break
-            
-            break
-            
-    return deleted_count
+        # 5. Make Public
+        service.permissions().create(
+            fileId=file.get('id'),
+            body={'type': 'anyone', 'role': 'reader'}
+        ).execute()
 
-def list_drive_contents(folder_id):
-    """Fetches folders and files for the Explorer."""
-    service = get_drive_service()
-    
-    # 1. Get Folder Name (for header)
-    try:
-        if folder_id == 'root':
-            folder_name = "My Drive (Root)"
-            parents = []
-        else:
-            f = service.files().get(fileId=folder_id, fields="name, parents", supportsAllDrives=True).execute()
-            folder_name = f.get('name', 'Unknown Folder')
-            parents = f.get('parents', [])
-    except:
-        folder_name = "Unknown Folder"
-        parents = []
+        return file.get('webViewLink', '')
         
-    parent_id = parents[0] if parents else None
-    
-    # 2. List Items (Folders then Files)
-    query = f"'{folder_id}' in parents and trashed = false"
-    # Folders first
-    q_folders = f"{query} and mimeType = 'application/vnd.google-apps.folder'"
-    res_folders = service.files().list(
-        q=q_folders, 
-        fields="files(id, name)", 
-        orderBy="name",
-        pageSize=1000,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
-    ).execute()
-    folders = res_folders.get('files', [])
-    
-    # Files next
-    q_files = f"{query} and mimeType != 'application/vnd.google-apps.folder'"
-    res_files = service.files().list(
-        q=q_files, 
-        fields="files(id, name, webViewLink, size)", 
-        orderBy="name",
-        pageSize=1000,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
-    ).execute()
-    files = res_files.get('files', [])
-    
-    
-    return folder_name, parent_id, folders, files
+    except Exception as e:
+        print(f"❌ Upload Failed: {e}")
+        traceback.print_exc()
+        return ""
 
-def find_folder_by_name(name):
-    """Searches for a specific folder by name (Smart Strict)."""
-    service = get_drive_service()
-    # 1. Broad Search to find candidates
-    query = f"mimeType = 'application/vnd.google-apps.folder' and name contains '{name}' and trashed = false"
-    res = service.files().list(
-        q=query, 
-        fields="files(id, name)", 
-        pageSize=10, # Check top 10 matches
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
-    ).execute()
-    
-    files = res.get('files', [])
-    
-    # 2. Strict Python Filter (Case Insensitive)
-    for f in files:
-        if f['name'].strip().lower() == name.lower():
-            return f['id']
-            
+
+
+
+def _extract_drive_id(link: str):
+    import re
+    if not link: return None
+    match = re.search(r'/file/d/([^/?\s]+)', link)
+    if match: return match.group(1)
+    match = re.search(r'[?&]id=([^&\s]+)', link)
+    if match: return match.group(1)
     return None
 
-def get_folder_parent(folder_id):
-    """Gets the parent ID of a folder."""
-    service = get_drive_service()
+def _drive_delete_file(link: str) -> bool:
+    """Delete a file from Google Drive given its webViewLink. Returns True on success."""
     try:
-        f = service.files().get(fileId=folder_id, fields="parents", supportsAllDrives=True).execute()
-        parents = f.get('parents', [])
-        return parents[0] if parents else None
-    except:
-        return None
-
-def get_folder_size(folder_id):
-    """Recursively calculates total size and file count of a Drive folder."""
-    try:
+        file_id = _extract_drive_id(link)
+        if not file_id:
+            return False
         service = get_drive_service()
-        total_bytes = 0
-        file_count = 0
-        
-        # List all files in this folder (including subfolders)
-        query = f"'{folder_id}' in parents and trashed = false"
-        results = service.files().list(
-            q=query,
-            fields="files(id, name, mimeType, size)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
+        service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+        return True
+    except Exception as e:
+        logging.warning(f"Drive delete failed: {e}")
+        return False
+
+
+def _drive_rename_file(link: str, new_name: str) -> bool:
+    """Rename a PDF on Google Drive. Returns True on success."""
+    try:
+        file_id = _extract_drive_id(link)
+        if not file_id:
+            return False
+        service = get_drive_service()
+        service.files().update(
+            fileId=file_id,
+            body={'name': new_name + '.pdf'},
+            supportsAllDrives=True
         ).execute()
-        
-        items = results.get('files', [])
-        
-        for item in items:
-            mime_type = item.get('mimeType', '')
-            
-            # If it's a folder, recurse into it
-            if mime_type == 'application/vnd.google-apps.folder':
-                folder_bytes, folder_files = get_folder_size(item['id'])
-                total_bytes += folder_bytes
-                file_count += folder_files
-            else:
-                # It's a file
-                file_count += 1
-                # Google Docs/Sheets/Slides don't have a 'size' field
-                if 'size' in item:
-                    total_bytes += int(item.get('size', 0))
-        
-        return total_bytes, file_count
-        
+        return True
     except Exception as e:
-        print(f"Folder Size Error: {e}")
-        raise e
-
-# ==========================================
-# 🤖 HANDLERS
-# ==========================================
-
-@dp.message(Command("start"))
-@dp.message(F.text == "🔙 Back to Menu")
-async def start(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    
-    # 1. SILENT BAN CHECK
-    if is_banned(user_id): return # Ignore completely
-
-    # 2. ADMIN CHECK
-    if is_admin(user_id):
-        await state.clear()
-        reply_markup = get_main_menu(user_id)
-        
-        # Determine Greeting
-        if user_id == OWNER_ID:
-            greeting = "💎 **MSA NODE BOT 4**\nAt your command, Master."
-        else:
-            # Fetch Role
-            admin_doc = col_admins.find_one({"user_id": user_id})
-            if not admin_doc: admin_doc = col_admins.find_one({"user_id": str(user_id)})
-            
-            role = admin_doc.get("role", "Authorized Admin") if admin_doc else "Authorized Admin"
-            name = message.from_user.full_name
-            
-            greeting = (
-                f"💎 **MSA NODE SYSTEMS**\n"
-                f"ASSIGNED BY 👑 **OWNER:** MSA\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🛡️ **ACCESS GRANTED**\n"
-                f"👤 **Officer:** {name}\n"
-                f"🔰 **Rank:** `{role}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🚀 System initialized."
-            )
-
-        await message.answer(greeting, reply_markup=reply_markup)
-        return
-
-    # 3. STRANGER / SPAM LOGIC
-    now = time.time()
-    
-    # Initialize or reset tracker if > 60s
-    if user_id not in START_TRACKER or (now - START_TRACKER[user_id][0] > 60):
-        START_TRACKER[user_id] = [now, 1]
-    else:
-        START_TRACKER[user_id][1] += 1
-        
-    # CHECK FLOOD
-    if START_TRACKER[user_id][1] > 5:
-        # AUTO-BAN EXECUTION
-        if not is_banned(user_id): # Double check
-            try:
-                if col_banned is not None:
-                    col_banned.insert_one({
-                        "user_id": user_id,
-                        "reason": "Auto-Ban: Spamming /start",
-                        "timestamp": datetime.now()
-                    })
-            except Exception as e:
-                logging.error(f"Failed to ban user {user_id}: {e}")
-            # Notify Owner One Last Time
-            alert = (
-                f"🚨 **SECURITY: AUTO-BANNED USER**\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🆔 `{user_id}`\n"
-                f"⚠️ Reason: Spamming /start > 5 times/min.\n"
-                f"⛔ **Status:** PERMANENTLY BLOCKED."
-            )
-            try: await bot.send_message(OWNER_ID, alert)
-            except: pass
-        return
-
-    # 4. UNAUTHORIZED (Fallthrough)
-    # The SecurityMiddleware has already alerted the Owner.
-    # We just silently return or can send a generic denial if preferred.
-    return
-
-@dp.message(F.text == "📋 Show Library")
-async def show_library(message: types.Message, state: FSMContext):
-    # 1. Main Menu Fork
-    await message.answer(
-        "📚 **VAULT LIBRARY ACCESS**\n"
-        "Select your preferred viewing mode:",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="📋 DISPLAY ALL"), KeyboardButton(text="🔍 SEARCH")],
-                [KeyboardButton(text="🔙 Back to Menu")]
-            ], resize_keyboard=True
-        )
-    )
-    await state.set_state(BotState.choosing_retrieval_mode) # Reusing existing generic state or create specific?
-    # Actually let's use a specific one to avoid confusion with "Get Link".
-    # We'll use choosing_retrieval_mode IS for Get Link. 
-    # Let's use a new handler or reuse "browsing_library" state for choice?
-    # Let's make a temp state or just handle it. 
-    # Wait, simple way: Just handle text in a new function? 
-    # But we need state. 
-    # Let's use `browsing_library` but initial step.
-    # actually let's define `choosing_library_mode`.
-    # Avoiding adding too many states. Let's reuse `browsing_library` and check text.
-    await state.set_state(BotState.browsing_library)
-    await state.update_data(lib_mode="menu")
-
-@dp.message(BotState.browsing_library)
-async def handle_library_logic(message: types.Message, state: FSMContext):
-    text = message.text
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    data = await state.get_data()
-    mode = data.get("lib_mode", "menu")
-    
-    # === MENU SELECTION ===
-    if mode == "menu":
-        if text == "📋 DISPLAY ALL":
-            # Initialize Pagination
-            await state.update_data(lib_mode="display", page=0)
-            await render_library_page(message, state, page=0)
-            
-        elif text == "🔍 SEARCH":
-            # Fetch Docs for Reference List
-            docs = list(col_pdfs.find().sort("timestamp", -1))
-            list_msg = ["📂 **AVAILABLE FILES**", "━━━━━━━━━━━━━━━━━━━━"]
-            list_msg.extend(get_formatted_file_list(docs, limit=30)) # Show top 30 as reference
-            
-            list_text = "\n".join(list_msg)
-            if len(list_text) > 3500: list_text = list_text[:3500] + "\n..." # Safe truncate
-
-            await message.answer(
-                f"{list_text}\n\n"
-                "🔍 **SEARCH PARAMETERS**\n"
-                "Enter a **Project Code** (e.g., `S19`) or **Index Number** (e.g., `1`).",
-                reply_markup=ReplyKeyboardMarkup(
-                    keyboard=[
-                        [KeyboardButton(text="⬅️ BACK")],
-                        [KeyboardButton(text="🔙 Back to Menu")]
-                    ],
-                    resize_keyboard=True
-                ),
-                parse_mode="HTML"
-            )
-            await state.set_state(BotState.searching_library)
-            
-        else:
-            await message.answer("⚠️ Invalid Option.")
-            
-    # === BROWSING (PAGINATION) ===
-    elif mode == "display":
-        current_page = data.get("page", 0)
-        
-        # Handle BACK button - return to mode selection
-        if text == "⬅️ BACK":
-            await state.update_data(lib_mode="menu")
-            await show_library(message, state)
-            return
-        
-        if text == "➡️ NEXT":
-            await render_library_page(message, state, page=current_page + 1)
-        elif text == "⬅️ PREV":
-            await render_library_page(message, state, page=current_page - 1)
-        # Handle "Back to Menu" is top level check
-        elif text == "🔍 SEARCH": # Allow switching
-            await state.set_state(BotState.searching_library)
-            await message.answer("🔍 Enter Code/Index:")
-        else:
-            await message.answer("⚠️ Navigation only. Use buttons.")
-
-async def render_library_page(message, state, page):
-    limit = 20
-    docs = list(col_pdfs.find().sort("timestamp", 1))
-    total_docs = len(docs)
-    
-    # Boundary Check
-    max_page = (total_docs - 1) // limit
-    if page < 0: page = 0
-    if page > max_page: page = max_page
-    
-    # Slice
-    start_idx = page * limit
-    end_idx = start_idx + limit
-    page_docs = docs[start_idx:end_idx]
-    
-    # Format (Using standard)
-    lines = []
-    # Re-use formatted list logic manually or call helper?
-    # Helper uses different index logic (always starts at 1).
-    # We want absolute index.
-    
-    for i, doc in enumerate(page_docs):
-        abs_idx = start_idx + i + 1
-        code = doc.get("code")
-        ts = doc.get("timestamp")
-        date_str = ts.strftime('%d-%b %I:%M %p') if ts else "?"
-        link = doc.get('link')
-        
-        # Format: 1. CODE
-        if link:
-            line = f"<b>{abs_idx}. {code}</b>\n<i>{date_str}</i> • <a href='{link}'>🔗 Link</a>"
-        else:
-            line = f"<b>{abs_idx}. {code}</b>\n<i>{date_str}</i>"
-        lines.append(line)
-        
-    text_content = "\n".join(lines)
-    if not text_content: text_content = "EMPTY PAGE"
-    
-    # Header
-    header = (
-        f"📋 **LIBRARY INDEX** (Page {page+1}/{max_page+1})\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{text_content}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Total: {total_docs} Files"
-    )
-    
-    await state.update_data(page=page)
-    
-    # Build Nav Buttons
-    builder = ReplyKeyboardBuilder()
-    row_btns = []
-    if page > 0: row_btns.append(KeyboardButton(text="⬅️ PREV"))
-    if page < max_page: row_btns.append(KeyboardButton(text="➡️ NEXT"))
-    if row_btns: builder.row(*row_btns)
-    
-    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
-    # Send
-    await message.answer(header, reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML", disable_web_page_preview=True)
-
-@dp.message(BotState.searching_library)
-async def handle_library_search(message: types.Message, state: FSMContext):
-    text = message.text.strip().upper()
-    if text == "🔙 BACK TO MENU": return await start(message, state)
-    
-    # Handle BACK button - return to mode selection
-    if text == "⬅️ BACK":
-        await show_library(message, state)
-        return
-    
-    doc = None
-    all_docs = list(col_pdfs.find().sort("timestamp", 1))
-    
-    # 1. Try Index
-    if text.isdigit():
-        idx = int(text)
-        if 1 <= idx <= len(all_docs):
-            doc = all_docs[idx-1]
-    
-    # 2. Try Code
-    if not doc:
-        doc = next((d for d in all_docs if d.get('code') == text), None)
-        
-    if doc:
-        # DETAILED REPORT
-        code = doc.get('code')
-        link = doc.get('link', 'N/A')
-        ts = doc.get('timestamp')
-        date_str = ts.strftime('%d-%b-%Y %I:%M %p') if ts else "Unknown"
-        restored_mark = " 🔄<b>R</b>" if doc.get('restored', False) else ""
-        
-        # Check basic stats if available? (Usually not stored)
-        
-        msg = (
-            f"💎 <b>VAULT ITEM REPORT</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🆔 <b>Code:</b> <code>{code}</code>{restored_mark}\n"
-            f"📅 <b>Added:</b> <code>{date_str}</code>\n"
-            f"📂 <b>Status:</b> Active\n\n"
-            f"🔗 <b>Drive Link:</b>\n{link}\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        await message.answer(msg, parse_mode="HTML", disable_web_page_preview=True)
-        # Stay in search state for more searches?
-        await message.answer("🔍 Search another or '🔙 Back to Menu'.")
-    else:
-        await message.answer(f"❌ Record `{text}` not found in the Library.")
-
-@dp.message(F.text == "📊 Storage Info")
-async def storage_info(message: types.Message):
-    wait_msg = await message.answer("⏳ **Running Deep System Scan...**")
-    start_t = time.time()
-    
-    try:
-        # 1. MongoDB Health & Stats
-        t0 = time.time()
-        stats = db_client["MSANodeDB"].command("collstats", "pdf_library")
-        t_mongo = (time.time() - t0) * 1000
-        
-        m_count = stats.get('count', 0)
-        m_used = stats.get('size', 0) / (1024 * 1024)
-        m_limit = 512.0 # Cluster Limit
-        m_perc = (m_used / m_limit) * 100
-        
-        # 2. Drive Connectivity & Quota
-        service = get_drive_service()
-        about = service.about().get(fields="storageQuota, user").execute()
-        drive_user = about.get('user', {}).get('emailAddress', 'Unknown')
-        quota = about.get('storageQuota', {})
-        
-        total_limit_gb = int(quota.get('limit')) / (1024**3)
-        total_used_gb = int(quota.get('usage')) / (1024**3)
-        total_perc = (total_used_gb / total_limit_gb) * 100
-        
-        # 3. Vault Recursive Audit
-        target_id = PARENT_FOLDER_ID if PARENT_FOLDER_ID else 'root'
-        try:
-            vault_bytes, vault_count = get_folder_size(target_id)
-            scan_status = "✅ Deep Scan Complete"
-        except Exception as e:
-            print(f"Scan Warning: {e}")
-            vault_bytes, vault_count = 0, 0
-            scan_status = "⚠️ Partial Scan (Permission/Network)"
-
-        vault_mb = vault_bytes / (1024 * 1024)
-        
-        # 4. System Health Check
-        health_score = 100
-        issues = []
-        if total_perc > 90: health_score -= 20; issues.append("Drive Full")
-        if m_perc > 80: health_score -= 10; issues.append("DB Heavy")
-        if t_mongo > 150: health_score -= 5; issues.append("High Latency")
-        
-        health_emoji = "🟢 Excellent"
-        if health_score < 90: health_emoji = "🟡 Good"
-        if health_score < 70: health_emoji = "🔴 Critical"
-        
-        scan_time = time.time() - start_t
-
-        # Enhanced Stats
-        pdf_bin_count = col_trash.count_documents({}) if col_trash is not None else 0
-        locked_bin_count = col_trash_locked.count_documents({}) if col_trash_locked is not None else 0
-
-        msg = (
-            f"📊 **MASTER STORAGE ANALYTICS**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💚 **System Health:** {health_emoji} ({health_score}%)\n"
-            f"🕒 **Scan Time:** `{scan_time:.2f}s`\n"
-            f"📅 **Last Check:** `{datetime.now().strftime('%d-%b %I:%M %p')}`\n\n"
-            
-            f"🍃 **MONGODB CORE**\n"
-            f"• Active PDFs: `{m_count}` documents\n"
-            f"• PDF Bin: `{pdf_bin_count}` items\n"
-            f"• Locked Bin: `{locked_bin_count}` items\n"
-            f"• Storage: `{m_used:.2f} MB` / `{m_limit} MB`\n"
-            f"• Latency: `{t_mongo:.1f}ms` {'⚠️ (High)' if t_mongo > 150 else '✅'}\n"
-            f"`{generate_progress_bar(m_perc)}`\n\n"
-            
-            f"☁️ **GOOGLE DRIVE VAULT**\n"
-            f"• Account: `{drive_user}`\n"
-            f"• Scan Status: `{scan_status}`\n"
-            f"• Total Files: `{vault_count}` documents\n"
-            f"• Vault Size: `{vault_mb:.2f} MB`\n"
-            f"• Location: {'`Root`' if not PARENT_FOLDER_ID else f'`Folder ID: {PARENT_FOLDER_ID[:15]}...`'}\n\n"
-            
-            f"💿 **GLOBAL DRIVE QUOTA**\n"
-            f"• Used: `{total_used_gb:.2f} GB` / `{total_limit_gb:.0f} GB`\n"
-            f"• Free: `{total_limit_gb - total_used_gb:.2f} GB`\n"
-            f"`{generate_progress_bar(total_perc)}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{'✅ **ALL SYSTEMS OPERATIONAL**' if health_score == 100 else f'⚠️ **ISSUES DETECTED:** {', '.join(issues)}'}"
-        )
-        await wait_msg.delete()
-        await message.answer(msg, parse_mode="Markdown")
-        
-    except Exception as e:
-        if 'wait_msg' in locals(): await wait_msg.delete()
-        await message.answer(f"⚠️ **Analytics Error:** `{e}`")
-
-@dp.message(F.text == "📄 Generate PDF")
-async def gen_btn(message: types.Message, state: FSMContext):
-    await state.update_data(raw_script="")
-    
-    # Fetch last 5 codes (Newest on top)
-    recent_codes = []
-    try:
-        last_docs = list(col_pdfs.find({}, {"code": 1, "restored": 1}).sort("timestamp", -1).limit(5))
-        # User wants latest at bottom, so reverse the list of last 5
-        last_docs.reverse() 
-        
-        for i, d in enumerate(last_docs, 1): 
-            if "code" in d:
-                marker = " **[R]**" if d.get('restored', False) else ""
-                recent_codes.append(f"{i}. `{d['code']}`{marker}")
-    except: pass
-    
-    msg = "🔑 **AUTHENTICATED.**\n\nEnter your **Project Code** to begin:"
-    if recent_codes:
-        msg += f"\n\n🕒 **Recent (Latest ↓):**\n" + "\n".join(recent_codes)
-    else:
-        msg += "\n\n(No recent codes found)"
-
-    await message.answer(msg, reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True), parse_mode="Markdown")
-    await state.set_state(BotState.waiting_for_code)
-
-@dp.message(BotState.waiting_for_code)
-async def code_input(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Back to Menu": return await start(message, state)
-    
-    code = message.text.strip().upper()
-    exists = col_pdfs.find_one({"code": code})
-    
-    if exists:
-        # Strict Uniqueness Check (Requested by User)
-        await message.answer(
-            f"⛔ **ERROR: Code `{code}` Already Exists!**\n"
-            f"This code is already in use by another project.\n\n"
-            f"🔄 **Please enter a DIFFERENT Project Code:**",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
-        )
-        return # Stay in waiting_for_code state
-
-    await state.update_data(code=code)
-    await message.answer(
-        f"🖋 **Code `{code}` Available.**\n"
-        "📝 **Awaiting Content...**\nPaste your script or data now, Master.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
-    )
-    await state.set_state(BotState.processing_script)
-
-# Old Overwrite Handler Removed to enforce uniqueness
-# @dp.message(BotState.confirm_overwrite) ... REMOVED
-
-@dp.message(BotState.processing_script, F.text)
-async def merge_script(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Back to Menu": return await start(message, state)
-    
-    data = await state.get_data()
-    updated = data.get('raw_script', '') + "\n\n" + message.text
-    await state.update_data(raw_script=updated)
-    
-    if not data.get('timer_active'):
-        await state.update_data(timer_active=True)
-        
-        async def auto_finish(uid, st):
-            await asyncio.sleep(5)
-            await finalize_pdf(uid, st)
-            
-        asyncio.create_task(auto_finish(message.from_user.id, state))
-
-async def finalize_pdf(user_id, state):
-    global DAILY_STATS_BOT4
-    data = await state.get_data()
-    code, script = data.get('code'), data.get('raw_script', '').strip()
-    if not script or not code: return
-    
-    msg = await bot.send_message(user_id, "⏳ **Compiling Assets...**")
-    filename = f"{code}.pdf"
-    
-    try:
-        await asyncio.to_thread(create_goldmine_pdf, script, filename)
-        link = await asyncio.to_thread(upload_to_drive, filename)
-        
-        col_pdfs.delete_many({"code": code}) 
-        col_pdfs.insert_one({
-            "code": code, 
-            "link": link, 
-            "timestamp": datetime.now()
-        })
-        
-        await bot.send_document(
-            user_id, 
-            FSInputFile(filename), 
-            caption=f"✅ **READY**\nCode: `{code}`\n🔗 **Link:** {link}"
-        )
-        
-        # Track success
-        DAILY_STATS_BOT4["pdfs_generated"] += 1
-        
-        await asyncio.sleep(2)
-        if os.path.exists(filename):
-            try:
-                os.remove(filename)
-                print(f"◈ System: {filename} purged successfully.")
-            except PermissionError:
-                await asyncio.sleep(3)
-                try:
-                    os.remove(filename)
-                except:
-                    print(f"◈ Warning: {filename} locked by system. Janitor will clear it later.")
-                
-    except Exception as e: 
-        await bot.send_message(user_id, f"❌ Error: `{e}`")
-        await notify_error_bot4("PDF Generation Failed", f"Code: {code} | Error: {e}")
-        DAILY_STATS_BOT4["errors"] += 1
-    
-    await state.clear()
-
-@dp.message(F.text == "📋 Show Library")
-async def list_library(message: types.Message):
-    docs = list(col_pdfs.find().sort("timestamp", 1))
-    
-    if not docs: 
-        return await message.answer("📂 **Vault Empty.** No assets found.")
-    
-    seen_codes = set()
-    res = ["📋 **LIBRARY INDEX (SYNCED)**", "━━━━━━━━━━━━━━━━━━━━"]
-    count = 1
-    
-    for d in docs:
-        code = d.get('code')
-        if code and code not in seen_codes:
-            timestamp = d.get('timestamp', datetime.now()).strftime('%d/%m')
-            restored_mark = " **[R]**" if d.get('restored', False) else ""
-            res.append(f"{count}. `{code}`{restored_mark} — [{timestamp}]")
-            seen_codes.add(code)
-            count += 1
-            if count > 25: break
-            
-    res.append("━━━━━━━━━━━━━━━━━━━━")
-    res.append("💎 *System: God-Mode filtered entries.*")
-    await message.answer("\n".join(res), parse_mode="Markdown")
-
-@dp.message(F.text == "♻️ Recycle Bin")
-async def recycle_bin_btn(message: types.Message, state: FSMContext):
-    await state.clear()
-    
-    # Count items in bin
-    count = col_trash.count_documents({}) if col_trash is not None else 0
-    
-    if count == 0:
-        await message.answer("♻️ **RECYCLE BIN IS EMPTY**", parse_mode="Markdown")
-        return
-    
-    # Show direct action menu
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="👁️ VIEW DELETED"), KeyboardButton(text="♻️ RESTORE"))
-    builder.row(KeyboardButton(text="🔥 PURGE"), KeyboardButton(text="⬅️ BACK"))
-    builder.row(KeyboardButton(text="🔙 Back to Menu"))
-    
-    await message.answer(
-        f"♻️ **RECYCLE BIN**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗑 Items in Bin: `{count}`\n\n"
-        f"Select Action:",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    await state.set_state(BotState.bin_menu)
-
-@dp.message(BotState.bin_category_select)
-async def handle_bin_category_selection(message: types.Message, state: FSMContext):
-    text = message.text
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    if text == "📂 PDF BIN":
-        await state.update_data(bin_category="PDF")
-        target_col = col_trash
-        label = "PDF BIN"
-    elif text == "🔒 LOCKED BIN":
-        await state.update_data(bin_category="LOCKED")
-        target_col = col_trash_locked
-        label = "LOCKED CONTENT BIN"
-    else:
-        await message.answer("⚠️ Invalid Selection.")
-        return
-
-    # Count items
-    count = target_col.count_documents({}) if target_col is not None else 0
-    
-    if count == 0:
-        await message.answer(f"♻️ **{label} IS EMPTY**", parse_mode="Markdown")
-        # Stay in category select or go back? Better stay or re-show options.
-        # Actually, let's show the menu anyway so they can see it's empty, or just return.
-        # Standard behavior: show menu but maybe disable actions? 
-        # For consistency with previous code, if empty, just tell them.
-        return
-
-    # Show Action Menu
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="👁️ VIEW DELETED"), KeyboardButton(text="♻️ RESTORE"))
-    builder.row(KeyboardButton(text="🔥 PURGE"), KeyboardButton(text="🔙 Back to Menu"))
-    
-    await message.answer(
-        f"♻️ **{label} MANAGER**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗑 Items in Bin: `{count}`\n\n"
-        f"Select Action:",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    await state.set_state(BotState.bin_menu)
-
-@dp.message(BotState.bin_menu)
-async def handle_bin_menu_selection(message: types.Message, state: FSMContext):
-    text = message.text
-    if text == "🔙 Back to Menu" or text == "⬅️ BACK": return await start(message, state)
-    
-    # Always use col_trash (Locked bin removed)
-    
-    docs = list(col_trash.find().sort("deleted_at", 1))
-    
-    if text == "👁️ VIEW DELETED":
-         # Use Pagination
-         if not docs:
-             await message.answer("🗑 **BIN IS EMPTY**")
-             return
-         await state.update_data(bin_page=0, bin_mode="view")
-         await render_bin_page(message, state, page=0)
-         await state.set_state(BotState.bin_viewing)
-         
-    elif text == "♻️ RESTORE":
-         await ask_method(message, state, "RESTORE")
-         
-    elif text == "🔥 PURGE":
-         await ask_method(message, state, "PURGE")
-    
-    else:
-        await message.answer("⚠️ Invalid Option.")
-
-async def ask_method(message, state, action):
-    await state.update_data(bin_action=action)
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="👤 SINGLE"), KeyboardButton(text="🔢 BULK RANGE"))
-    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
-    await message.answer(
-        f"⚙️ **{action} MODE SELECTED**\n"
-        f"Select Method:",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    await state.set_state(BotState.bin_choosing_method)
-
-@dp.message(BotState.bin_choosing_method)
-async def handle_bin_method_selection(message: types.Message, state: FSMContext):
-    text = message.text
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    # Handle BACK button - return to bin menu
-    if text == "⬅️ BACK":
-        await recycle_bin_btn(message, state)
-        return
-    
-    data = await state.get_data()
-    action = data.get("bin_action", "RESTORE")
-    
-    # Fetch all bin items
-    docs = list(col_trash.find().sort("deleted_at", 1))
-    
-    if not docs:
-        await message.answer("🗑 **BIN IS EMPTY**")
-        return
-    
-    # Build available items list
-    lines = ["♻️ **AVAILABLE ITEMS IN BIN**", "━━━━━━━━━━━━━━━━━━━━"]
-    for i, doc in enumerate(docs, 1):
-        code = doc.get('code', 'Unknown')
-        deleted_at = doc.get('deleted_at')
-        time_str = deleted_at.strftime('%d-%b %I:%M %p') if deleted_at else "Unknown"
-        lines.append(f"{i}. `{code}` • 🗑 {time_str}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📊 Total: {len(docs)} Items\n")
-    
-    # Show list first
-    await message.answer("\n".join(lines), parse_mode="Markdown")
-    
-    if text == "👤 SINGLE":
-        # Create buttons for each available item
-        builder = ReplyKeyboardBuilder()
-        for i, doc in enumerate(docs, 1):
-            code = doc.get('code', 'Unknown')
-            builder.add(KeyboardButton(text=f"{i}"))
-        builder.adjust(5)  # 5 buttons per row
-        builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-        
-        await message.answer(
-            f"👤 **SINGLE {action}**\n"
-            f"Select the **Index** to {action.lower()}:",
-            reply_markup=builder.as_markup(resize_keyboard=True),
-            parse_mode="Markdown"
-        )
-        if action == "RESTORE": await state.set_state(BotState.bin_restoring)
-        else: await state.set_state(BotState.bin_purging)
-        
-    elif text == "🔢 BULK RANGE":
-        await message.answer(
-            f"🔢 **BULK {action}**\n"
-            f"Enter the **Index Range** (e.g. `1-{len(docs)}`) to {action.lower()}.\n"
-            "Index 1 = Oldest Deleted Item.",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="⬅️ BACK")],
-                    [KeyboardButton(text="🔙 Back to Menu")]
-                ],
-                resize_keyboard=True
-            ),
-            parse_mode="Markdown"
-        )
-        if action == "RESTORE": await state.set_state(BotState.bin_restoring)
-        else: await state.set_state(BotState.bin_purging)
-        
-    else:
-        await message.answer("⚠️ Invalid.")
-
-@dp.message(BotState.bin_viewing)
-async def handle_bin_nav(message: types.Message, state: FSMContext):
-    text = message.text
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    # Handle BACK button - return to bin menu
-    if text == "⬅️ BACK":
-        await recycle_bin_btn(message, state)
-        return
-    
-    data = await state.get_data()
-    page = data.get("bin_page", 0)
-    
-    if text == "➡️ NEXT":
-        await render_bin_page(message, state, page + 1)
-    elif text == "⬅️ PREV":
-        await render_bin_page(message, state, page - 1)
-    else:
-        await message.answer("⚠️ Navigation only.")
-
-async def render_bin_page(message, state, page):
-    limit = 20
-    # Always use col_trash
-    docs = list(col_trash.find().sort("deleted_at", 1))
-    total_docs = len(docs)
-    
-    max_page = (total_docs - 1) // limit
-    if page < 0: page = 0
-    if page > max_page: page = max_page
-    
-    start_idx = page * limit
-    end_idx = start_idx + limit
-    page_docs = docs[start_idx:end_idx]
-    
-    lines = []
-    for i, doc in enumerate(page_docs):
-        idx = start_idx + i + 1
-        code = doc.get('code')
-        ts = doc.get("deleted_at")
-        # 12h Format Request: 12 am pm format
-        date_str = ts.strftime('%d-%b %I:%M %p') if ts else "?"
-        lines.append(f"<b>{idx}. {code}</b>\n❌ <i>Deleted: {date_str}</i>")
-        
-    content = "\n".join(lines)
-    
-    header = (
-        f"🗑 **DELETED ITEMS** (Page {page+1}/{max_page+1})\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{content}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"items: {total_docs}"
-    )
-    
-    await state.update_data(bin_page=page)
-    
-    builder = ReplyKeyboardBuilder()
-    row = []
-    if page > 0: row.append(KeyboardButton(text="⬅️ PREV"))
-    if page < max_page: row.append(KeyboardButton(text="➡️ NEXT"))
-    if row: builder.row(*row)
-    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
-    await message.answer(header, reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML")
-
-@dp.message(BotState.bin_restoring)
-async def handle_bin_restore(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    # Handle BACK button - return to bin menu
-    if text == "⬅️ BACK":
-        await recycle_bin_btn(message, state)
-        return
-    
-    # Range Logic
-    try:
-        if "-" in text:
-            s, e = map(int, text.split("-"))
-        elif text.isdigit():
-            s = int(text)
-            e = s
-        else:
-            await message.answer("⚠️ Enter valid index or range (e.g. `1` or `1-5`).")
-            return
-            
-        # Bounds check
-        docs = list(col_trash.find().sort("deleted_at", 1))
-        
-        if s < 1 or e > len(docs) or s > e:
-            await message.answer(
-                f"❌ **Invalid Range**\n"
-                f"Valid range: 1-{len(docs)}\n"
-                f"Please enter a valid index or range.",
-                parse_mode="Markdown"
-            )
-            return
-            
-        targets = docs[s-1 : e]
-        
-        await message.answer(f"⏳ Restoring {len(targets)} items...")
-        
-        count = 0
-        for doc in targets:
-            # RESTORE LOGIC
-            restore_doc = doc.copy()
-            if "_id" in restore_doc: del restore_doc["_id"]
-            if "deleted_at" in restore_doc: del restore_doc["deleted_at"]
-            
-            # MARK AS RESTORED (Highlight)
-            restore_doc['restored'] = True
-            
-            try:
-                col_pdfs.insert_one(restore_doc)
-                col_trash.delete_one({"_id": doc["_id"]})
-                count += 1
-            except Exception as e:
-                print(f"Restore Error: {e}")
-                
-        await message.answer(f"✅ **SUCCESS:** {count} items restored to PDF Library.", parse_mode="Markdown")
-        await start(message, state)
-        
-    except ValueError:
-        await message.answer("⚠️ Invalid number format.")
-
-@dp.message(BotState.bin_purging)
-async def handle_bin_purge(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    # Store range for confirmation
-    try:
-        if "-" in text:
-            s, e = map(int, text.split("-"))
-        elif text.isdigit():
-            s = int(text)
-            e = s
-        else:
-             await message.answer("⚠️ Invalid.")
-             return
-        
-        await state.update_data(purge_range=(s, e))
-        
-        # CONFIRMATION
-        builder = ReplyKeyboardBuilder()
-        builder.row(KeyboardButton(text="✅ CONFIRM PERMANENT DELETE"), KeyboardButton(text="❌ CANCEL"))
-        builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-        
-        await message.answer(
-            f"🔥 **CONFIRM DESTRUCTION**\n"
-            f"You are about to delete items `{s}-{e}` FOREVER.\n"
-            f"Are you sure?",
-            reply_markup=builder.as_markup(resize_keyboard=True),
-            parse_mode="Markdown"
-        )
-        await state.set_state(BotState.bin_confirm_purge)
-        
-    except:
-        await message.answer("⚠️ Error parsing range.")
-
-@dp.message(BotState.bin_confirm_purge)
-async def process_purge_confirm(message: types.Message, state: FSMContext):
-    text = message.text
-    if text == "❌ CANCEL": return await start(message, state)
-    
-    # Handle BACK button - return to bin menu  
-    if text == "⬅️ BACK":
-        await recycle_bin_btn(message, state)
-        return
-    
-    if text == "✅ CONFIRM PERMANENT DELETE":
-        data = await state.get_data()
-        s, e = data.get('purge_range')
-        
-        # Execute - always use col_trash
-        docs = list(col_trash.find().sort("deleted_at", 1))
-        targets = docs[s-1 : e]
-        
-        msg = await message.answer(f"🔥 Purging {len(targets)} items from Drive & DB...")
-        
-        # Drive Service
-        try:
-            service = get_drive_service()
-            bin_id = get_recycle_bin_id(service)
-        except: service = None
-        
-        count = 0
-        for doc in targets:
-            # 1. DB Delete
-            col_trash.delete_one({"_id": doc["_id"]})
-            
-            # 2. Drive Delete
-            if service:
-                try:
-                    fname = f"{doc['code']}.pdf"
-                    q = f"name = '{fname}' and '{bin_id}' in parents and trashed = false"
-                    res = service.files().list(q=q, fields="files(id)").execute()
-                    files = res.get('files', [])
-                    for f in files:
-                        service.files().delete(fileId=f['id']).execute()
-                except: pass
-            count += 1
-            
-        await msg.edit_text(f"🔥 **PURGE COMPLETE**\nDeleted {count} items.")
-        await asyncio.sleep(2)
-        await start(message, state)
-    else:
-        await message.answer("Use buttons.")
-
-def get_bin_formatted_list(docs, limit=30):
-    if not docs: return ["_Bin is empty._"]
-    lines = []
-    for idx, doc in enumerate(docs[:limit], 1):
-         code = doc.get('code')
-         ts = doc.get('deleted_at') # Use deleted time
-         date_str = ts.strftime('%d-%b %I:%M %p') if ts else "?"
-         line = f"<b>{idx}. {code}</b>\n❌ <i>Deleted: {date_str}</i>"
-         lines.append(line)
-    return lines
+        logging.warning(f"Drive rename failed: {e}")
+        return False
 
 @dp.message(F.text == "✏️ Edit PDF")
 async def edit_btn(message: types.Message, state: FSMContext):
@@ -2494,45 +1903,83 @@ async def edit_btn(message: types.Message, state: FSMContext):
     await state.set_state(BotState.choosing_edit_mode)
 
 @dp.message(BotState.choosing_edit_mode)
-async def handle_edit_mode(message: types.Message, state: FSMContext):
-    text = message.text
+async def handle_edit_mode(message: types.Message, state: FSMContext, mode_override: str = None, page_override: int = None):
+    text = mode_override if mode_override else message.text
     if text == "🔙 Back to Menu": return await start(message, state)
     
-    # helper to generate list
-    docs = list(col_pdfs.find().sort("timestamp", -1))
+    # ── PAGINATION LOGIC ─────────────────────────────
+    PAGE_SIZE = 10
+    data = await state.get_data()
     
-    list_msg = ["📋 **AVAILABLE PDFS**", "━━━━━━━━━━━━━━━━━━━━"]
-    list_msg.extend(get_formatted_file_list(docs))
-            
-    list_text = "\n".join(list_msg)
+    # If switching modes or first time, reset page to 1 unless overridden
+    current_page = page_override if page_override else data.get("edit_page", 1)
+    
+    # If text changed (switching modes), reset to page 1
+    # BUT if just paginating (same mode), keep page.
+    # We detecting mode switch by checking if text matches typical mode strings
     
     if text == "🔢 BY INDEX":
+        await state.update_data(edit_mode="index", edit_page=current_page)
+    elif text == "🆔 BY CODE":
+        await state.update_data(edit_mode="code", edit_page=current_page)
+    else:
+        # Fallback if text is weird, though usually called with override or button
+        pass
+
+    # helper to generate list
+    all_docs = _get_unique_docs()
+    total_docs = len(all_docs)
+    total_pages = (total_docs + PAGE_SIZE - 1) // PAGE_SIZE
+    
+    # Clamp page
+    current_page = max(1, min(current_page, total_pages)) if total_pages > 0 else 1
+    
+    # Slice
+    start_idx = (current_page - 1) * PAGE_SIZE
+    end_idx   = start_idx + PAGE_SIZE
+    page_docs = all_docs[start_idx:end_idx]
+    
+    # Generate List Text
+    list_msg = [f"📋 **AVAILABLE PDFS** (Page {current_page}/{total_pages})", "━━━━━━━━━━━━━━━━━━━━"]
+    list_msg.extend(get_formatted_file_list(page_docs, limit=PAGE_SIZE, start_index=start_idx + 1))
+    list_text = "\n".join(list_msg)
+    
+    # ── BUILD NAVIGATION ROWS ────────────────────────
+    nav_row = []
+    if current_page > 1:
+        nav_row.append(KeyboardButton(text="⬅️ PREV"))
+    if current_page < total_pages:
+        nav_row.append(KeyboardButton(text="NEXT ➡️"))
+        
+    # ── MODE SPECIFIC KEYBOARDS ──────────────────────
+    if text == "🔢 BY INDEX":
+        # Keyboard: [Prev, Next] / [Back, Menu]
+        rows = []
+        if nav_row: rows.append(nav_row)
+        rows.append([KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu")])
+        
         await message.answer(
             f"{list_text}\n\n"
             "🔢 **INDEX SELECTION**\n"
-            "Enter the **Index Number** from the list above (e.g. `1`).",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="⬅️ BACK")],
-                    [KeyboardButton(text="🔙 Back to Menu")]
-                ],
-                resize_keyboard=True
-            ),
+            "Enter the **Index Number** from the list above (e.g. `15`).",
+            reply_markup=ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True),
             parse_mode="HTML", disable_web_page_preview=True
         )
-        await state.update_data(edit_mode="index")
         await state.set_state(BotState.waiting_for_edit_target)
         
     elif text == "🆔 BY CODE":
+        # Dynamic Code Buttons
         builder = ReplyKeyboardBuilder()
-        existing_codes = []
-        for d in docs[:50]:
+        for d in page_docs:
             code = d.get('code')
-            if code and code not in existing_codes:
+            if code:
                 builder.add(KeyboardButton(text=code))
-                existing_codes.append(code)
+        builder.adjust(2) # 2 columns
         
-        builder.adjust(3)
+        # Add Nav Row
+        if nav_row: builder.row(*nav_row)
+        
+        # Add Control Row
         builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
         
         await message.answer(
@@ -2542,10 +1989,23 @@ async def handle_edit_mode(message: types.Message, state: FSMContext):
             reply_markup=builder.as_markup(resize_keyboard=True),
             parse_mode="HTML", disable_web_page_preview=True
         )
-        await state.update_data(edit_mode="code")
         await state.set_state(BotState.waiting_for_edit_target)
     else:
         await message.answer("⚠️ Invalid Option.")
+
+@dp.message(BotState.waiting_for_edit_target, F.text == "NEXT ➡️")
+async def edit_next_page(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = data.get("edit_page", 1) + 1
+    mode = "🔢 BY INDEX" if data.get("edit_mode") == "index" else "🆔 BY CODE"
+    await handle_edit_mode(message, state, mode_override=mode, page_override=page)
+
+@dp.message(BotState.waiting_for_edit_target, F.text == "⬅️ PREV")
+async def edit_prev_page(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = max(1, data.get("edit_page", 1) - 1)
+    mode = "🔢 BY INDEX" if data.get("edit_mode") == "index" else "🆔 BY CODE"
+    await handle_edit_mode(message, state, mode_override=mode, page_override=page)
 
 @dp.message(BotState.waiting_for_edit_target)
 async def select_edit_target(message: types.Message, state: FSMContext):
@@ -2570,7 +2030,7 @@ async def select_edit_target(message: types.Message, state: FSMContext):
             await message.answer("⚠️ Index must be 1 or greater.")
             return
             
-        all_docs = list(col_pdfs.find().sort("timestamp", -1))
+        all_docs = _get_unique_docs()
         if idx > len(all_docs):
             await message.answer(f"❌ Index {idx} not found. Max is {len(all_docs)}.")
             return
@@ -2610,8 +2070,8 @@ async def save_new_code(message: types.Message, state: FSMContext):
         data = await state.get_data()
         edit_mode = data.get('edit_mode', 'index')
         # Re-trigger the mode
-        message.text = "🔢 BY INDEX" if edit_mode == "index" else "🆔 BY CODE"
-        await handle_edit_mode(message, state)
+        mode_text = "🔢 BY INDEX" if edit_mode == "index" else "🆔 BY CODE"
+        await handle_edit_mode(message, state, mode_override=mode_text)
         return
     
     # Validation
@@ -2628,27 +2088,25 @@ async def save_new_code(message: types.Message, state: FSMContext):
     
     msg = await message.answer(f"⏳ **RENAMING: `{old_code}` ➡️ `{new_code}`...**")
     
-    # 1. Drive Rename
-    old_filename = f"{old_code}.pdf"
-    new_filename = f"{new_code}.pdf"
-    
-    drive_res = await asyncio.to_thread(rename_file_in_drive, old_filename, new_filename)
-    
-    # 2. DB Update
+    # DB Update
     from bson.objectid import ObjectId
+    # Grab Drive link BEFORE rename for GDrive sync
+    old_doc_full = col_pdfs.find_one({"_id": ObjectId(doc_id)})
+    old_link = old_doc_full.get("link", "") if old_doc_full else ""
     col_pdfs.update_one(
-        {"_id": ObjectId(doc_id)}, 
-        {"$set": {"code": new_code, "filename": new_code}} # Assuming we want to sync filename too if used
+        {"_id": ObjectId(doc_id)},
+        {"$set": {"code": new_code, "filename": new_code}}
     )
-    
-    status = "☁️ Drive: Renamed" if drive_res else "☁️ Drive: Not Found (DB Only Revised)"
-    
+    drive_note = ""
+    if old_link:
+        drive_ok = await asyncio.to_thread(_drive_rename_file, old_link, new_code)
+        drive_note = "\n☁️ Drive: ✅ Renamed" if drive_ok else "\n☁️ Drive: ⚠️ Could not rename"
+
     await msg.edit_text(
-        f"✅ **SUCCESSFULLY RENAMED**\n"
-        f"Old: `{old_code}`\n"
-        f"New: `{new_code}`\n"
-        f"{status}\n\n"
-        f"Enter next command or '🔙 Back to Menu'."
+        f"✅ <b>RENAMED</b>\n"
+        f"<code>{old_code}</code> → <code>{new_code}</code>\n"
+        f"🍃 DB: ✅ Updated{drive_note}",
+        parse_mode="HTML"
     )
     # Return to Menu logic? 
     # User usually wants to stop editing after one rename.
@@ -2711,90 +2169,114 @@ async def handle_mode_selection(message: types.Message, state: FSMContext):
     await state.set_state(BotState.choosing_retrieval_method)
 
 @dp.message(BotState.choosing_retrieval_method)
-async def handle_retrieval_method_selection(message: types.Message, state: FSMContext):
-    text = message.text
+async def handle_retrieval_method_selection(message: types.Message, state: FSMContext, override_text: str = None, override_page: int = None):
+    text = override_text if override_text else message.text
     if text == "🏠 MAIN MENU": return await start(message, state)
-    if text == "⬅️ BACK": 
-        # Re-trigger Step 1 Logic manually to go back
-        # We need the message text "PDF" or "LINK" to simulate it? 
-        # Easier: Recall handle_mode_selection? No, that expects "PDF" text.
-        # Better: Recall link_btn to restart? No, that goes too far back.
-        # We want to go back to "Choose Single/Bulk"? NO, we ARE at Single/Bulk.
-        # Wait, this handler IS the selection. So "Back" goes to Step 1 (Mode Selection)?
-        # Actually, "Back" here means "I want to change PDF/LINK mode".
-        return await link_btn(message, state)
+    if text == "⬅️ BACK": return await link_btn(message, state)
 
-    # FETCH DOCS FOR DISPLAY
-    docs = list(col_pdfs.find().sort("timestamp", -1))
+    PAGE_SIZE = 10
+    data = await state.get_data()
     
-    # Generate List Helper
-    # FIX: Increase limit to 50 to match buttons
-    list_msg = ["📂 **AVAILABLE FILES**", "━━━━━━━━━━━━━━━━━━━━"]
-    list_msg.extend(get_formatted_file_list(docs, limit=50))
-        
+    current_page = override_page if override_page is not None else data.get("retr_page", 1)
+    
+    if text == "🔢 BULK RANGE":
+        await state.update_data(retr_method="bulk", retr_page=current_page)
+    elif text == "👤 SINGLE FILE":
+        await state.update_data(retr_method="single", retr_page=current_page)
+    else:
+        text = data.get("retr_method", "single") 
+        text = "🔢 BULK RANGE" if text == "bulk" else "👤 SINGLE FILE"
+
+    all_docs = _get_unique_docs()
+    total_docs = len(all_docs)
+    total_pages = (total_docs + PAGE_SIZE - 1) // PAGE_SIZE
+    
+    current_page = max(1, min(current_page, total_pages)) if total_pages > 0 else 1
+    
+    start_idx = (current_page - 1) * PAGE_SIZE
+    end_idx   = start_idx + PAGE_SIZE
+    page_docs = all_docs[start_idx:end_idx]
+    
+    list_msg = [f"📂 **AVAILABLE FILES** (Page {current_page}/{total_pages})", "━━━━━━━━━━━━━━━━━━━━"]
+    list_msg.extend(get_formatted_file_list(page_docs, limit=PAGE_SIZE, start_index=start_idx + 1))
     list_text = "\n".join(list_msg)
     
-    # FIX: Safe Split Logic
-    if len(list_text) > 4000:
-        parts = [list_text[i:i+4000] for i in range(0, len(list_text), 4000)]
-        for part in parts:
-            await message.answer(part, parse_mode="HTML", disable_web_page_preview=True)
-    else:
-        await message.answer(list_text, parse_mode="HTML", disable_web_page_preview=True)
+    nav_row = []
+    if current_page > 1:
+        nav_row.append(KeyboardButton(text="⬅️ PREV"))
+    if current_page < total_pages:
+        nav_row.append(KeyboardButton(text="NEXT ➡️"))
 
     if text == "🔢 BULK RANGE":
-         await message.answer(
+        rows = []
+        if nav_row: rows.append(nav_row)
+        rows.append([KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🏠 MAIN MENU")])
+        
+        await message.answer(
+            f"{list_text}\n\n"
             "🔢 <b>BULK RETRIEVAL MODE</b>\n"
             "Enter the index range of PDFs you need (e.g., `1-5`, `10-20`).\n"
             "Index 1 = Newest PDF.",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🏠 MAIN MENU")]], resize_keyboard=True),
-            parse_mode="HTML"
+            reply_markup=ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True),
+            parse_mode="HTML", disable_web_page_preview=True
         )
-         await state.set_state(BotState.waiting_for_range)
-         
+        await state.set_state(BotState.waiting_for_range)
+        
     elif text == "👤 SINGLE FILE":
         builder = ReplyKeyboardBuilder()
-        existing_codes = []
-        for idx, d in enumerate(docs[:50], 1):
+        for d in page_docs:
             code = d.get('code')
-            if code and code not in existing_codes:
-                # ADD INDEX TO BUTTON TEXT: "1. CODE"
-                btn_text = f"{idx}. {code}"
-                builder.add(KeyboardButton(text=btn_text))
-                existing_codes.append(code)
+            if code:
+                abs_idx = all_docs.index(d) + 1
+                builder.add(KeyboardButton(text=f"{abs_idx}. {code}"))
+        builder.adjust(2)
         
-        builder.adjust(3)
+        if nav_row: builder.row(*nav_row)
         builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🏠 MAIN MENU"))
         
+        mode = data.get("retrieval_mode", "link")
         await message.answer(
-            "👤 <b>SINGLE RETRIEVAL MODE</b>\n"
-            "Select a Project Code below:",
+            f"{list_text}\n\n"
+            f"👤 <b>SINGLE RETRIEVAL</b>\n"
+            f"{'📄 PDF FILE' if mode=='pdf' else '🔗 DRIVE LINK'} mode — Select file:",
             reply_markup=builder.as_markup(resize_keyboard=True),
-            parse_mode="HTML"
+            parse_mode="HTML", disable_web_page_preview=True
         )
         await state.set_state(BotState.fetching_link)
-        
-    else:
-        await message.answer("⚠️ Invalid Option.")
+
+@dp.message(BotState.fetching_link, F.text == "NEXT ➡️")
+async def single_next_page(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = data.get("retr_page", 1) + 1
+    await handle_retrieval_method_selection(message, state, override_text="👤 SINGLE FILE", override_page=page)
+
+@dp.message(BotState.fetching_link, F.text == "⬅️ PREV")
+async def single_prev_page(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = max(1, data.get("retr_page", 1) - 1)
+    await handle_retrieval_method_selection(message, state, override_text="👤 SINGLE FILE", override_page=page)
+
+@dp.message(BotState.waiting_for_range, F.text == "NEXT ➡️")
+async def bulk_next_page(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = data.get("retr_page", 1) + 1
+    await handle_retrieval_method_selection(message, state, override_text="🔢 BULK RANGE", override_page=page)
+
+@dp.message(BotState.waiting_for_range, F.text == "⬅️ PREV")
+async def bulk_prev_page(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = max(1, data.get("retr_page", 1) - 1)
+    await handle_retrieval_method_selection(message, state, override_text="🔢 BULK RANGE", override_page=page)
 
 @dp.message(BotState.fetching_link)
 async def fetch_link(message: types.Message, state: FSMContext):
-    text = message.text.strip().upper()
+    text = message.text.strip()
+    if text.upper() == "🏠 MAIN MENU": return await start(message, state)
     
-    if text == "🏠 MAIN MENU": return await start(message, state)
-    if text == "⬅️ BACK": 
-        # Return to Method Selection
-        # We need to simulate the message for handle_retrieval_method_selection?
-        # No, we need to RE-SHOW the method prompt.
-        # But `handle_mode_selection` does that. 
-        # But `handle_mode_selection` needs "PDF" or "LINK" text to work.
-        # So we check state data.
+    text = text.upper()
+    if text == "⬅️ BACK":
         data = await state.get_data()
-        mode = data.get('retrieval_mode', 'link')
-        msg = types.Message(message_id=0, date=datetime.now(), chat=message.chat, from_user=message.from_user, text="PDF" if mode=="pdf" else "LINK") # Hacky simulation
-        # Better: Refactor `handle_mode_selection` to use data if text is invalid?
-        # Or just manually call the logic:
-        
+        mode = data.get("retrieval_mode", "link")
         count = col_pdfs.count_documents({})
         builder = ReplyKeyboardBuilder()
         builder.row(KeyboardButton(text="👤 SINGLE FILE"), KeyboardButton(text="🔢 BULK RANGE"))
@@ -2811,40 +2293,27 @@ async def fetch_link(message: types.Message, state: FSMContext):
         await state.set_state(BotState.choosing_retrieval_method)
         return
 
-    # HANDLE BUTTON CLICK (e.g. "1. CODE")
-    # Clean input to get just CODE
-    if ". " in text:
-        try:
-            _, clean_code = text.split(". ", 1)
-            text = clean_code.strip()
-        except: pass
+    import re
+    all_docs = _get_unique_docs()
     
-    # === BULK RANGE MODE ===
+    if text.isdigit():
+        idx = int(text)
+        if 1 <= idx <= len(all_docs):
+            text = all_docs[idx - 1].get("code")
+    else:
+        match = re.match(r"^(\d+)\.\s+(.*)$", text)
+        if match:
+            idx = int(match.group(1))
+            extracted_code = match.group(2)
+            if 1 <= idx <= len(all_docs):
+                doc_code = all_docs[idx - 1].get("code", "")
+                if doc_code == extracted_code:
+                    text = doc_code
+                elif extracted_code.endswith("…") or extracted_code.endswith("..."):
+                    clean_extracted = extracted_code.rstrip("….")
+                    if doc_code.startswith(clean_extracted):
+                        text = doc_code
     
-    # === BULK RANGE MODE ===
-    if text == "🔢 BULK RANGE":
-        # ... logic ...
-        pass # Fallthrough if existing logic handles this, checking next Step
-
-        # Generate List Helper
-        docs = list(col_pdfs.find().sort("timestamp", -1))
-        list_msg = ["🔢 **AVAILABLE INDICES**", "━━━━━━━━━━━━━━━━━━━━"]
-        list_msg.extend(get_formatted_file_list(docs))
-        
-        list_text = "\n".join(list_msg)
-        
-        await message.answer(
-            f"{list_text}\n\n"
-            "🔢 <b>BULK RETRIEVAL MODE</b>\n"
-            "Enter the index range of PDFs you need (e.g., `1-5`, `10-20`).\n"
-            "Index 1 = Newest PDF.",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True),
-            parse_mode="HTML", disable_web_page_preview=True
-        )
-        await state.set_state(BotState.waiting_for_range)
-        return
-
-    # === SINGLE RETRIEVAL MODE (User clicked a code button) ===
     doc = col_pdfs.find_one({"code": text}, sort=[("timestamp", -1)])
     
     if doc:
@@ -2852,29 +2321,75 @@ async def fetch_link(message: types.Message, state: FSMContext):
         mode = data.get('retrieval_mode', 'link')
         
         if mode == 'pdf':
-            wait_msg = await message.answer(f"⏳ **Fetching PDF: `{text}`...**")
-            filename = f"{text}.pdf"
-            
+            wait_msg = await message.answer(f"⏳ <b>Fetching PDF:</b> <code>{text}</code>...", parse_mode="HTML")
+            doc_for_pdf = col_pdfs.find_one({"code": text.upper()}) or col_pdfs.find_one({"code": text})
+
+            if not doc_for_pdf or not doc_for_pdf.get("link"):
+                await wait_msg.edit_text(f"❌ No file found for code <code>{text}</code>.", parse_mode="HTML")
+                return
+
+            link = doc_for_pdf.get("link", "")
+            file_id = _extract_drive_id(link)
+            if not file_id:
+                await wait_msg.edit_text(
+                    f"❌ Cannot parse Drive link.\n🔗 <a href='{link}'>Open on Drive</a>",
+                    parse_mode="HTML", disable_web_page_preview=False
+                )
+                return
+            code_clean = doc_for_pdf.get('code', text)
+            fname = f"{code_clean}.pdf"
+            tmp_path = fname
+
             try:
-                # Attempt to download from Drive
-                local_path = await asyncio.to_thread(download_from_drive, filename)
-                
-                if local_path and os.path.exists(local_path):
-                    await bot.send_document(message.from_user.id, FSInputFile(local_path), caption=f"📄 **FILE ACQUIRED**\nCode: `{text}`")
-                    await wait_msg.delete()
-                    try: os.remove(local_path) 
-                    except: pass
-                else:
-                    await wait_msg.edit_text(f"❌ Error: File `{filename}` not found in Drive Vault.")
+                def _download_drive_file():
+                    svc = get_drive_service()
+                    request = svc.files().get_media(fileId=file_id)
+                    buf = io.BytesIO()
+                    downloader = MediaIoBaseDownload(buf, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                    buf.seek(0)
+                    return buf.read()
+
+                raw_bytes = await asyncio.to_thread(_download_drive_file)
+                with open(tmp_path, 'wb') as f:
+                    f.write(raw_bytes)
+
+                size_kb = max(1, len(raw_bytes) // 1024)
+                await wait_msg.delete()
+                await message.answer_document(
+                    FSInputFile(tmp_path, filename=fname),
+                    caption=(
+                        f"📄 <b>{code_clean}.pdf</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📦 <code>{size_kb} KB</code>  ·  "
+                        f"🕐 <code>{now_local().strftime('%b %d, %Y  ·  %I:%M %p')}</code>"
+                    ),
+                    parse_mode="HTML"
+                )
+                DAILY_STATS_BOT4["links_retrieved"] += 1
+                asyncio.create_task(_persist_stats())
             except Exception as e:
-                await wait_msg.edit_text(f"❌ Download Failed: {e}")
+                import logging
+                logging.error(f"Drive download failed for {file_id}: {e}")
+                await wait_msg.edit_text(
+                    f"❌ <b>Download Failed</b>\n"
+                    f"<code>{e}</code>\n\n"
+                    f"🔗 <a href='{link}'>Open on Drive instead</a>",
+                    parse_mode="HTML", disable_web_page_preview=False
+                )
+            finally:
+                import os
+                try: os.remove(tmp_path)
+                except: pass
                 
         else:
-            # Link Mode
+            DAILY_STATS_BOT4["links_retrieved"] += 1
+            asyncio.create_task(_persist_stats())
             await message.answer(f"✅ **RESOURCE ACQUIRED**\nCode: `{doc.get('code')}`\n🔗 {doc.get('link')}")
             
     else:
-        # If they typed something random that isn't a code
         await message.answer(f"❌ Code `{text}` not found. Select from the buttons or try again.")
 
 @dp.message(BotState.waiting_for_range)
@@ -2918,7 +2433,7 @@ async def process_bulk_range(message: types.Message, state: FSMContext):
             return
 
         # Fetch all docs sorted by timestamp (Newest first)
-        all_docs = list(col_pdfs.find().sort("timestamp", -1))
+        all_docs = _get_unique_docs()
         total_docs = len(all_docs)
         
         # STRICT BOUNDS CHECK
@@ -2949,21 +2464,50 @@ async def process_bulk_range(message: types.Message, state: FSMContext):
             # === BULK PDF MODE ===
             await message.answer(f"📦 **BULK DOWNLOAD INITIATED ({len(selected_docs)} files)...**\nPlease wait.")
             
-            count = 0 
+            count = 0
             for doc in selected_docs:
-                code = doc.get('code')
-                filename = f"{code}.pdf"
+                code = doc.get('code', '')
+                link = doc.get('link', '')
+                fname = f"{code}.pdf"
+                fid_match = re.search(r'/file/d/([^/?\s]+)', link)
+                if not fid_match:
+                    await message.answer(f"⚠️ <b>{code}</b>: Cannot parse Drive link — skipped.", parse_mode="HTML")
+                    continue
+                fid = fid_match.group(1)
                 try:
-                    local_path = await asyncio.to_thread(download_from_drive, filename)
-                    if local_path and os.path.exists(local_path):
-                        await bot.send_document(message.from_user.id, FSInputFile(local_path), caption=f"Code: `{code}`")
-                        count += 1
-                        try: os.remove(local_path) 
-                        except: pass
-                        await asyncio.sleep(1) # Prevent flood wait
-                except: continue
-                
-            await message.answer(f"✅ **Delivered {count}/{len(selected_docs)} files.**")
+                    def _dl(file_id=fid):
+                        svc = get_drive_service()
+                        req = svc.files().get_media(fileId=file_id)
+                        buf = io.BytesIO()
+                        dl = MediaIoBaseDownload(buf, req)
+                        done = False
+                        while not done:
+                            _, done = dl.next_chunk()
+                        buf.seek(0)
+                        return buf.read()
+                    raw = await asyncio.to_thread(_dl)
+                    with open(fname, 'wb') as wf:
+                        wf.write(raw)
+                    size_kb = max(1, len(raw) // 1024)
+                    await message.answer_document(
+                        FSInputFile(fname, filename=fname),
+                        caption=f"📄 <b>{code}.pdf</b>  ·  <code>{size_kb} KB</code>",
+                        parse_mode="HTML"
+                    )
+                    count += 1
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    await message.answer(
+                        f"❌ <b>{code}</b> failed: <code>{e}</code>\n🔗 <a href='{link}'>Open on Drive</a>",
+                        parse_mode="HTML", disable_web_page_preview=False
+                    )
+                finally:
+                    try: os.remove(fname)
+                    except: pass
+
+            await message.answer(f"✅ <b>Delivered {count}/{len(selected_docs)} PDFs.</b>", parse_mode="HTML")
+            DAILY_STATS_BOT4["links_retrieved"] += count
+            asyncio.create_task(_persist_stats())
             
         else:
             # === BULK LINK MODE ===
@@ -2984,6 +2528,8 @@ async def process_bulk_range(message: types.Message, state: FSMContext):
                     await message.answer(chunk, disable_web_page_preview=True)
             else:
                 await message.answer(full_msg, disable_web_page_preview=True)
+            DAILY_STATS_BOT4["links_retrieved"] += len(selected_docs)
+            asyncio.create_task(_persist_stats())
             
         await message.answer("💎 **Operation Complete.** Enter another range or click '🔙 Back to Menu'.")
         
@@ -2999,49 +2545,91 @@ async def remove_btn(message: types.Message, state: FSMContext):
     builder.row(KeyboardButton(text="🔙 Back to Menu"))
     
     await message.answer(
-        "🗑 **DELETION PROTOCOL INITIATED**\n"
+        "🗑 <b>DELETION PROTOCOL</b>\n"
         "Select Deletion Mode:\n\n"
-        "🔢 **DELETE BY RANGE**: Delete multiple files (e.g., 1-5).\n"
-        "🆔 **DELETE BY CODE**: Delete a specific code (e.g., P1).",
-        reply_markup=builder.as_markup(resize_keyboard=True)
+        "🔢 <b>DELETE BY RANGE</b>: Delete multiple files (e.g., 1-5).\n"
+        "🆔 <b>DELETE BY CODE</b>: Delete a specific file by code.",
+        reply_markup=builder.as_markup(resize_keyboard=True),
+        parse_mode="HTML"
     )
     await state.set_state(BotState.choosing_delete_mode)
 
 @dp.message(BotState.choosing_delete_mode)
-async def handle_delete_mode(message: types.Message, state: FSMContext):
-    text = message.text
+async def handle_delete_mode(message: types.Message, state: FSMContext, mode_override: str = None, page_override: int = None):
+    text = mode_override if mode_override else message.text
     if text == "🔙 Back to Menu": return await start(message, state)
     
-    # Generate List Helper
-    docs = list(col_pdfs.find().sort("timestamp", -1))
-    list_msg = ["🗑 **FILES AVAILABLE FOR DELETION**", "━━━━━━━━━━━━━━━━━━━━"]
-    list_msg.extend(get_formatted_file_list(docs))
-            
-    list_text = "\n".join(list_msg)
+    # ── PAGINATION LOGIC ─────────────────────────────
+    PAGE_SIZE = 10
+    data = await state.get_data()
+    
+    # Reset page on mode switch, keep if paginating
+    current_page = page_override if page_override else data.get("delete_page", 1)
     
     if text == "🔢 DELETE BY RANGE":
+        await state.update_data(delete_mode="range", delete_page=current_page)
+    elif text == "🆔 DELETE BY CODE":
+        await state.update_data(delete_mode="code", delete_page=current_page)
+    else:
+        # fallback
+        pass
+
+    # helper to generate list
+    all_docs = _get_unique_docs()
+    total_docs = len(all_docs)
+    total_pages = (total_docs + PAGE_SIZE - 1) // PAGE_SIZE
+    
+    # Clamp page
+    current_page = max(1, min(current_page, total_pages)) if total_pages > 0 else 1
+    
+    # Slice
+    start_idx = (current_page - 1) * PAGE_SIZE
+    end_idx   = start_idx + PAGE_SIZE
+    page_docs = all_docs[start_idx:end_idx]
+    
+    list_msg = [f"🗑 **FILES AVAILABLE FOR DELETION** (Page {current_page}/{total_pages})", "━━━━━━━━━━━━━━━━━━━━"]
+    list_msg.extend(get_formatted_file_list(page_docs, limit=PAGE_SIZE, start_index=start_idx + 1))
+    list_text = "\n".join(list_msg)
+    
+    # ── BUILD NAVIGATION ROWS ────────────────────────
+    nav_row = []
+    if current_page > 1:
+        nav_row.append(KeyboardButton(text="⬅️ PREV"))
+    if current_page < total_pages:
+        nav_row.append(KeyboardButton(text="NEXT ➡️"))
+
+    # ── MODE SPECIFIC OUTPUT ─────────────────────────
+    if text == "🔢 DELETE BY RANGE":
+        # Keyboard: [Prev, Next] / [Back] / [Back to Menu]
+        rows = []
+        if nav_row: rows.append(nav_row)
+        rows.append([KeyboardButton(text="⬅️ BACK")]) # Back to Mode Selection
+        rows.append([KeyboardButton(text="🔙 Back to Menu")])
+        
         await message.answer(
             f"{list_text}\n\n"
             "🔢 <b>BULK DELETE MODE</b>\n"
             "Enter range to purge (e.g., `1-5`).\n"
-            "⚠️ <b>WARNING</b>: This deletes from Database AND Google Drive.",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True),
+            "⚠️ <b>WARNING</b>: This permanently removes PDFs from the database.",
+            reply_markup=ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True),
             parse_mode="HTML", disable_web_page_preview=True
         )
-        await state.update_data(delete_mode="range")
         await state.set_state(BotState.deleting_pdf)
         
     elif text == "🆔 DELETE BY CODE":
-        # Fetch available codes for buttons
+        # Dynamic Code Buttons
         builder = ReplyKeyboardBuilder()
-        existing_codes = []
-        for d in docs[:50]:
+        for d in page_docs:
             code = d.get('code')
-            if code and code not in existing_codes:
-                builder.add(KeyboardButton(text=code))
-                existing_codes.append(code)
+            if code:
+                abs_idx = all_docs.index(d) + 1
+                builder.add(KeyboardButton(text=f"{abs_idx}. {code}"))
+        builder.adjust(2)
         
-        builder.adjust(3)
+        if nav_row: builder.row(*nav_row)
+        
+        # Add Control Rows
+        builder.row(KeyboardButton(text="⬅️ BACK")) # Back to Mode Selection
         builder.row(KeyboardButton(text="🔙 Back to Menu"))
         
         await message.answer(
@@ -3051,15 +2639,33 @@ async def handle_delete_mode(message: types.Message, state: FSMContext):
             reply_markup=builder.as_markup(resize_keyboard=True),
             parse_mode="HTML", disable_web_page_preview=True
         )
-        await state.update_data(delete_mode="code")
         await state.set_state(BotState.deleting_pdf)
     else:
         await message.answer("⚠️ Invalid Option. use buttons.")
+
+@dp.message(BotState.deleting_pdf, F.text == "NEXT ➡️")
+async def delete_next_page(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = data.get("delete_page", 1) + 1
+    mode = "🔢 DELETE BY RANGE" if data.get("delete_mode") == "range" else "🆔 DELETE BY CODE"
+    await handle_delete_mode(message, state, mode_override=mode, page_override=page)
+
+@dp.message(BotState.deleting_pdf, F.text == "⬅️ PREV")
+async def delete_prev_page(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    page = max(1, data.get("delete_page", 1) - 1)
+    mode = "🔢 DELETE BY RANGE" if data.get("delete_mode") == "range" else "🆔 DELETE BY CODE"
+    await handle_delete_mode(message, state, mode_override=mode, page_override=page)
 
 @dp.message(BotState.deleting_pdf)
 async def process_deletion(message: types.Message, state: FSMContext):
     text = message.text.strip().upper()
     if text == "🔙 BACK TO MENU": return await start(message, state)
+    
+    # Handle Back to Mode Selection
+    if text == "⬅️ BACK":
+        await remove_btn(message, state)
+        return
     
     data = await state.get_data()
     mode = data.get('delete_mode', 'code')
@@ -3067,6 +2673,26 @@ async def process_deletion(message: types.Message, state: FSMContext):
     if mode == 'code':
         # Single Deletion - Ask for Confirmation
         code = text
+        import re
+        all_docs = _get_unique_docs()
+        
+        if code.isdigit():
+            idx = int(code)
+            if 1 <= idx <= len(all_docs):
+                code = all_docs[idx - 1].get("code")
+        else:
+            match = re.match(r"^(\d+)\.\s+(.*)$", code)
+            if match:
+                idx = int(match.group(1))
+                extracted_code = match.group(2)
+                if 1 <= idx <= len(all_docs):
+                    doc_code = all_docs[idx - 1].get("code", "")
+                    if doc_code == extracted_code:
+                        code = doc_code
+                    elif extracted_code.endswith("…") or extracted_code.endswith("..."):
+                        clean_extracted = extracted_code.rstrip("….")
+                        if doc_code.startswith(clean_extracted):
+                            code = doc_code
         await state.update_data(target_code=code)
         
         # Confirmation Keyboard
@@ -3107,7 +2733,7 @@ async def process_deletion(message: types.Message, state: FSMContext):
                 return
             
             # Fetch docs
-            all_docs = list(col_pdfs.find().sort("timestamp", -1))
+            all_docs = _get_unique_docs()
             selected_docs = all_docs[start_idx-1 : end_idx]
             
             if not selected_docs:
@@ -3146,20 +2772,21 @@ async def execute_deletion(message: types.Message, state: FSMContext):
         return
     
     if text == "❌ CANCEL":
-        await message.answer("� **DELETION ABORTED.**\nNo files were touched.")
+        await message.answer("❌ <b>DELETION CANCELLED.</b>\nNo files were deleted.", parse_mode="HTML")
         
         # Helper to re-show menu based on mode
         if mode == 'code':
             # Re-fetch buttons
-            docs = list(col_pdfs.find().sort("timestamp", -1))
+            docs = _get_unique_docs()
             builder = ReplyKeyboardBuilder()
             existing_codes = []
             for d in docs[:50]:
                 code = d.get('code')
                 if code and code not in existing_codes:
-                    builder.add(KeyboardButton(text=code))
+                    abs_idx = docs.index(d) + 1
+                    builder.add(KeyboardButton(text=f"{abs_idx}. {code}"))
                     existing_codes.append(code)
-            builder.adjust(3)
+            builder.adjust(2)
             builder.row(KeyboardButton(text="🔙 Back to Menu"))
             await message.answer("🆔 **Select Code to Delete:**", reply_markup=builder.as_markup(resize_keyboard=True))
             await state.set_state(BotState.deleting_pdf)
@@ -3172,60 +2799,90 @@ async def execute_deletion(message: types.Message, state: FSMContext):
     if text == "✅ YES, DELETE":
         if mode == 'code':
             code = data.get('target_code')
-            msg = await message.answer(f"⏳ **MOVING TO RECYCLE BIN: `{code}`...**")
+            msg = await message.answer(f"⏳ **ARCHIVING: `{code}`...**")
+
+            if code.endswith('…'):
+                search_code = code[:-1]
+                query = {"code": {"$regex": f"^{search_code}"}}
+            elif code.endswith('...'):
+                search_code = code[:-3]
+                query = {"code": {"$regex": f"^{search_code}"}}
+            else:
+                query = {"code": code}
             
-            # 1. Drive Move
-            filename = f"{code}.pdf"
-            drive_res = await asyncio.to_thread(move_to_recycle_bin, filename)
-            
-            # 2. MongoDB Move (Copy to Trash -> Delete from Library)
-            doc = col_pdfs.find_one({"code": code})
-            if doc:
-                doc['deleted_at'] = datetime.now()  # Add timestamp
-                col_trash.insert_one(doc)
-                col_pdfs.delete_one({"_id": doc['_id']})
+            docs = list(col_pdfs.find(query))
+            if docs:
                 db_res = True
+                drive_del_count = 0
+                links_to_delete = set()
+                
+                for doc in docs:
+                    link = doc.get("link", "")
+                    if link: links_to_delete.add(link)
+                    doc['deleted_at'] = datetime.now()
+                    col_trash.insert_one(doc)
+                    col_pdfs.delete_one({"_id": doc['_id']})
+                
+                for i in range(0, len(links_to_delete), 15):
+                    chunk = list(links_to_delete)[i:i+15]
+                    results = await asyncio.gather(*(asyncio.to_thread(_drive_delete_file, l) for l in chunk), return_exceptions=True)
+                    drive_del_count += sum(1 for r in results if r is True)
+                
+                DAILY_STATS_BOT4["pdfs_deleted"] += len(docs)
+                asyncio.create_task(_persist_stats())
+                
+                if links_to_delete:
+                    drive_note = f"  ☁️ Drive: {drive_del_count}/{len(links_to_delete)}"
+                else:
+                    drive_note = ""
             else:
                 db_res = False
-            
-            status = []
-            if drive_res: status.append("☁️ Drive: Moved to Bin")
-            else: status.append("☁️ Drive: Not Found")
-            
-            if db_res: status.append("🍃 DB: Moved to Bin")
-            else: status.append("🍃 DB: Not Found")
-            
-            await msg.edit_text(
-                f"♻️ **REYCLED: `{code}`**\n" + "\n".join(status)
-            )
+                drive_note = ""
+                docs = []
+
+            status = f"🍃 DB: ✅ {len(docs)} Deleted" if db_res else "🍃 DB: ❌ Not Found"
+            await msg.edit_text(f"✅ <b>DELETED: <code>{code}</code></b>\n{status}{drive_note}", parse_mode="HTML")
         else:
             # Range Deletion
             indices = data.get('target_range_indices')
             start_idx, end_idx = indices
             
-            msg = await message.answer(f"⏳ **EXECUTING BULK RECYCLE...**")
+            msg = await message.answer("⏳ <b>Deleting files...</b>", parse_mode="HTML")
             
-            all_docs = list(col_pdfs.find().sort("timestamp", -1))
+            all_docs = _get_unique_docs()
             selected_docs = all_docs[start_idx-1 : end_idx]
             
             moved_count = 0
-            for doc in selected_docs:
-                code = doc.get('code')
-                # Drive
-                await asyncio.to_thread(move_to_recycle_bin, f"{code}.pdf")
-                # DB
-                doc['deleted_at'] = datetime.now()  # Add timestamp
-                col_trash.insert_one(doc)
-                col_pdfs.delete_one({"_id": doc['_id']})
-                moved_count += 1
+            drive_del_count = 0
+            links_to_delete = set()
             
-            await msg.edit_text(f"♻️ **BULK RECYCLE COMPLETE**\nMoved {moved_count} files to Bin.")
+            for unique_doc in selected_docs:
+                unique_code = unique_doc.get("code")
+                duplicates = list(col_pdfs.find({"code": unique_code}))
+                for doc in duplicates:
+                    link = doc.get("link", "")
+                    if link: links_to_delete.add(link)
+                    
+                    doc['deleted_at'] = datetime.now()
+                    col_trash.insert_one(doc)
+                    col_pdfs.delete_one({"_id": doc['_id']})
+                    moved_count += 1
+
+            for i in range(0, len(links_to_delete), 15):
+                chunk = list(links_to_delete)[i:i+15]
+                results = await asyncio.gather(*(asyncio.to_thread(_drive_delete_file, l) for l in chunk), return_exceptions=True)
+                drive_del_count += sum(1 for r in results if r is True)
+
+            drive_note = f"  ☁️ Drive: {drive_del_count}/{len(links_to_delete)}" if links_to_delete else ""
+            DAILY_STATS_BOT4["pdfs_deleted"] += moved_count
+            asyncio.create_task(_persist_stats())
+            await msg.edit_text(f"✅ <b>BULK DELETE COMPLETE</b>\nRemoved <code>{moved_count}</code> matching records from vault.{drive_note}", parse_mode="HTML")
             
         # Re-Show Menu
         if mode == 'code':
             await asyncio.sleep(1)
             # Re-fetch buttons
-            docs = list(col_pdfs.find().sort("timestamp", -1))
+            docs = _get_unique_docs()
             builder = ReplyKeyboardBuilder()
             existing_codes = []
             for d in docs[:50]:
@@ -3233,7 +2890,7 @@ async def execute_deletion(message: types.Message, state: FSMContext):
                 if code and code not in existing_codes:
                     builder.add(KeyboardButton(text=code))
                     existing_codes.append(code)
-            builder.adjust(3)
+            builder.adjust(2)
             builder.row(KeyboardButton(text="🔙 Back to Menu"))
             await message.answer("🆔 Select next Code or '🔙 Back to Menu'.", reply_markup=builder.as_markup(resize_keyboard=True))
         else:
@@ -3269,14 +2926,12 @@ async def send_elite_help(message: types.Message):
 
         "<b>\U0001F5C3\uFE0F 2. VAULT & LIBRARY</b>\n"
         "• <b>\U0001F4CB Show Library:</b> Full index. Sorts by Date. Search by Code/Index.\n"
-        "• <b>\U0001F517 Get Link:</b> Retrieve specific asset. Mode: <i>PDF File</i> (Download) or <i>Drive Link</i> (URL).\n"
-        "• <b>\u270F\uFE0F Edit PDF:</b> Rename files in DB + Drive instantly (Refreshes links).\n"
-        "• <b>📂 GDrive Explorer:</b> Navigates your <b>actual</b> Google Drive folders. View/Traverse the cloud hierarchy.\n\n"
-        
-        "<b>\U0001F6E1 3. SECURITY & RECOVERY</b>\n"
-        "• <b>\u267B\uFE0F Recycle Bin:</b> Deleted files go here first. <i>Restore</i> or <i>Purge</i> (Single/Range).\n"
-        "• <b>\U0001F5D1 Remove PDF:</b> Soft-delete. Moves to Bin. Updates DB & Drive.\n"
-        "• <b>\u26A0\uFE0F NUKE ALL DATA:</b> ☠️ <b>DANGER!</b> Wipes MongoDB + Drive Vault. Irreversible.\n"
+        "• <b>\U0001F517 Get Link:</b> Retrieve specific asset. Mode: <i>PDF File</i> (Download) or <i>Link</i> (URL).\n"
+        "• <b>\u270F\uFE0F Edit PDF:</b> Rename PDF code in DB instantly.\n\n"
+
+        "<b>\U0001F6E1 3. SECURITY</b>\n"
+        "• <b>\U0001F5D1 Remove PDF:</b> Deletes from vault (soft-archival for safety).\n"
+        "• <b>\u26A0\uFE0F NUKE ALL DATA:</b> ☠️ <b>DANGER!</b> Permanently wipes all MongoDB records. Irreversible.\n"
         "• <b>Anti-Spam:</b> Auto-bans users flooding commands (>5/sec).\n\n"
 
         "<b>⚙️ 4. ADMIN & INFRASTRUCTURE</b>\n"
@@ -3284,15 +2939,13 @@ async def send_elite_help(message: types.Message):
         "   - <b>Add/Remove Admin:</b> Assign By ID.\n"
         "   - <b>Roles:</b> Give titles (e.g., 'Chief Editor').\n"
         "   - <b>Locks:</b> Freeze admin access without removing them.\n"
-        "• <b>🗄️ Databases:</b> Switch MongoDB connections on the fly. Manage <code>.env</code> file directly.\n"
         "• <b>\U0001F4BB Live Terminal:</b> Real-time log streaming of bot actions.\n"
-        "• <b>\U0001F4CA Storage Info:</b> Health Score, Drive Quota, DB Latency.\n\n"
-        
+        "• <b>\U0001F4CA Storage Info:</b> DB Latency, PDF Count.\n\n"
+
         "<b>📦 5. BACKUP SYSTEMS</b>\n"
         "• <b>Manual:</b> Click <code>📦 Backup</code>.\n"
         "   - <b>Text Report:</b> Summary of Admins + PDF List.\n"
-        "   - <b>JSON Dump:</b> Full restore-ready DB export.\n"
-        "• <b>Auto-Cloud:</b> All backups upload to <code>MONTH YEAR</code> folders in Drive.\n"
+        "   - <b>JSON Dump:</b> Full restore-ready DB export (saved to MongoDB).\n"
         "• <b>Weekly Auto-Pilot:</b> Every Sunday @ 3AM, full snapshot sent to Owner.\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3302,87 +2955,102 @@ async def send_elite_help(message: types.Message):
 
 @dp.message(F.text == "⚠️ NUKE ALL DATA")
 async def nuke_warning(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
     builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="☢️ EXECUTE NUKE"), KeyboardButton(text="🔙 Back to Menu"))
-    
+    builder.row(KeyboardButton(text="⚠️ YES, I UNDERSTAND"), KeyboardButton(text="🔙 Back to Menu"))
     await message.answer(
-        "⚠️ **NUCLEAR WARNING** ⚠️\n\n"
-        "<b>AUTHORITY VERIFICATION REQUIRED</b>\n"
-        "You are about to initiate a **TOTAL SYSTEM WIPE**.\n\n"
-        "🔥 **This will destroy:**\n"
-        "- All MongoDB Metadata records\n"
-        "- All PDF files in your Google Drive Vault\n"
-        "- All local temporary files\n\n"
-        "**This action is IRREVERSIBLE.** Are you absolutely sure?",
+        "☢️ <b>DANGER — NUKE ALL DATA</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "This will <b>permanently destroy ALL</b>:\n"
+        "• All MongoDB PDF records\n"
+        "• All local PDF files\n\n"
+        "⚠️ <b>IRREVERSIBLE. Step 1 of 2:</b>\n"
+        "Press <b>YES, I UNDERSTAND</b> to continue:",
         reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     await state.set_state(BotState.confirm_nuke)
 
 @dp.message(BotState.confirm_nuke)
-async def nuke_execution(message: types.Message, state: FSMContext):
+async def nuke_step1(message: types.Message, state: FSMContext):
     if message.text == "🔙 Back to Menu": return await start(message, state)
-    
-    if message.text == "☢️ EXECUTE NUKE":
-        status_msg = await message.answer("☢️ **INITIATING NUCLEAR PROTOCOL...**")
+    if message.text == "⚠️ YES, I UNDERSTAND":
+        builder2 = ReplyKeyboardBuilder()
+        builder2.row(KeyboardButton(text="☢️ EXECUTE FINAL NUKE"), KeyboardButton(text="❌ ABORT"))
+        await message.answer(
+            "☢️ <b>FINAL CONFIRMATION — Step 2 of 2</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "⛔ <b>YOU ARE ABOUT TO WIPE ALL PDF DATA.</b>\n\n"
+            "This is your <b>LAST CHANCE</b> to abort.\n"
+            "Press <b>EXECUTE FINAL NUKE</b> to permanently wipe:",
+            reply_markup=builder2.as_markup(resize_keyboard=True),
+            parse_mode="HTML"
+        )
+        await state.set_state(BotState.waiting_for_nuke_2)
+        return
+    await message.answer("⚠️ Use the confirmation buttons.", parse_mode="HTML")
+
+@dp.message(BotState.waiting_for_nuke_2)
+async def nuke_execution(message: types.Message, state: FSMContext):
+    if message.text in ("❌ ABORT", "🔙 Back to Menu"):
+        await message.answer("✅ <b>NUKE ABORTED. All data is safe.</b>", parse_mode="HTML")
+        await state.clear()
+        return await start(message, state)
+    if message.text == "☢️ EXECUTE FINAL NUKE":
+        status_msg = await message.answer("☢️ <b>INITIATING NUCLEAR PROTOCOL...</b>", parse_mode="HTML")
         
-        # 1. MongoDB Wipe
-        await status_msg.edit_text("🔥 **STEP 1/3: Purging Database...**")
-        try:
-            x = col_pdfs.delete_many({})
-            db_count = x.deleted_count
-        except Exception as e:
-            db_count = f"Error: {e}"
-            
-        # 2. Drive Wipe
-        await status_msg.edit_text("🔥 **STEP 2/3: Incinerating Google Drive Vault...**")
+        # 1. Google Drive Wipe
+        await status_msg.edit_text("🔥 <b>STEP 1/3: Wiping Google Drive Vault...</b>", parse_mode="HTML")
         drive_count = 0
-        try:
-            if PARENT_FOLDER_ID:
-                service = get_drive_service()
-                # List only FILES inside the Parent Folder (Exclude Folders)
-                query = f"'{PARENT_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
-                results = service.files().list(q=query, fields="files(id, name)").execute()
-                items = results.get('files', [])
-                
-                if items:
-                    for item in items:
-                        try:
-                            service.files().delete(fileId=item['id']).execute()
-                            drive_count += 1
-                        except: pass
-            else:
-                 drive_count = "Skipped (No Parent ID)"
-        except Exception as e:
-            drive_count = f"Error: {e}"
-            
+        all_colls = [col_pdfs, col_trash, col_locked, col_trash_locked]
+        all_links = []
+        for coll in all_colls:
+            if coll is not None:
+                for doc in coll.find({}, {"link": 1}):
+                    if "link" in doc and doc["link"]:
+                        all_links.append(doc["link"])
+        
+        all_links = list(set(all_links)) # unique only
+        
+        for i in range(0, len(all_links), 15):
+            chunk = all_links[i:i+15]
+            results = await asyncio.gather(*(asyncio.to_thread(_drive_delete_file, l) for l in chunk), return_exceptions=True)
+            drive_count += sum(1 for r in results if r is True)
+
+        # 2. MongoDB Wipe
+        await status_msg.edit_text("🔥 <b>STEP 2/3: Purging Database...</b>", parse_mode="HTML")
+        db_count = 0
+        for coll in all_colls:
+            if coll is not None:
+                try:
+                    x = coll.delete_many({})
+                    db_count += x.deleted_count
+                except: pass
+
         # 3. Local Wipe
-        await status_msg.edit_text("🔥 **STEP 3/3: Sterilizing Local Environment...**")
+        await status_msg.edit_text("🔥 <b>STEP 3/3: Sterilizing Local Environment...</b>", parse_mode="HTML")
         local_count = 0
         for file in os.listdir():
             if file.endswith(".pdf"):
-                try: 
+                try:
                     os.remove(file)
                     local_count += 1
                 except: pass
-                
-        # Final Report
+
         report = (
-            "☢️ **NUCLEAR WIPEOUT COMPLETE** ☢️\n"
+            "☢️ <b>NUCLEAR WIPEOUT COMPLETE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🛢 **Database:** {db_count} records destroyed.\n"
-            f"☁️ **Drive:** {drive_count} items incinerated.\n"
-            f"💻 **Local:** {local_count} files purged.\n\n"
-            "☠️ **NUKE COMPLETE.**\n\n"
+            f"☁️ <b>Drive:</b> <code>{drive_count}</code> files destroyed.\n"
+            f"🛢 <b>Database:</b> <code>{db_count}</code> records destroyed.\n"
+            f"💻 <b>Local:</b> <code>{local_count}</code> files purged.\n\n"
+            "☠️ <b>NUKE COMPLETE.</b>\n"
             "The system has been purged, Master."
         )
-        await status_msg.edit_text(report)
+        await status_msg.edit_text(report, parse_mode="HTML")
         await state.clear()
-        
-        # Reset Menu
-        await message.answer("💎 **READY FOR REBIRTH.**", reply_markup=get_main_menu())
+        await message.answer("💎 <b>READY FOR REBIRTH.</b>", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
     else:
-        await message.answer("Please confirm with the button or go back.")
+        await message.answer("⚠️ Use the confirmation buttons to proceed.", parse_mode="HTML")
 
 # ==========================================
 # 🩺 DIAGNOSIS SYSTEM
@@ -3390,73 +3058,80 @@ async def nuke_execution(message: types.Message, state: FSMContext):
 @dp.message(F.text == "🩺 System Diagnosis")
 async def perform_bot4_diagnosis(message: types.Message):
     if not is_admin(message.from_user.id): return
-    
-    status_msg = await message.answer("🔄 **INITIATING DEEP SYSTEM SCAN...**")
-    start_time = time.time()
-    
-    # Trackers
+
+    status_msg = await message.answer("🔄 <b>INITIATING DEEP SYSTEM SCAN...</b>", parse_mode="HTML")
+    scan_start = time.time()
     health_score = 100
     issues = []
-    
-    # 1. ENVIRONMENT CHECK
-    await status_msg.edit_text("🔐 **SCANNING: SECURITY ENVIRONMENT...**")
+
+    # ── 1. ENVIRONMENT ────────────────────────────────────────
+    await status_msg.edit_text("🔐 <b>SCANNING: ENVIRONMENT...</b>", parse_mode="HTML")
     env_checks = []
-    if BOT_TOKEN: env_checks.append("✅ Bot Token")
-    else: 
-        env_checks.append("❌ Bot Token Missing"); health_score -= 50; issues.append("Critial: No Token")
-        
-    if MONGO_URI: env_checks.append("✅ Mongo URI")
-    else: 
-        env_checks.append("❌ Mongo URI Missing"); health_score -= 30; issues.append("Critical: No DB URI")
-        
-    if os.path.exists(CREDENTIALS_FILE): env_checks.append("✅ Credentials.json")
-    else: 
-        env_checks.append("❌ Credentials.json Missing"); health_score -= 20; issues.append("Auth: No Credentials")
-        
-    if os.path.exists(TOKEN_FILE): env_checks.append("✅ Token Pickle")
-    else: env_checks.append("⚠️ Token Pickle (Will Re-Auth)")
-    
-    await asyncio.sleep(0.5)
-    
-    # 2. DATABASE LATENCY
-    await status_msg.edit_text("🍃 **SCANNING: DATABASE TOPOLOGY...**")
-    db_status = "❌ FAIL"
+    if BOT_TOKEN:
+        env_checks.append("✅ Bot Token")
+    else:
+        env_checks.append("❌ Bot Token"); health_score -= 50; issues.append("CRITICAL: No Bot Token")
+    if MONGO_URI:
+        env_checks.append("✅ Mongo URI")
+    else:
+        env_checks.append("❌ Mongo URI"); health_score -= 30; issues.append("CRITICAL: No DB URI")
+    if os.path.exists(CREDENTIALS_FILE):
+        env_checks.append("✅ credentials.json")
+    else:
+        env_checks.append("⚠️ credentials.json"); issues.append("Drive: credentials.json missing (PDF upload disabled)")
+    if os.path.exists(TOKEN_FILE):
+        env_checks.append("✅ token.pickle")
+    else:
+        env_checks.append("⚠️ token.pickle (will re-auth)")
+    if PARENT_FOLDER_ID:
+        env_checks.append("✅ PARENT_FOLDER_ID")
+    else:
+        env_checks.append("⚠️ PARENT_FOLDER_ID (PDFs go to root)")
+    await asyncio.sleep(0.4)
+
+    # ── 2. DATABASE ───────────────────────────────────────────
+    await status_msg.edit_text("🍃 <b>SCANNING: DATABASE...</b>", parse_mode="HTML")
+    db_status = "❌ OFFLINE"
     mongo_lat = 0
     try:
         t0 = time.time()
-        db_client.admin.command('ping')
-        t1 = time.time()
-        mongo_lat = (t1 - t0) * 1000
-        db_status = f"✅ ONLINE ({mongo_lat:.1f}ms)"
-        if mongo_lat > 500: 
-            health_score -= 5; issues.append(f"High DB Latency ({mongo_lat:.0f}ms)")
+        db_client.admin.command("ping")
+        mongo_lat = (time.time() - t0) * 1000
+        lat_icon = "✅" if mongo_lat < 150 else ("🟡" if mongo_lat < 500 else "🔴")
+        db_status = f"{lat_icon} ONLINE ({mongo_lat:.1f}ms)"
+        if mongo_lat > 500:
+            health_score -= 10; issues.append(f"High DB Latency: {mongo_lat:.0f}ms")
     except Exception as e:
-        db_status = f"❌ FAIL: {str(e)[:20]}..."
+        db_status = f"❌ FAIL: {str(e)[:30]}"
         health_score -= 30; issues.append("Database Disconnected")
+    await asyncio.sleep(0.4)
 
-    await asyncio.sleep(0.5)
+    # ── 3. COLLECTION COUNTS ──────────────────────────────────
+    await status_msg.edit_text("📊 <b>SCANNING: COLLECTIONS...</b>", parse_mode="HTML")
+    pdf_count    = col_pdfs.count_documents({})         if col_pdfs         is not None else "N/A"
+    trash_count  = col_trash.count_documents({})        if col_trash        is not None else "N/A"
+    locked_count = col_locked.count_documents({})       if col_locked       is not None else "N/A"
+    admin_count  = col_admins.count_documents({})       if col_admins       is not None else "N/A"
+    banned_count = col_banned.count_documents({})       if col_banned       is not None else "N/A"
+    await asyncio.sleep(0.3)
 
-    # 3. GOOGLE DRIVE API
-    await status_msg.edit_text("☁️ **SCANNING: GOOGLE DRIVE UPLINK...**")
-    drive_status = "❌ FAIL"
-    api_lat = 0
-    try:
-        t0 = time.time()
-        service = get_drive_service()
-        # Check Identity instead of Root (More robust)
-        about = service.about().get(fields="user").execute()
-        email = about.get('user', {}).get('emailAddress', 'Unknown')
-        t1 = time.time()
-        api_lat = (t1 - t0) * 1000
-        drive_status = f"✅ ONLINE ({api_lat:.1f}ms)\n   👤 Auth: `{email}`"
-    except Exception as e:
-        drive_status = f"❌ FAIL: {str(e)[:50]}..."
-        health_score -= 30; issues.append(f"Drive Auth Error")
+    # ── 4. GOOGLE DRIVE ───────────────────────────────────────
+    await status_msg.edit_text("☁️ <b>SCANNING: GOOGLE DRIVE...</b>", parse_mode="HTML")
+    drive_status = "⚠️ SKIPPED (no credentials)"
+    if os.path.exists(CREDENTIALS_FILE):
+        try:
+            t0 = time.time()
+            svc = await asyncio.to_thread(get_drive_service)
+            svc.files().list(pageSize=1, fields="files(id)").execute()
+            drive_lat = (time.time() - t0) * 1000
+            drive_status = f"✅ CONNECTED ({drive_lat:.0f}ms)"
+        except Exception as e:
+            drive_status = f"❌ FAIL: {str(e)[:40]}"
+            health_score -= 10; issues.append("Drive Auth Failed")
+    await asyncio.sleep(0.3)
 
-    await asyncio.sleep(0.5)
-
-    # 4. FILESYSTEM
-    await status_msg.edit_text("📁 **SCANNING: LOCAL FILESYSTEM...**")
+    # ── 5. FILESYSTEM ─────────────────────────────────────────
+    await status_msg.edit_text("📁 <b>SCANNING: FILESYSTEM...</b>", parse_mode="HTML")
     fs_status = "✅ WRITEABLE"
     try:
         with open("test_write.tmp", "w") as f: f.write("test")
@@ -3464,78 +3139,260 @@ async def perform_bot4_diagnosis(message: types.Message):
     except Exception as e:
         fs_status = f"❌ READ-ONLY ({e})"
         health_score -= 20; issues.append("Filesystem Read-Only")
+    await asyncio.sleep(0.3)
 
-    # Final Compilation
-    scan_duration = time.time() - start_time
-    
-    # Color Logic
-    health_emoji = "🟢 EXCELLENT"
-    if health_score < 90: health_emoji = "🟡 GOOD"
-    if health_score < 70: health_emoji = "🟠 DEGRADED"
-    if health_score < 50: health_emoji = "🔴 CRITICAL FAILURE"
-    
+    # ── BUILD REPORT ──────────────────────────────────────────
+    scan_duration = time.time() - scan_start
+    uptime_secs   = int(time.time() - START_TIME)
+    uptime_str    = f"{uptime_secs // 3600}h {(uptime_secs % 3600) // 60}m {uptime_secs % 60}s"
+    now_str       = now_local().strftime("%b %d, %Y  ·  %I:%M %p")
+
+    if health_score >= 95:   health_emoji = "🟢 EXCELLENT"
+    elif health_score >= 80: health_emoji = "🟡 GOOD"
+    elif health_score >= 60: health_emoji = "🟠 DEGRADED"
+    else:                    health_emoji = "🔴 CRITICAL"
+
     report = (
-        f"🩺 **SYSTEM DIAGNOSTIC REPORT**\n"
+        f"🩺 <b>SYSTEM DIAGNOSTIC REPORT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌡️ **HEALTH SCORE:** {health_emoji} ({health_score}%)\n"
-        f"🤡 **Scan Duration:** `{scan_duration:.2f}s`\n\n"
-        
-        f"🔐 **ENVIRONMENT**\n"
-        f"• {'  '.join(env_checks)}\n\n"
-        
-        f"🍃 **DATABASE CORE**\n"
+        f"🌡️ <b>Health:</b> {health_emoji} <code>({health_score}%)</code>\n"
+        f"🕐 <b>Scan Time:</b> <code>{scan_duration:.2f}s</code>  |  ⏱ <b>Uptime:</b> <code>{uptime_str}</code>\n"
+        f"📅 <b>Report:</b> <code>{now_str}</code>\n\n"
+
+        f"🔐 <b>ENVIRONMENT</b>\n"
+        + "\n".join(f"• {c}" for c in env_checks) +
+
+        f"\n\n🍃 <b>DATABASE</b>\n"
         f"• Status: {db_status}\n"
-        f"• Records: {col_pdfs.count_documents({}) if col_pdfs is not None else 'N/A'}\n\n"
-        
-        f"☁️ **GOOGLE UPLINK**\n"
-        f"• Status: {drive_status}\n"
-        f"• Parent ID: `{PARENT_FOLDER_ID if PARENT_FOLDER_ID else 'WARNING: USING ROOT'}`\n\n"
-        
-        f"💻 **HOST SYSTEM**\n"
-        f"• Filesystem: {fs_status}\n"
-        f"• Process ID: `{os.getpid()}`\n\n"
+        f"• Process: <code>{os.getpid()}</code>\n\n"
+
+        f"📊 <b>COLLECTIONS</b>\n"
+        f"• 📚 Active PDFs: <code>{pdf_count}</code>\n"
+        f"• 🗑 Recycle Bin: <code>{trash_count}</code>\n"
+        f"• 🔒 Locked PDFs: <code>{locked_count}</code>\n"
+        f"• 👥 Admins: <code>{admin_count}</code>\n"
+        f"• 🚫 Banned: <code>{banned_count}</code>\n\n"
+
+        f"☁️ <b>GOOGLE DRIVE</b>\n"
+        f"• {drive_status}\n\n"
+
+        f"💻 <b>HOST SYSTEM</b>\n"
+        f"• Filesystem: {fs_status}\n\n"
+
+        f"📈 <b>SESSION STATS</b>\n"
+        f"• 📄 PDFs Generated: <code>{DAILY_STATS_BOT4['pdfs_generated']}</code>\n"
+        f"• 🔗 Links Retrieved: <code>{DAILY_STATS_BOT4['links_retrieved']}</code>\n"
+        f"• 🗑 PDFs Deleted: <code>{DAILY_STATS_BOT4['pdfs_deleted']}</code>\n"
+        f"• ⚠️ Errors: <code>{DAILY_STATS_BOT4['errors']}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
-    
+
+    SOLUTIONS = {
+        "CRITICAL: No Bot Token":      "Set BOT_4_TOKEN in bot4.env or Render env vars",
+        "CRITICAL: No DB URI":         "Set MONGO_URI in bot4.env or Render env vars",
+        "Database Disconnected":       "Check MONGO_URI, Atlas IP whitelist (0.0.0.0/0), or restart",
+        "Drive Auth Failed":           "Delete token.pickle and re-run OAuth, or check credentials.json",
+        "Filesystem Read-Only":        "Check Render disk permissions or free disk space",
+        "Drive: credentials.json missing (PDF upload disabled)": "Upload credentials.json to deploy dir",
+    }
+    # Extra live checks
+    try:
+        _adm_active = col_admins.count_documents({"locked": False}) if col_admins else 0
+        _adm_locked = col_admins.count_documents({"locked": True})  if col_admins else 0
+    except: _adm_active = _adm_locked = 0
+    try:
+        _dbb = db_client["MSANodeDB"]
+        _lb  = _dbb["bot4_monthly_backups"].find_one({}, sort=[("date", -1)])
+        _lb_str = _lb["month"] if _lb else "Never"
+    except: _lb_str = "?"
+    try:
+        import psutil as _ps
+        _proc = _ps.Process(os.getpid())
+        _mem  = _proc.memory_info().rss / 1024 / 1024
+        _cpu  = _proc.cpu_percent(interval=0.3)
+        mem_line = f"• RAM: <code>{_mem:.1f} MB</code>  CPU: <code>{_cpu:.1f}%</code>\n"
+    except: mem_line = ""
+    report += (
+        "\n👤 <b>ADMIN STATUS</b>\n"
+        f"• 🟢 Active: <code>{_adm_active}</code>  🔴 Locked: <code>{_adm_locked}</code>\n"
+        f"• 📦 Last Monthly Backup: <code>{_lb_str}</code>\n"
+    )
+    if mem_line: report += "\n💻 <b>PROCESS RESOURCES</b>\n" + mem_line
+    report += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     if issues:
-        report += f"⚠️ **ISSUES DETECTED:**\n"
-        for i in issues: report += f"• {i}\n"
-        report += "\n🛑 **ACTION REQUIRED.**"
+        report += f"⚠️ <b>ISSUES DETECTED ({len(issues)})</b>\n"
+        for i in issues:
+            sol = SOLUTIONS.get(i, "")
+            report += f"• 🔴 {i}\n"
+            if sol: report += f"  💡 <i>{sol}</i>\n"
+        report += "\n🛑 <b>ACTION REQUIRED.</b>"
     else:
-        report += "✅ **SYSTEM OPERATING AT PEAK EFFICIENCY.**"
-        
-    await status_msg.edit_text(report, parse_mode="Markdown")
+        report += "✅ <b>ALL SYSTEMS OPERATING AT PEAK EFFICIENCY.</b>"
+
+    await status_msg.edit_text(report, parse_mode="HTML")
 
 # ==========================================
-# 👥 ADMIN MANAGEMENT
+# 👥 ADMIN MANAGEMENT — HELPERS & CONSTANTS
+# ==========================================
+
+ROLE_MESSAGES = {
+    "🏅 MANAGER": lambda name: (
+        f"💼 <b>DESIGNATION UPDATED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Officer:</b> {name}\n"
+        f"🏅 <b>Role:</b> <code>Manager</code>\n\n"
+        f"You have been elevated to <b>Manager</b> status within MSA NODE SYSTEMS.\n"
+        f"This rank grants operational oversight and resource management authority.\n\n"
+        f"Serve with precision. Every action is logged.\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <i>MSA NODE SYSTEMS · Authorized by OWNER</i>"
+    ),
+    "⚙️ ADMIN": lambda name: (
+        f"🛡 <b>ACCESS GRANTED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Officer:</b> {name}\n"
+        f"⚙️ <b>Role:</b> <code>Admin</code>\n\n"
+        f"Your admin credentials are now active, {name}.\n"
+        f"Use your access responsibly.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <i>MSA NODE SYSTEMS · Authorized by OWNER</i>"
+    ),
+    "🔰 MODERATOR": lambda name: (
+        f"🔰 <b>ROLE ASSIGNED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Officer:</b> {name}\n"
+        f"🔰 <b>Role:</b> <code>Moderator</code>\n\n"
+        f"Welcome, {name}. You are now a Moderator.\n"
+        f"Your duty: maintain order, uphold standards.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <i>MSA NODE SYSTEMS · Authorized by OWNER</i>"
+    ),
+    "🎧 SUPPORT": lambda name: (
+        f"🎧 <b>SUPPORT DESIGNATION</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Officer:</b> {name}\n"
+        f"🎧 <b>Role:</b> <code>Support</code>\n\n"
+        f"You are now registered as Support staff, {name}.\n"
+        f"Assist with care, respond with precision.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <i>MSA NODE SYSTEMS · Authorized by OWNER</i>"
+    ),
+}
+PRESET_ROLES = ["🏅 MANAGER", "⚙️ ADMIN", "🔰 MODERATOR", "🎧 SUPPORT"]
+
+def _admin_select_keyboard(admins, page=0, include_status=False):
+    """Paginated admin selection keyboard. Returns (markup, page_admins, page, max_page)."""
+    total = len(admins)
+    if total == 0:
+        return None, [], 0, 0
+    max_page = max(0, (total - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, max_page))
+    page_admins = admins[page * ADMIN_PAGE_SIZE:(page + 1) * ADMIN_PAGE_SIZE]
+    builder = ReplyKeyboardBuilder()
+    for a in page_admins:
+        uid = a.get("user_id")
+        name = a.get("name", "")
+        locked = a.get("locked", False)
+        if include_status:
+            lock_icon = "🔴" if locked else "🟢"
+            label = f"👤 {name} ({uid}) {lock_icon}" if name else f"👤 {uid} {lock_icon}"
+        else:
+            label = f"👤 {name} ({uid})" if name else f"👤 {uid}"
+        builder.add(KeyboardButton(text=label))
+    builder.adjust(1 if len(page_admins) <= 4 else 2)
+    nav = []
+    if page > 0: nav.append(KeyboardButton(text="⬅️ PREV PAGE"))
+    if page < max_page: nav.append(KeyboardButton(text="➡️ NEXT PAGE"))
+    if nav: builder.row(*nav)
+    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
+    return builder.as_markup(resize_keyboard=True), page_admins, page, max_page
+
+def _parse_admin_id_from_btn(text):
+    """Parse '👤 Name (12345)' or '👤 12345' or '👤 12345 🔴' → int ID."""
+    try:
+        t = text.strip()
+        # '👤' is a single Unicode char; prefix '👤 ' is exactly 2 chars, not 3
+        if t.startswith("👤 "): t = t[len("👤 "):]
+        if "(" in t and ")" in t:
+            uid_str = t.rsplit("(", 1)[1].split(")")[0].strip()
+            return int(uid_str)
+        return int(t.split()[0].strip())
+    except:
+        return None
+
+async def _send_role_welcome_message(uid, role, name):
+    """Send personalized role message to a specific admin. Silent on error."""
+    fn = ROLE_MESSAGES.get(role)
+    if fn is None: return
+    try:
+        await bot.send_message(uid, fn(name), parse_mode="HTML")
+    except Exception as e:
+        logging.warning(f"Could not send role message to {uid}: {e}")
+
+def _admin_doc_by_id(uid):
+    """Find admin doc by int or str user_id."""
+    doc = col_admins.find_one({"user_id": uid})
+    if not doc:
+        doc = col_admins.find_one({"user_id": str(uid)})
+    return doc
+
+def _update_admin_field(uid, field, value):
+    res = col_admins.update_one({"user_id": uid}, {"$set": {field: value}})
+    if res.matched_count == 0:
+        col_admins.update_one({"user_id": str(uid)}, {"$set": {field: value}})
+
+def update_admin_perms(user_id, perms):
+    _update_admin_field(user_id, "permissions", perms)
+
+def update_admin_role(user_id, role):
+    _update_admin_field(user_id, "role", role)
+
+def update_admin_lock(user_id, locked):
+    _update_admin_field(user_id, "locked", locked)
+
+
+# ==========================================
+# ⚙️ ADMIN CONFIG MENU
 # ==========================================
 @dp.message(F.text == "⚙️ Admin Config")
 async def admin_config_btn(message: types.Message):
     if not is_admin(message.from_user.id): return
-    
+    admin_count = col_admins.count_documents({}) if col_admins is not None else 0
     builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="➕ Add Admin"), KeyboardButton(text="➖ Remove Admin"))
-    builder.row(KeyboardButton(text="🔑 Permissions"), KeyboardButton(text="🎭 Manage Roles"))
-    builder.row(KeyboardButton(text="🔒 Lock/Unlock User"), KeyboardButton(text="🚫 Banned Users"))
-    builder.row(KeyboardButton(text="📜 List Admins"))
+    builder.row(KeyboardButton(text="➕ ADD ADMIN"), KeyboardButton(text="➖ REMOVE ADMIN"))
+    builder.row(KeyboardButton(text="🔑 PERMISSIONS"), KeyboardButton(text="🎭 MANAGE ROLES"))
+    builder.row(KeyboardButton(text="🔒 LOCK / UNLOCK"), KeyboardButton(text="🚫 BANNED USERS"))
+    builder.row(KeyboardButton(text="📜 LIST ADMINS"))
     builder.row(KeyboardButton(text="🔙 Back to Menu"))
-    
     await message.answer(
-        "👥 **ADMINISTRATION CONSOLE**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Manage authorized users and security protocols.\n"
-        "Select an option:",
-        reply_markup=builder.as_markup(resize_keyboard=True)
+        f"👥 <b>ADMINISTRATION CONSOLE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👑 <b>Owner:</b> <code>{OWNER_ID}</code>\n"
+        f"👥 <b>Admins Registered:</b> <code>{admin_count}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Select an operation:",
+        reply_markup=builder.as_markup(resize_keyboard=True),
+        parse_mode="HTML"
     )
 
-# === ADD ADMIN ===
-@dp.message(F.text == "➕ Add Admin")
+
+# ==========================================
+# ➕ ADD ADMIN
+# ==========================================
+@dp.message(F.text == "➕ ADD ADMIN")
 async def add_admin_btn(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
     await message.answer(
-        "➕ **ADD ADMINISTRATOR**\n"
-        "Enter the **Telegram User ID** to promote.\n"
-        "⚠️ They will have full access.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")], [KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
+        "➕ <b>ADD ADMINISTRATOR</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Enter the <b>Telegram User ID</b> to promote.\n"
+        "📌 New admins are <b>LOCKED</b> by default.\n"
+        "Activate via <b>🔒 LOCK / UNLOCK</b> when ready.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu")]],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_admin_id)
 
@@ -3543,45 +3400,72 @@ async def add_admin_btn(message: types.Message, state: FSMContext):
 async def process_add_admin(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
-    if text == "⬅️ BACK": 
-        await admin_config_btn(message)
-        await state.clear()
-        return
-
+    if text == "⬅️ BACK": await state.clear(); return await admin_config_btn(message)
     if not text.isdigit():
-        await message.answer("⚠️ Invalid ID.")
-        return
-        
-    new_admin_id = int(text)
-    
-    if is_admin(new_admin_id):
-        await message.answer("⚠️ User is already an Admin.")
-        return
-        
+        await message.answer("⚠️ Invalid ID. Numbers only."); return
+    new_id = int(text)
+    if new_id == OWNER_ID:
+        await message.answer("❌ Owner already has supreme access — cannot add as admin."); return
+    if _admin_doc_by_id(new_id):
+        await message.answer(
+            f"⚠️ <b>ALREADY EXISTS</b>\n"
+            f"<code>{new_id}</code> is already registered as an admin.\n"
+            f"Use <b>➖ REMOVE ADMIN</b> first to re-add.",
+            parse_mode="HTML"
+        ); return
+    if is_banned(new_id):
+        await message.answer(
+            f"⛔ <b>CANNOT ADD BANNED USER</b>\n"
+            f"<code>{new_id}</code> is on the blacklist.\n"
+            f"Unban first via <b>🚫 BANNED USERS</b>.",
+            parse_mode="HTML"
+        ); return
+    name = ""
+    try:
+        chat = await bot.get_chat(new_id)
+        name = chat.full_name or ""
+    except: pass
     col_admins.insert_one({
-        "user_id": new_admin_id,
+        "user_id": new_id,
+        "name": name,
+        "role": "⚙️ ADMIN",
+        "permissions": [],  # All OFF by default — owner grants individually
+        "locked": True,
         "added_by": message.from_user.id,
-        "timestamp": datetime.now(),
-        "locked": True # LOCKED BY DEFAULT
+        "timestamp": now_local()
     })
-    
+    display = f"👤 {name} (<code>{new_id}</code>)" if name else f"<code>{new_id}</code>"
     await message.answer(
-        f"✅ **USER ADDED**\n"
-        f"👤 ID: `{new_admin_id}`\n"
-        f"🔒 Status: **LOCKED (Inactive)**\n"
-        f"⚠️ **Action Required:** Go to `🔒 Lock/Unlock` to grant access."
+        f"✅ <b>ADMIN ADDED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 {display}\n"
+        f"🎭 Role: <code>⚙️ ADMIN</code>\n"
+        f"🔒 Status: <b>LOCKED</b> (Inactive)\n\n"
+        f"⚠️ Unlock via <b>🔒 LOCK / UNLOCK</b> to activate.",
+        parse_mode="HTML"
     )
     await state.clear()
     await admin_config_btn(message)
 
-# === REMOVE ADMIN ===
-@dp.message(F.text == "➖ Remove Admin")
+
+# ==========================================
+# ➖ REMOVE ADMIN
+# ==========================================
+@dp.message(F.text == "➖ REMOVE ADMIN")
 async def remove_admin_btn(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
+    admins = list(col_admins.find())
+    if not admins:
+        await message.answer("⚠️ No admins registered."); return
+    markup, _, page, max_page = _admin_select_keyboard(admins, page=0, include_status=True)
+    await state.update_data(rm_page=0)
     await message.answer(
-        "➖ **REMOVE ADMINISTRATOR**\n"
-        "Enter the **Telegram User ID** to demote.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")], [KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
+        f"➖ <b>REMOVE ADMINISTRATOR</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Total: <code>{len(admins)}</code> admin(s)\n"
+        f"🟢 Active  🔴 Locked\n\n"
+        f"Select admin to remove:",
+        reply_markup=markup, parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_remove_admin)
 
@@ -3589,460 +3473,521 @@ async def remove_admin_btn(message: types.Message, state: FSMContext):
 async def process_remove_admin(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
-    if text == "⬅️ BACK": 
-        await admin_config_btn(message)
-        await state.clear()
+    if text == "⬅️ BACK": await state.clear(); return await admin_config_btn(message)
+    if text in ("⬅️ PREV PAGE", "➡️ NEXT PAGE"):
+        data = await state.get_data()
+        page = data.get("rm_page", 0) + (1 if "NEXT" in text else -1)
+        admins = list(col_admins.find())
+        markup, _, page, _ = _admin_select_keyboard(admins, page=page, include_status=True)
+        await state.update_data(rm_page=page)
+        await message.answer(f"📋 Page {page + 1}", reply_markup=markup, parse_mode="HTML")
         return
-
-    if not text.isdigit():
-        await message.answer("⚠️ Invalid ID.")
-        return
-        
-    target_id = int(text)
-    
-    if target_id == OWNER_ID:
-        await message.answer("❌ Cannot remove the Owner.")
-        return
-        
-    res = col_admins.delete_one({"user_id": target_id})
-    if res.deleted_count > 0:
-        await message.answer(f"✅ **SUCCESS:** User `{target_id}` demoted.")
-    else:
-        # Try string cleanup
-        res = col_admins.delete_one({"user_id": str(target_id)})
-        if res.deleted_count > 0:
-             await message.answer(f"✅ **SUCCESS:** User `{target_id}` demoted.")
-        else:
-             await message.answer("⚠️ User is not an admin.")
-             
+    uid = _parse_admin_id_from_btn(text)
+    if uid is None:
+        await message.answer("⚠️ Invalid selection."); return
+    if uid == OWNER_ID:
+        await message.answer("❌ Cannot remove the Owner."); return
+    res = col_admins.delete_one({"user_id": uid})
+    if res.deleted_count == 0:
+        col_admins.delete_one({"user_id": str(uid)})
+    await message.answer(
+        f"🗑 <b>ADMIN REMOVED</b>\n"
+        f"<code>{uid}</code> has been demoted successfully.",
+        parse_mode="HTML"
+    )
     await state.clear()
     await admin_config_btn(message)
 
-# === LIST ADMINS ===
-@dp.message(F.text == "📜 List Admins")
-async def list_admins_btn(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    
-    admins = list(col_admins.find())
-    msg = ["👥 **ADMINISTRATORS**", "━━━━━━━━━━━━━━━━━━━━"]
-    msg.append(f"👑 `{OWNER_ID}` (Owner)")
-    
-    for a in admins:
-        uid = a.get('user_id')
-        role = a.get('role', 'Standard Admin')
-        locked = a.get('locked', False)
-        
-        status_icon = "🛑 LOCKED" if locked else "✅ Active"
-        
-        msg.append(f"👤 `{uid}`\n   ├ 🏷 **Role:** {role}\n   └ 📊 **Status:** {status_icon}")
-        
-    await message.answer("\n".join(msg))
 
-# === PERMISSION MANAGEMENT ===
-@dp.message(F.text == "🔑 Permissions")
+# ==========================================
+# 📜 LIST ADMINS
+# ==========================================
+@dp.message(F.text == "📜 LIST ADMINS")
+async def list_admins_btn(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await state.update_data(list_admins_page=0)
+    await state.set_state(BotState.viewing_admin_list)
+    await _send_admin_list_page(message, page=0)
+
+async def _send_admin_list_page(message, page: int):
+    """Paginated admin roster — 10 per page, prev/next when needed."""
+    PAGE_SIZE = 10
+    admins = list(col_admins.find())
+    total = len(admins)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    page_admins = admins[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    now_str = now_local().strftime("%b %d, %Y  ·  %I:%M %p")
+    lines = [
+        f"👥 <b>ADMIN ROSTER</b>  (Page {page+1}/{total_pages})",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🕐 <code>{now_str}</code>",
+        f"👑 <b>OWNER:</b> <code>{OWNER_ID}</code>",
+        f"📊 Total: <code>{total}</code> admin(s)\n",
+    ]
+    if not admins:
+        lines.append("<i>No additional admins registered.</i>")
+    else:
+        start_idx = page * PAGE_SIZE + 1
+        for idx, a in enumerate(page_admins, start=start_idx):
+            uid = a.get("user_id")
+            name = a.get("name", "")
+            role = a.get("role", "Admin")
+            locked = a.get("locked", False)
+            ts = a.get("timestamp")
+            date_str = ts.strftime("%b %d, %Y  ·  %I:%M %p") if isinstance(ts, datetime) else "Unknown"
+            status = "🔴 LOCKED" if locked else "🟢 ACTIVE"
+            display = f"👤 {name} (<code>{uid}</code>)" if name else f"👤 <code>{uid}</code>"
+            perms = a.get("permissions", [])
+            perm_count = len(perms) if perms else 0
+            lines.append(
+                f"<b>{idx}.</b> {display}\n"
+                f"   🎭 <code>{role}</code>  |  {status}\n"
+                f"   🔑 Permissions: <code>{perm_count}</code>\n"
+                f"   📅 <code>{date_str}</code>\n"
+            )
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    # Keyboard with prev/next if needed
+    nav_row = []
+    if page > 0:
+        nav_row.append(KeyboardButton(text="⬅️ PREV ADMINS"))
+    if (page + 1) < total_pages:
+        nav_row.append(KeyboardButton(text="➡️ NEXT ADMINS"))
+    keyboard_rows = []
+    if nav_row:
+        keyboard_rows.append(nav_row)
+    keyboard_rows.append([KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu")])
+    markup = ReplyKeyboardMarkup(keyboard=keyboard_rows, resize_keyboard=True)
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=markup)
+
+@dp.message(BotState.viewing_admin_list)
+async def admin_list_pagination_handler(message: types.Message, state: FSMContext):
+    text = message.text or ""
+    if text == "🔙 Back to Menu": await state.clear(); return await start(message, state)
+    if text in ("⬅️ BACK", "⬅️ BACK TO MENU"): await state.clear(); return await admin_config_btn(message)
+    data = await state.get_data()
+    page = data.get("list_admins_page", 0)
+    if text == "➡️ NEXT ADMINS":
+        page += 1
+    elif text == "⬅️ PREV ADMINS":
+        page = max(0, page - 1)
+    else:
+        return
+    await state.update_data(list_admins_page=page)
+    await _send_admin_list_page(message, page)
+
+
+# ==========================================
+# 🔑 PERMISSIONS
+# ==========================================
+@dp.message(F.text == "🔑 PERMISSIONS")
 async def permissions_entry(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
-        await message.answer("⛔ **ACCESS DENIED.**\nOnly the Owner can modify clearance levels.")
-        return
-
+        await message.answer("⛔ <b>OWNER ONLY.</b>", parse_mode="HTML"); return
     admins = list(col_admins.find())
     if not admins:
-        await message.answer("⚠️ No admins found to manage.")
-        return
-
-    # Generate Admin List
-    msg = ["🔑 **SELECT ADMINISTRATOR**", "━━━━━━━━━━━━━━━━━━━━"]
-    builder = ReplyKeyboardBuilder()
-    
-    for idx, a in enumerate(admins, 1):
-        uid = a.get('user_id')
-        name = f"Admin {idx}" 
-        # Try to get name if possible or just use ID
-        msg.append(f"**{idx}.** `{uid}`")
-        builder.add(KeyboardButton(text=f"{idx}. {uid}"))
-        
-    builder.adjust(2)
-    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
+        await message.answer("⚠️ No admins to configure."); return
+    markup, _, page, _ = _admin_select_keyboard(admins, page=0, include_status=True)
+    await state.update_data(perm_page=0)
     await message.answer(
-        "\n".join(msg) + "\n\n👇 **Select an Admin to configure:**",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
+        f"🔑 <b>PERMISSIONS — SELECT ADMIN</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Active  |  🔴 Locked\n"
+        f"<i>Locked admins cannot have permissions modified.</i>\n\n"
+        f"Select admin to configure:",
+        reply_markup=markup, parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_perm_admin)
 
 @dp.message(BotState.waiting_for_perm_admin)
 async def permissions_admin_select(message: types.Message, state: FSMContext):
-    text = message.text
+    text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
-    if text == "⬅️ BACK": return await admin_config_btn(message)
-    
-    # Parse selection "1. 12345"
-    target_id = None
-    try:
-        if ". " in text:
-            target_id = int(text.split(". ")[1])
-        else:
-            target_id = int(text) # Fallback if they type ID
-    except:
-        await message.answer("⚠️ Invalid Selection.")
+    if text == "⬅️ BACK": await state.clear(); return await admin_config_btn(message)
+    if text in ("⬅️ PREV PAGE", "➡️ NEXT PAGE"):
+        data = await state.get_data()
+        page = data.get("perm_page", 0) + (1 if "NEXT" in text else -1)
+        admins = list(col_admins.find())
+        markup, _, page, _ = _admin_select_keyboard(admins, page=page, include_status=True)
+        await state.update_data(perm_page=page)
+        await message.answer(f"📋 Page {page + 1}", reply_markup=markup, parse_mode="HTML")
         return
-        
-    # Verify Admin
-    admin_doc = col_admins.find_one({"user_id": target_id})
-    if not admin_doc:
-        # Check str id
-        admin_doc = col_admins.find_one({"user_id": str(target_id)})
-        
-    if not admin_doc:
-        await message.answer("❌ Admin not found.")
-        return
-        
-    await state.update_data(perm_target_id=target_id)
-    await render_permission_menu(message, state, target_id)
+    uid = _parse_admin_id_from_btn(text)
+    if uid is None:
+        await message.answer("⚠️ Invalid selection."); return
+    doc = _admin_doc_by_id(uid)
+    if not doc:
+        await message.answer("❌ Admin not found."); return
+    if doc.get("locked", False):
+        # Owner CAN still modify – will take effect when admin is unlocked
+        await message.answer(
+            "🔒 <b>Admin is locked</b>\n"
+            "ℹ️ Changes saved — will take effect when unlocked.",
+            parse_mode="HTML"
+        )
+    await state.update_data(perm_target_id=uid)
+    await render_permission_menu(message, state, uid)
 
 async def render_permission_menu(message, state, target_id):
-    # Fetch current permissions
-    # If key 'permissions' missing, assume ALL enabled
-    admin_doc = col_admins.find_one({"user_id": target_id})
-    if not admin_doc: admin_doc = col_admins.find_one({"user_id": str(target_id)})
-    
-    current_perms = admin_doc.get("permissions", DEFAULT_PERMISSIONS)
-    
+    doc = _admin_doc_by_id(target_id)
+    if not doc: return
+    name = doc.get("name", "")
+    current_perms = doc.get("permissions", list(DEFAULT_PERMISSIONS))
     builder = ReplyKeyboardBuilder()
-    
-    # Iterate through MAP to build toggles
-    # PERMISSION_MAP = {"Text": "key"}
-    # We want button text to be "✅ Generate PDF" or "❌ Generate PDF"
-    
     for btn_text, key in PERMISSION_MAP.items():
         status = "✅" if key in current_perms else "❌"
-        # Clean button text (remove existing emojis if duplicate?)
-        # btn_text has emojis like "📄 Generate PDF". 
-        # Result: "✅ 📄 Generate PDF"
-        label = f"{status} {btn_text}"
-        builder.add(KeyboardButton(text=label))
-        
+        builder.add(KeyboardButton(text=f"{status} {btn_text}"))
     builder.adjust(2)
     builder.row(KeyboardButton(text="🔐 GRANT ALL"), KeyboardButton(text="🔒 REVOKE ALL"))
     builder.row(KeyboardButton(text="💾 SAVE CHANGES"))
     builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
+    display = f"👤 {name} ({target_id})" if name else f"{target_id}"
     await message.answer(
-        f"⚙️ **CONFIGURING: `{target_id}`**\n"
+        f"🔑 <b>PERMISSIONS: {display}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ = Access Granted\n"
-        f"❌ = Access Denied\n\n"
-        f"👇 **Toggle features below:**",
+        f"✅ = Granted  |  ❌ = Denied\n\n"
+        f"Tap a feature to toggle:",
         reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_perm_toggle)
 
 @dp.message(BotState.waiting_for_perm_toggle)
 async def process_perm_toggle(message: types.Message, state: FSMContext):
-    text = message.text
+    text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
     if text == "⬅️ BACK": return await permissions_entry(message, state)
-    
-    # Handle SAVE
-    if text == "💾 SAVE CHANGES":
-        await message.answer("✅ **SETTINGS SAVED SUCCESSFULLY**")
-        await permissions_entry(message, state) # Return to Admin List
-        return
-    
     data = await state.get_data()
     target_id = data.get("perm_target_id")
-    
-    # Reload doc
-    admin_doc = col_admins.find_one({"user_id": target_id})
-    if not admin_doc: admin_doc = col_admins.find_one({"user_id": str(target_id)})
-    current_perms = admin_doc.get("permissions", DEFAULT_PERMISSIONS)
-    
-    # HANDLE BULK
+    if text == "💾 SAVE CHANGES":
+        await message.answer("✅ <b>PERMISSIONS SAVED.</b>", parse_mode="HTML")
+        return await permissions_entry(message, state)
+    doc = _admin_doc_by_id(target_id)
+    if not doc: return
+    current_perms = list(doc.get("permissions", list(DEFAULT_PERMISSIONS)))
     if text == "🔐 GRANT ALL":
-        new_perms = list(PERMISSION_MAP.values())
-        update_admin_perms(target_id, new_perms)
-        await message.answer("✅ **ALL FEATURES ENABLED**")
-        await render_permission_menu(message, state, target_id)
-        return
-        
+        update_admin_perms(target_id, list(PERMISSION_MAP.values()))
+        await message.answer("✅ <b>ALL PERMISSIONS GRANTED.</b>", parse_mode="HTML")
+        return await render_permission_menu(message, state, target_id)
     if text == "🔒 REVOKE ALL":
         update_admin_perms(target_id, [])
-        await message.answer("🔒 **ALL FEATURES DISABLED**")
-        await render_permission_menu(message, state, target_id)
-        return
-
-    # HANDLE TOGGLE
-    # Text format: "✅ 📄 Generate PDF"
-    # We need to find which key this corresponds to.
-    
-    # Strip status icon
-    clean_text = text[2:].strip() # Remove "✅ " or "❌ "
-    
-    target_key = PERMISSION_MAP.get(clean_text)
-    
+        await message.answer("🔒 <b>ALL PERMISSIONS REVOKED.</b>", parse_mode="HTML")
+        return await render_permission_menu(message, state, target_id)
+    clean = text[2:].strip()
+    target_key = PERMISSION_MAP.get(clean)
     if not target_key:
-        await message.answer("⚠️ Unknown Option.")
-        return
-        
-    # Toggle
+        await message.answer("⚠️ Unknown option."); return
     if target_key in current_perms:
         current_perms.remove(target_key)
-        action = "❌ Disabled"
     else:
         current_perms.append(target_key)
-        action = "✅ Enabled"
-        
     update_admin_perms(target_id, current_perms)
-    
-    # Re-render
     await render_permission_menu(message, state, target_id)
 
-def update_admin_perms(user_id, perms):
-    # Try updating int
-    res = col_admins.update_one({"user_id": user_id}, {"$set": {"permissions": perms}})
-    if res.matched_count == 0:
-        # Try str
-        col_admins.update_one({"user_id": str(user_id)}, {"$set": {"permissions": perms}})
 
-# === ROLE MANAGEMENT ===
-@dp.message(F.text == "🎭 Manage Roles")
+# ==========================================
+# 🎭 MANAGE ROLES
+# ==========================================
+@dp.message(F.text == "🎭 MANAGE ROLES")
 async def roles_entry(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
-        await message.answer("⛔ **ACCESS DENIED.**\nOnly the Owner can assign titles.")
-        return
-
+        await message.answer("⛔ <b>OWNER ONLY.</b>", parse_mode="HTML"); return
     admins = list(col_admins.find())
     if not admins:
-        await message.answer("⚠️ No admins found.")
-        return
-
-    msg = ["🎭 **SELECT ADMINISTRATOR FOR ROLE ASSIGNMENT**", "━━━━━━━━━━━━━━━━━━━━"]
-    builder = ReplyKeyboardBuilder()
-    
-    for idx, a in enumerate(admins, 1):
-        uid = a.get('user_id')
-        current_role = a.get('role', 'Standard Admin')
-        msg.append(f"**{idx}.** `{uid}` - *{current_role}*")
-        builder.add(KeyboardButton(text=f"{idx}. {uid}"))
-        
-    builder.adjust(2)
-    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
+        await message.answer("⚠️ No admins found."); return
+    markup, _, _, _ = _admin_select_keyboard(admins, page=0, include_status=True)
+    await state.update_data(role_page=0)
     await message.answer(
-        "\n".join(msg),
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
+        f"🎭 <b>MANAGE ROLES — SELECT ADMIN</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Active  |  🔴 Locked\n"
+        f"<i>Role is saved for locked admins but message is only sent when unlocked.</i>\n\n"
+        f"Select admin:",
+        reply_markup=markup, parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_role_admin)
 
 @dp.message(BotState.waiting_for_role_admin)
 async def roles_admin_select(message: types.Message, state: FSMContext):
-    text = message.text
+    text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
-    if text == "⬅️ BACK": return await admin_config_btn(message)
-    
-    # Parse ID
-    target_id = None
-    try:
-        if ". " in text: target_id = int(text.split(". ")[1])
-        else: target_id = int(text)
-    except:
-        await message.answer("⚠️ Invalid Selection.")
+    if text == "⬅️ BACK": await state.clear(); return await admin_config_btn(message)
+    if text in ("⬅️ PREV PAGE", "➡️ NEXT PAGE"):
+        data = await state.get_data()
+        page = data.get("role_page", 0) + (1 if "NEXT" in text else -1)
+        admins = list(col_admins.find())
+        markup, _, page, _ = _admin_select_keyboard(admins, page=page, include_status=True)
+        await state.update_data(role_page=page)
+        await message.answer(f"📋 Page {page + 1}", reply_markup=markup, parse_mode="HTML")
         return
-        
-    # Verify
-    if not is_admin(target_id):
-        await message.answer("❌ Admin not found.")
-        return
-        
-    await state.update_data(role_target_id=target_id)
-    
-    # Show Roles
+    uid = _parse_admin_id_from_btn(text)
+    if uid is None:
+        await message.answer("⚠️ Invalid selection."); return
+    doc = _admin_doc_by_id(uid)
+    if not doc:
+        await message.answer("❌ Admin not found."); return
+    await state.update_data(role_target_id=uid)
+    name = doc.get("name", "")
+    current_role = doc.get("role", "Admin")
+    display = f"👤 {name} ({uid})" if name else f"<code>{uid}</code>"
     builder = ReplyKeyboardBuilder()
-    roles = ["Manager", "Supervisor", "Editor", "Moderator", "Head Admin"]
-    for r in roles: builder.add(KeyboardButton(text=r))
-    
+    for r in PRESET_ROLES: builder.add(KeyboardButton(text=r))
     builder.adjust(2)
-    builder.row(KeyboardButton(text="✏️ CUSTOM ROLE"))
+    builder.row(KeyboardButton(text="👑 TRANSFER OWNERSHIP"))
     builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
     await message.answer(
-        f"🎭 **ASSIGN ROLE FOR: `{target_id}`**\n"
-        f"Select a preset or create custom:",
+        f"🎭 <b>ASSIGN ROLE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Admin:</b> {display}\n"
+        f"📌 <b>Current Role:</b> <code>{current_role}</code>\n\n"
+        f"Select new role:",
         reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_role_select)
 
 @dp.message(BotState.waiting_for_role_select)
 async def process_role_assign(message: types.Message, state: FSMContext):
-    text = message.text
+    text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
     if text == "⬅️ BACK": return await roles_entry(message, state)
-    
-    if text == "✏️ CUSTOM ROLE":
-        await message.answer("✏️ **Enter Custom Role Title:**", reply_markup=ReplyKeyboardRemove())
-        await state.set_state(BotState.waiting_for_custom_role)
+    data = await state.get_data()
+    target_id = data.get("role_target_id")
+    doc = _admin_doc_by_id(target_id)
+    if not doc:
+        await message.answer("❌ Admin not found."); return
+    if text == "👑 TRANSFER OWNERSHIP":
+        await message.answer(
+            f"👑 <b>OWNERSHIP TRANSFER</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ This <b>permanently transfers</b> Owner control to <code>{target_id}</code>.\n\n"
+            f"🔐 Enter the <b>Owner Transfer Password</b>:",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="❌ CANCEL"), KeyboardButton(text="🔙 Back to Menu")]],
+                resize_keyboard=True
+            ), parse_mode="HTML"
+        )
+        await state.update_data(owner_transfer_target=target_id)
+        await state.set_state(BotState.waiting_for_owner_pw_first)
         return
-        
-    # Assign Standard Role
-    data = await state.get_data()
-    target_id = data.get("role_target_id")
-    
+    if text not in PRESET_ROLES:
+        await message.answer("⚠️ Unknown role option."); return
+    name = doc.get("name", str(target_id))
+    locked = doc.get("locked", False)
     update_admin_role(target_id, text)
-    await message.answer(f"✅ **ROLE ASSIGNED:** `{text}`")
-    await roles_entry(message, state) # Loop back
-
-@dp.message(BotState.waiting_for_custom_role)
-async def process_custom_role(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if not text: return 
-    
-    data = await state.get_data()
-    target_id = data.get("role_target_id")
-    
-    update_admin_role(target_id, text)
-    await message.answer(f"✅ **CUSTOM ROLE ASSIGNED:** `{text}`")
+    await message.answer(
+        f"✅ <b>ROLE UPDATED</b>\n"
+        f"👤 <code>{target_id}</code> → <code>{text}</code>",
+        parse_mode="HTML"
+    )
+    if not locked:
+        await _send_role_welcome_message(target_id, text, name)
+    else:
+        await message.answer(
+            f"ℹ️ Admin is locked — role message will be delivered when they are unlocked.",
+            parse_mode="HTML"
+        )
     await roles_entry(message, state)
 
-def update_admin_role(user_id, role):
-    res = col_admins.update_one({"user_id": user_id}, {"$set": {"role": role}})
-    if res.matched_count == 0:
-        col_admins.update_one({"user_id": str(user_id)}, {"$set": {"role": role}})
 
-# === LOCK/UNLOCK MANAGEMENT ===
-@dp.message(F.text == "🔒 Lock/Unlock User")
+# ==========================================
+# 👑 OWNERSHIP TRANSFER
+# ==========================================
+@dp.message(BotState.waiting_for_owner_pw_first)
+async def owner_pw_first(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text in ("❌ CANCEL", "🔙 Back to Menu"): return await start(message, state)
+    await state.update_data(owner_pw_attempt=text)
+    await message.answer(
+        f"🔐 <b>CONFIRM PASSWORD</b>\n"
+        f"Enter the password <b>once more</b> to confirm:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ CANCEL"), KeyboardButton(text="🔙 Back to Menu")]],
+            resize_keyboard=True
+        ), parse_mode="HTML"
+    )
+    await state.set_state(BotState.waiting_for_owner_pw_confirm)
+
+@dp.message(BotState.waiting_for_owner_pw_confirm)
+async def owner_pw_confirm(message: types.Message, state: FSMContext):
+    global OWNER_ID
+    text = message.text.strip()
+    if text in ("❌ CANCEL", "🔙 Back to Menu"): return await start(message, state)
+    data = await state.get_data()
+    first_pw = data.get("owner_pw_attempt", "")
+    target_id = data.get("owner_transfer_target")
+    # Load effective password (DB overrides env)
+    effective_pw = OWNER_TRANSFER_PW
+    try:
+        db = db_client["MSANodeDB"]
+        sec = db["bot_secrets"].find_one({"bot": "bot4"})
+        if sec and sec.get("OWNER_TRANSFER_PW"):
+            effective_pw = sec["OWNER_TRANSFER_PW"]
+    except: pass
+    if first_pw != effective_pw or text != effective_pw:
+        await message.answer(
+            f"❌ <b>INCORRECT PASSWORD.</b>\n"
+            f"Transfer aborted. Both entries must match exactly.",
+            parse_mode="HTML"
+        )
+        await state.clear(); return await admin_config_btn(message)
+    old_owner = OWNER_ID
+    OWNER_ID = target_id
+    try:
+        db = db_client["MSANodeDB"]
+        db["bot_secrets"].update_one(
+            {"bot": "bot4"}, {"$set": {"OWNER_ID": str(target_id)}}, upsert=False
+        )
+    except Exception as e:
+        logging.error(f"Failed to persist OWNER_ID transfer: {e}")
+    try:
+        col_admins.delete_one({"user_id": target_id})
+        col_admins.delete_one({"user_id": str(target_id)})
+    except: pass
+    try:
+        await bot.send_message(
+            target_id,
+            f"👑 <b>OWNERSHIP TRANSFERRED TO YOU</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"You are now the <b>Supreme Owner</b> of MSA NODE SYSTEMS.\n"
+            f"Previous Owner: <code>{old_owner}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 <i>Full control transferred.</i>",
+            parse_mode="HTML"
+        )
+    except: pass
+    await message.answer(
+        f"✅ <b>OWNERSHIP TRANSFERRED</b>\n"
+        f"New Owner: <code>{target_id}</code>",
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+# ==========================================
+# 🔒 LOCK / UNLOCK
+# ==========================================
+@dp.message(F.text == "🔒 LOCK / UNLOCK")
 async def lock_entry(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
-        await message.answer("⛔ **ACCESS DENIED.**\nOnly the Owner can freeze accounts.")
-        return
-
+        await message.answer("⛔ <b>OWNER ONLY.</b>", parse_mode="HTML"); return
     admins = list(col_admins.find())
     if not admins:
-        await message.answer("⚠️ No admins found.")
-        return
-
-    msg = ["🔒 **SELECT ADMIN TO FREEZE/THAW**", "━━━━━━━━━━━━━━━━━━━━"]
-    builder = ReplyKeyboardBuilder()
-    
-    for idx, a in enumerate(admins, 1):
-        uid = a.get('user_id')
-        is_locked = a.get('locked', False)
-        status = "🔴 LOCKED" if is_locked else "🟢 ACTIVE"
-        
-        msg.append(f"**{idx}.** `{uid}` - {status}")
-        builder.add(KeyboardButton(text=f"{idx}. {uid}"))
-        
-    builder.adjust(2)
-    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
+        await message.answer("⚠️ No admins found."); return
+    markup, _, _, _ = _admin_select_keyboard(admins, page=0, include_status=True)
+    await state.update_data(lock_page=0)
     await message.answer(
-        "\n".join(msg),
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
+        f"🔒 <b>LOCK / UNLOCK ADMIN</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Active  |  🔴 Locked\n\n"
+        f"Select admin to toggle access:",
+        reply_markup=markup, parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_lock_admin)
 
 @dp.message(BotState.waiting_for_lock_admin)
 async def lock_admin_select(message: types.Message, state: FSMContext):
-    text = message.text
+    text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
-    if text == "⬅️ BACK": return await admin_config_btn(message)
-    
-    # Parse ID
-    target_id = None
-    try:
-        if ". " in text: target_id = int(text.split(". ")[1])
-        else: target_id = int(text)
-    except:
-        await message.answer("⚠️ Invalid Selection.")
+    if text == "⬅️ BACK": await state.clear(); return await admin_config_btn(message)
+    if text in ("⬅️ PREV PAGE", "➡️ NEXT PAGE"):
+        data = await state.get_data()
+        page = data.get("lock_page", 0) + (1 if "NEXT" in text else -1)
+        admins = list(col_admins.find())
+        markup, _, page, _ = _admin_select_keyboard(admins, page=page, include_status=True)
+        await state.update_data(lock_page=page)
+        await message.answer(f"📋 Page {page + 1}", reply_markup=markup, parse_mode="HTML")
         return
-        
-    # Verify (Here we check raw DB because is_admin might return False if locked)
-    admin_doc = col_admins.find_one({"user_id": target_id})
-    if not admin_doc: admin_doc = col_admins.find_one({"user_id": str(target_id)})
-    
-    if not admin_doc:
-         await message.answer("❌ Admin not found.")
-         return
-
-    await state.update_data(lock_target_id=target_id)
-    
-    is_locked = admin_doc.get('locked', False)
+    uid = _parse_admin_id_from_btn(text)
+    if uid is None:
+        await message.answer("⚠️ Invalid selection."); return
+    doc = _admin_doc_by_id(uid)
+    if not doc:
+        await message.answer("❌ Admin not found."); return
+    await state.update_data(lock_target_id=uid)
+    is_locked = doc.get("locked", False)
+    name = doc.get("name", "")
+    display = f"👤 {name} ({uid})" if name else f"<code>{uid}</code>"
     status_text = "🔴 LOCKED (Inactive)" if is_locked else "🟢 ACTIVE (Operational)"
-    
     builder = ReplyKeyboardBuilder()
-    if is_locked:
-        builder.row(KeyboardButton(text="🔓 UNLOCK (RESTORE ACCESS)"))
-    else:
-        builder.row(KeyboardButton(text="🔒 LOCK (REVOKE ACCESS)"))
-        
+    builder.row(KeyboardButton(text="🔓 UNLOCK ADMIN") if is_locked else KeyboardButton(text="🔒 LOCK ADMIN"))
     builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
-    
     await message.answer(
-        f"⚙️ **CONFIGURING: `{target_id}`**\n"
-        f"Current Status: **{status_text}**\n\n"
-        f"👇 Select Action:",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
+        f"🔒 <b>ACCESS CONTROL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Admin:</b> {display}\n"
+        f"📊 <b>Status:</b> {status_text}\n\n"
+        f"Select action:",
+        reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_lock_toggle)
 
 @dp.message(BotState.waiting_for_lock_toggle)
 async def process_lock_toggle(message: types.Message, state: FSMContext):
-    text = message.text
+    text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
     if text == "⬅️ BACK": return await lock_entry(message, state)
-    
     data = await state.get_data()
     target_id = data.get("lock_target_id")
-    
-    if "LOCK" in text:
+    doc = _admin_doc_by_id(target_id)
+    if not doc:
+        await message.answer("❌ Admin not found."); return
+    if text == "🔒 LOCK ADMIN":
         update_admin_lock(target_id, True)
-        await message.answer(f"🔒 **ACCESS REVOKED:** `{target_id}` is now Frozen.")
-    elif "UNLOCK" in text:
+        await message.answer(
+            f"🔒 <b>LOCKED</b>\n"
+            f"<code>{target_id}</code> — access revoked, now inactive.",
+            parse_mode="HTML"
+        )
+    elif text == "🔓 UNLOCK ADMIN":
         update_admin_lock(target_id, False)
-        await message.answer(f"🔓 **ACCESS RESTORED:** `{target_id}` is now Active.")
-        
+        await message.answer(
+            f"🔓 <b>UNLOCKED</b>\n"
+            f"<code>{target_id}</code> — access restored, now active.",
+            parse_mode="HTML"
+        )
+        role = doc.get("role", "⚙️ ADMIN")
+        name = doc.get("name", str(target_id))
+        await _send_role_welcome_message(target_id, role if role in ROLE_MESSAGES else "⚙️ ADMIN", name)
+    await state.clear()
     await lock_entry(message, state)
 
-def update_admin_lock(user_id, locked):
-    res = col_admins.update_one({"user_id": user_id}, {"$set": {"locked": locked}})
-    if res.matched_count == 0:
-        col_admins.update_one({"user_id": str(user_id)}, {"$set": {"locked": locked}})
 
-# BANNED MANAGEMENT SUBMENU
-@dp.message(F.text == "🚫 Banned Users")
+# ==========================================
+# 🚫 BANNED USERS
+# ==========================================
+@dp.message(F.text == "🚫 BANNED USERS")
 async def banned_mgmt_btn(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
-    
+    banned_count = col_banned.count_documents({}) if col_banned is not None else 0
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="🔨 BAN USER"), KeyboardButton(text="🔓 UNBAN USER"))
-    builder.row(KeyboardButton(text="📜 LIST BANNED"), KeyboardButton(text="🔙 Back to Menu"))
-    
+    builder.row(KeyboardButton(text="📜 LIST BANNED"))
+    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
     await message.answer(
-        "🚫 **BANNED USER MANAGEMENT**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Manage the Blacklist.\n"
-        "Select Operation:",
-        reply_markup=builder.as_markup(resize_keyboard=True)
+        f"🚫 <b>BANNED USER MANAGEMENT</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Blacklisted: <code>{banned_count}</code>\n\n"
+        f"⚠️ Active admins cannot be banned.\n"
+        f"Remove them as admin first.",
+        reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML"
     )
 
 @dp.message(F.text == "🔨 BAN USER")
 async def ban_user_manual_btn(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
     await message.answer(
-        "🔨 **MANUAL BAN**\n"
-        "Enter the **Telegram User ID** to ban forever.",
+        "🔨 <b>BAN USER</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Enter the <b>Telegram User ID</b> to blacklist.\n"
+        "⚠️ Cannot ban active admins — remove admin role first.",
         reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="⬅️ BACK")],
-                [KeyboardButton(text="🔙 Back to Menu")]
-            ],
+            keyboard=[[KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu")]],
             resize_keyboard=True
-        )
+        ), parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_ban_id)
 
@@ -4050,58 +3995,68 @@ async def ban_user_manual_btn(message: types.Message, state: FSMContext):
 async def process_manual_ban(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
-    
-    # Handle BACK button - return to admin config
-    if text == "⬅️ BACK":
-        await admin_config_btn(message)
-        await state.clear()
-        return
-    
+    if text == "⬅️ BACK": await state.clear(); return await banned_mgmt_btn(message, state)
     if not text.isdigit():
-        await message.answer("⚠️ Invalid ID.")
-        return
-    
+        await message.answer("⚠️ Invalid ID."); return
     target_id = int(text)
     if target_id == OWNER_ID:
-        await message.answer("❌ Cannot ban the Owner.")
-        return
-        
+        await message.answer("❌ Cannot ban the Owner."); return
+    if _admin_doc_by_id(target_id):
+        await message.answer(
+            f"⛔ <b>CANNOT BAN ACTIVE ADMIN</b>\n"
+            f"<code>{target_id}</code> is currently an admin.\n"
+            f"Use <b>➖ REMOVE ADMIN</b> first, then ban.",
+            parse_mode="HTML"
+        ); return
     if is_banned(target_id):
-        await message.answer("⚠️ User is already banned.")
-        return
-    
+        await message.answer(f"⚠️ <code>{target_id}</code> is already banned.", parse_mode="HTML"); return
     try:
-        if col_banned is not None:
-            col_banned.insert_one({
-                "user_id": target_id,
-                "reason": f"Manual Ban by {message.from_user.id}",
-                "timestamp": datetime.now()
-            })
-            await message.answer(f"✅ **BANNED:** User `{target_id}` is now blacklisted.")
-        else:
-            await message.answer("❌ Database unavailable. Cannot ban user.")
-            return
+        col_banned.insert_one({
+            "user_id": target_id,
+            "reason": f"Manual ban by admin {message.from_user.id}",
+            "timestamp": now_local()
+        })
     except Exception as e:
-        logging.error(f"Failed to ban user {target_id}: {e}")
-        await message.answer(f"❌ Ban failed: {e}")
-        return
-    
-    # Notify Owner/Log
+        await message.answer(f"❌ Failed: <code>{e}</code>", parse_mode="HTML"); return
     if message.from_user.id != OWNER_ID:
-        log_msg = f"🔨 **ADMIN LOG: BAN**\nAdmin: `{message.from_user.id}`\nTarget: `{target_id}`\nTime: {datetime.now()}"
-        try: await bot.send_message(OWNER_ID, log_msg)
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"🔨 <b>BAN LOG</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Admin: <code>{message.from_user.id}</code>\n"
+                f"Banned: <code>{target_id}</code>\n"
+                f"Time: <code>{now_local().strftime('%b %d, %Y  ·  %I:%M %p')}</code>",
+                parse_mode="HTML"
+            )
         except: pass
+    await message.answer(
+        f"✅ <b>USER BANNED</b>\n"
+        f"<code>{target_id}</code> silently blacklisted.",
+        parse_mode="HTML"
+    )
     await state.clear()
     await banned_mgmt_btn(message, state)
-
 
 @dp.message(F.text == "🔓 UNBAN USER")
 async def unban_user_btn(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
+    if col_banned is None:
+        await message.answer("❌ Database unavailable."); return
+    bans = list(col_banned.find().sort("timestamp", -1).limit(25))
+    if not bans:
+        await message.answer("✅ <b>No banned users.</b>", parse_mode="HTML"); return
+    builder = ReplyKeyboardBuilder()
+    for b in bans:
+        uid = b.get("user_id")
+        builder.add(KeyboardButton(text=f"🚫 {uid}"))
+    builder.adjust(2)
+    builder.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
     await message.answer(
-        "🔓 **UNBAN USER**\n"
-        "Enter the **Telegram User ID** to forgive.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
+        f"🔓 <b>UNBAN USER</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Select user to remove from blacklist:",
+        reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML"
     )
     await state.set_state(BotState.waiting_for_unban_id)
 
@@ -4109,1444 +4064,355 @@ async def unban_user_btn(message: types.Message, state: FSMContext):
 async def process_unban(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text == "🔙 Back to Menu": return await start(message, state)
-    
-    # Handle BACK button - return to admin config
-    if text == "⬅️ BACK":
-        await admin_config_btn(message)
-        await state.clear()
-        return
-    
-    if not text.isdigit():
-        await message.answer("⚠️ Invalid ID.")
-        return
-        
-    target_id = int(text)
-    
+    if text == "⬅️ BACK": await state.clear(); return await banned_mgmt_btn(message, state)
+    uid_str = text.replace("🚫", "").strip()
+    if not uid_str.isdigit():
+        await message.answer("⚠️ Invalid selection."); return
+    target_id = int(uid_str)
     try:
-        if col_banned is None:
-            await message.answer("❌ Database unavailable. Cannot unban user.")
-            await state.clear()
-            return
-        
         res = col_banned.delete_one({"user_id": target_id})
-        
-        if res.deleted_count > 0:
-            await message.answer(f"✅ **UNBANNED:** User `{target_id}` is free.")
-            
-            # Notify Owner/Log
-            if message.from_user.id != OWNER_ID:
-                log_msg = f"🔓 **ADMIN LOG: UNBAN**\nAdmin: `{message.from_user.id}`\nTarget: `{target_id}`\nTime: {datetime.now()}"
-                try: await bot.send_message(OWNER_ID, log_msg)
-                except: pass
-        else:
-            await message.answer(f"⚠️ User `{target_id}` was not in the ban list.")
+        if res.deleted_count == 0:
+            col_banned.delete_one({"user_id": str(target_id)})
+        await message.answer(
+            f"✅ <b>UNBANNED</b>\n"
+            f"<code>{target_id}</code> removed from blacklist.",
+            parse_mode="HTML"
+        )
+        if message.from_user.id != OWNER_ID:
+            try:
+                await bot.send_message(
+                    OWNER_ID,
+                    f"🔓 <b>UNBAN LOG</b>\n"
+                    f"Admin: <code>{message.from_user.id}</code>\n"
+                    f"Unbanned: <code>{target_id}</code>\n"
+                    f"Time: <code>{now_local().strftime('%b %d, %Y  ·  %I:%M %p')}</code>",
+                    parse_mode="HTML"
+                )
+            except: pass
     except Exception as e:
-        logging.error(f"Failed to unban user {target_id}: {e}")
-        await message.answer(f"❌ Unban failed: {e}")
-        
+        await message.answer(f"❌ Failed: <code>{e}</code>", parse_mode="HTML")
     await state.clear()
     await banned_mgmt_btn(message, state)
 
 @dp.message(F.text == "📜 LIST BANNED")
 async def list_banned_btn(message: types.Message):
     if not is_admin(message.from_user.id): return
-    
+    if col_banned is None:
+        await message.answer("❌ Database unavailable."); return
     try:
-        if col_banned is None:
-            await message.answer("❌ Database unavailable. Cannot list banned users.")
-            return
-        
-        bans = list(col_banned.find())
+        bans = list(col_banned.find().sort("timestamp", -1))
     except Exception as e:
-        logging.error(f"Failed to fetch banned users: {e}")
-        await message.answer(f"❌ Failed to retrieve banned users: {e}")
-        return
-    
-    msg = ["🚫 **BLACKLISTED USERS**", "━━━━━━━━━━━━━━━━━━━━"]
-    
+        await message.answer(f"❌ Error: <code>{e}</code>", parse_mode="HTML"); return
+    lines = [f"🚫 <b>BLACKLISTED USERS</b>", f"━━━━━━━━━━━━━━━━━━━━"]
     if not bans:
-        msg.append("_No banned users._")
+        lines.append("<i>No banned users.</i>")
     else:
         for idx, b in enumerate(bans, 1):
-            uid = b.get('user_id')
-            reason = b.get('reason', 'Unknown')
-            ts = b.get('timestamp')
-            
-            # Format Date
-            if isinstance(ts, datetime):
-                date_str = ts.strftime('%d-%b-%Y %I:%M %p')
-            else:
-                date_str = "Unknown"
-                
-            msg.append(
-                f"{idx}. `{uid}`\n"
-                f"   📅 **Date:** {date_str}\n"
-                f"   📝 **Reason:** {reason}\n"
+            uid = b.get("user_id")
+            reason = b.get("reason", "Unknown")
+            ts = b.get("timestamp")
+            date_str = ts.strftime("%b %d, %Y  ·  %I:%M %p") if isinstance(ts, datetime) else "Unknown"
+            lines.append(
+                f"<b>{idx}.</b> <code>{uid}</code>\n"
+                f"   📅 <code>{date_str}</code>\n"
+                f"   📝 {reason}\n"
             )
-            
-    await message.answer("\n".join(msg))
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
-# ==========================================
-# 📂 GDRIVE EXPLORER
-# ==========================================
-@dp.message(F.text == "📂 GDrive Explorer")
-async def drive_explorer_entry(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    
-    msg = await message.answer("⏳ **Locating Bot Data Sector...**")
-    
-    msg = await message.answer("⏳ **Locating Bot Data Sector...**")
-    
-    # 1. Try Configured Parent
-    root_id = PARENT_FOLDER_ID
-    
-    # 2. Dynamic Lookup if Config Missing
-    if not root_id:
-        # Search for the Main Folder explicitly
-        target_name = "BOT 4 DATA" 
-        root_id = await asyncio.to_thread(find_folder_by_name, target_name)
-        
-    # 3. Validation - NO ROOT FALLBACK
-    if not root_id:
-        await msg.delete()
-        
-        # DEBUG: List what we CAN see to help user
-        debug_list = await asyncio.to_thread(list_drive_contents, 'root')
-        # list_drive_contents returns: name, parent, folders, files
-        # We just want top 5 folders
-        visible_names = [f['name'] for f in debug_list[2][:5]]
-        visible_str = ", ".join(visible_names) if visible_names else "None"
-        
-        await message.answer(
-            "❌ **ACCESS DENIED: MISSING VAULT**\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "The system cannot locate the `BOT 4 DATA` folder.\n"
-            "Security Protocol prohibits scanning the entire Drive.\n\n"
-            "⚠️ **Action:** Please create a folder named `BOT 4 DATA` in your Google Drive.\n\n"
-            f"🔍 **Debug - I can see:**\n`{visible_str}`"
-        )
-        return
-        
-    await msg.delete()
-    
-    # Store this ID as the Session Root
-    await state.update_data(explorer_root=root_id)
-    
-    await render_explorer_gateway(message, state)
 
-async def render_explorer_gateway(message: types.Message, state: FSMContext):
-    """Displays the Entry Gateway with the single Root Folder button."""
-    data = await state.get_data()
-    root_id = data.get('explorer_root')
-    
-    if not root_id:
-        await message.answer("❌ Error: Root not established.")
-        return
-        
-    # Fetch stats for the Gateway View
-    name, parent, folders, files = await asyncio.to_thread(list_drive_contents, root_id)
-    
-    # Preview of what we see
-    visible_folders = [f['name'] for f in folders[:3]]
-    preview_str = ", ".join(visible_folders) if visible_folders else "None"
-    if len(folders) > 3: preview_str += "..."
-        
-    builder = ReplyKeyboardBuilder()
-    builder.add(KeyboardButton(text="📂 BOT 4 DATA"))
-    builder.add(KeyboardButton(text="🔄 Force Refresh"))
-    builder.row(KeyboardButton(text="🔙 Back to Menu"))
-    
-    # Map the visual button to the ID
-    nav_map = {"📂 BOT 4 DATA": root_id}
-    await state.update_data(drive_nav_map=nav_map)
-    await state.set_state(BotState.browsing_drive)
-    
-    await message.answer(
-        "📂 **GDRIVE EXPLORER**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📂 **Source:** `{name}`\n"
-        f"🆔 **ID:** `{root_id[-6:]}` (Partial)\n"
-        f"📁 **Folders:** `{len(folders)}`\n"
-        f"📄 **Files:** `{len(files)}`\n"
-        f"👀 **Visible:** `{preview_str}`\n\n"
-        "👇 **Click below to Access Data:**",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-
-async def show_drive_folder(message: types.Message, state: FSMContext, folder_id):
-    try:
-        name, parent, folders, files = await asyncio.to_thread(list_drive_contents, folder_id)
-        
-        # LOGIC RESTRICTION: Keep user inside the Session Root
-        data = await state.get_data()
-        session_root = data.get('explorer_root')
-        
-        # If we somehow didn't set it (legacy state), fallback
-        if not session_root: 
-            session_root = PARENT_FOLDER_ID if PARENT_FOLDER_ID else 'root'
-            
-        is_root = (folder_id == session_root)
-        
-        if is_root:
-            name = "BOT 4 DATA" # Branding Override
-            parent = "ENTRY" # UP goes back to Gateway
-            
-        builder = ReplyKeyboardBuilder()
-        
-        # Navigation Buttons
-        if parent: 
-            builder.add(KeyboardButton(text="⬆️ UP ONE LEVEL"))
-            
-        # Folders (📂)
-        for f in folders[:50]: # Increased Limit for visibility
-            builder.add(KeyboardButton(text=f"📂 {f['name']}"))
-            
-        # Files (📄)
-        for f in files[:50]:
-            builder.add(KeyboardButton(text=f"📄 {f['name']}"))
-            
-        builder.adjust(2) # 2 columns
-        builder.row(KeyboardButton(text="🔙 Back to Menu"))
-        
-        # Store state for navigation mapping
-        # We need to map names back to IDs since ReplyKeyboard sends text
-        nav_map = { "UP": parent }
-        for f in folders: nav_map[f"📂 {f['name']}"] = f['id']
-        for f in files: nav_map[f"📄 {f['name']}"] = {"type": "file", "link": f.get('webViewLink'), "name": f['name']}
-        
-        await state.update_data(drive_nav_map=nav_map, current_folder_id=folder_id)
-        await state.set_state(BotState.browsing_drive)
-        
-        # Display
-        stats = f"📁 **Total Available Folders:** `{len(folders)}`\n📄 **Total Available PDFs:** `{len(files)}`"
-        await message.answer(
-            f"📂 **EXPLORER:** `{name}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{stats}\n\n"
-            "👇 **Navigate or Open Files:**",
-            reply_markup=builder.as_markup(resize_keyboard=True),
-            parse_mode="Markdown"
-        )
-        
-    except Exception as e:
-        await message.answer(f"❌ **Explorer Error:** {e}")
-        # await start(message, state)
-
-@dp.message(BotState.browsing_drive)
-async def drive_browser_nav(message: types.Message, state: FSMContext):
-    text = message.text
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    data = await state.get_data()
-    nav_map = data.get('drive_nav_map', {})
-    
-    if text == "🔄 Force Refresh":
-        msg = await message.answer("♻️ Refreshing...")
-        await render_explorer_gateway(message, state)
-        await msg.delete()
-        return
-    
-    if text == "⬆️ UP ONE LEVEL":
-        target = nav_map.get("UP")
-        if target == "ENTRY":
-            await render_explorer_gateway(message, state)
-        elif target: 
-            await show_drive_folder(message, state, target)
-        else: 
-            await message.answer("⚠️ Top of Vault.")
-        return
-
-    # Check if folder or file
-    if text in nav_map:
-        item = nav_map[text]
-        if isinstance(item, str): 
-            # It's a Folder ID -> Navigate
-            await show_drive_folder(message, state, item)
-        else:
-            # It's a File Dict -> Show Details
-            f_name = item['name']
-            f_link = item['link']
-            await message.answer(
-                f"📄 **FILE DETAILS**\n"
-                f"Name: `{f_name}`\n"
-                f"🔗 [Open in Drive]({f_link})",
-                parse_mode="Markdown"
-            )
-    else:
-        # User typed something random?
-        await message.answer("⚠️ Please select a folder/file from the buttons.")
-
-@dp.message(F.text == "➕ Add Admin")
-async def add_admin_btn(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    await message.answer(
-        "➕ **ADD NEW ADMIN**\n"
-        "Enter the **Telegram User ID** of the new admin.\n"
-        "(Get it from @userinfobot)",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="⬅️ BACK")],
-                [KeyboardButton(text="🔙 Back to Menu")]
-            ],
-            resize_keyboard=True
-        )
-    )
-    await state.set_state(BotState.waiting_for_admin_id)
-
-@dp.message(BotState.waiting_for_admin_id)
-async def process_add_admin(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    # Handle BACK button - return to admin config
-    if text == "⬅️ BACK":
+# ------------------------------------------------
+# 🔙 BACK CATCH-ALL for admin sub-menus (no state)
+# Fires when ⬅️ BACK is pressed while in DEFAULT
+# state (e.g. from Banned Users screen). Returns
+# the admin to Admin Config, others to main menu.
+# ------------------------------------------------
+@dp.message(F.text == "⬅️ BACK")
+async def admin_back_catchall(message: types.Message, state: FSMContext):
+    await state.clear()
+    if is_admin(message.from_user.id):
         await admin_config_btn(message)
-        await state.clear()
-        return
-    
-    if not text.isdigit():
-        await message.answer("⚠️ Invalid ID. Please enter numbers only.")
-        return
-        
-    new_admin_id = int(text)
-    
-    if is_admin(new_admin_id):
-        await message.answer(f"⚠️ User `{new_admin_id}` is already an Admin.")
-        return
-        
-    col_admins.insert_one({
-        "user_id": new_admin_id,
-        "added_by": message.from_user.id,
-        "timestamp": datetime.now()
-    })
-    
-    await message.answer(f"✅ **SUCCESS:** User `{new_admin_id}` is now an Admin.")
-    await state.clear()
-    await admin_config_btn(message) # Return to Admin Menu
-
-@dp.message(F.text == "➖ Remove Admin")
-async def remove_admin_btn(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    await message.answer(
-        "➖ **REMOVE ADMIN**\n"
-        "Enter the **Telegram User ID** to revoke access.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
-    )
-    await state.set_state(BotState.waiting_for_remove_admin)
-
-@dp.message(BotState.waiting_for_remove_admin)
-async def process_remove_admin(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text == "🔙 Back to Menu": return await start(message, state)
-    
-    if not text.isdigit():
-        await message.answer("⚠️ Invalid ID. Numbers only.")
-        return
-        
-    target_id = int(text)
-    
-    if target_id == OWNER_ID:
-        await message.answer("❌ **CRITICAL DENIED:** Cannot remove the Supreme Owner.")
-        return
-        
-    res = col_admins.delete_one({"user_id": target_id})
-    
-    if res.deleted_count > 0:
-        await message.answer(f"🗑 **REVOKED:** User `{target_id}` removed from Admins.")
     else:
-        await message.answer(f"⚠️ User `{target_id}` is not in the Admin List.")
-        
-    await state.clear()
-    await admin_config_btn(message)
+        await start(message, state)
 
-@dp.message(F.text == "📜 List Admins")
-async def list_admins_btn(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    
-    admins = list(col_admins.find())
-    
-    msg = [
-        "👥 **AUTHORIZED ADMINS**",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"👑 **OWNER:** `{OWNER_ID}`"
-    ]
-    
-    if not admins:
-        msg.append("\n_No additional admins configured._")
-    else:
-        for idx, a in enumerate(admins, 1):
-            uid = a.get('user_id')
-            added = a.get('timestamp', datetime.now()).strftime('%d/%m/%y')
-            msg.append(f"{idx}. `{uid}` (Since {added})")
-            
-    msg.append("━━━━━━━━━━━━━━━━━━━━")
-    await message.answer("\n".join(msg))
-
-
-# ==========================================
-# 💻 TERMINAL VIEWER
-# ==========================================
-@dp.message(BotState.waiting_for_remove_admin)
-async def process_remove_admin(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return # Security Patch
-    
-    text = message.text.strip()
-    if text == "🔙 Back to Menu": return await start(message, state)
-# ...
 
 # ==========================================
 # 💻 TERMINAL VIEWER
 # ==========================================
 @dp.message(F.text == "💻 Live Terminal")
 async def show_terminal(message: types.Message):
-    """Shows live terminal logs from memory"""
-    if not is_admin(message.from_user.id): return # Security Patch
+    """Shows live terminal logs from memory with auto Telegram char-limit enforcement."""
+    if not is_admin(message.from_user.id): return
+
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🔄 REFRESH TERMINAL"), KeyboardButton(text="🔙 Back to Menu")]],
+        resize_keyboard=True
+    )
 
     if not LOG_BUFFER:
-        await message.answer("💻 <b>LIVE TERMINAL</b>\n━━━━━━━━━━━━━━━━━━━━\n<i>No logs captured yet.</i>", parse_mode="HTML")
+        await message.answer(
+            "💻 <b>LIVE TERMINAL</b>\n━━━━━━━━━━━━━━━━━━━━\n<i>No logs captured yet.</i>",
+            parse_mode="HTML", reply_markup=kb
+        )
         return
-        
-    # Get last 20 lines
-    logs = list(LOG_BUFFER)[-20:]
-    log_text = "\n".join(logs)
-    
-    # Escape HTML to prevent injection
-    import html
-    safe_log_text = html.escape(log_text)
-    
-    msg = (
+
+    import html as _html
+
+    now_str  = now_local().strftime("%b %d, %Y  ·  %I:%M:%S %p")
+    buf_size = len(LOG_BUFFER)
+
+    # Build header + footer — measure their char cost
+    header = (
         f"💻 <b>LIVE TERMINAL STREAM</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<pre>{safe_log_text}</pre>\n"
+        f"📋 <b>Buffer:</b> <code>{buf_size}</code> lines  |  "
+        f"🕐 <code>{now_str}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 <i>Connection Active</i> | ⏱ {datetime.now().strftime('%I:%M:%S %p')}"
+        f"<pre>"
     )
-    
-    # Add Refresh Button
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🔄 REFRESH TERMINAL"), KeyboardButton(text="🔙 Back to Menu")]
-    ], resize_keyboard=True)
-    
+    footer = (
+        f"</pre>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 <i>Connection Active</i>"
+    )
+
+    # Telegram hard limit is 4096 chars; leave headroom for HTML tags
+    MAX_CONTENT = 4096 - len(header) - len(footer) - 50
+
+    # Take last lines, newest at bottom; trim to fit
+    all_logs = list(LOG_BUFFER)
+    safe_lines = []
+    total = 0
+    for line in reversed(all_logs):
+        safe_line = _html.escape(line)
+        cost = len(safe_line) + 1  # +1 for newline
+        if total + cost > MAX_CONTENT:
+            break
+        safe_lines.append(safe_line)
+        total += cost
+
+    safe_lines.reverse()  # restore chronological order
+    log_body = "\n".join(safe_lines)
+    if len(all_logs) > len(safe_lines):
+        log_body = f"[... {len(all_logs) - len(safe_lines)} older lines trimmed ...]\n" + log_body
+
+    msg = header + log_body + footer
     await message.answer(msg, parse_mode="HTML", reply_markup=kb)
 
 @dp.message(F.text == "🔄 REFRESH TERMINAL")
 async def refresh_terminal(message: types.Message):
-    if not is_admin(message.from_user.id): return # Security Patch
-    await show_terminal(message)
-
-@dp.message(F.text == "🔄 REFRESH TERMINAL")
-async def refresh_terminal(message: types.Message):
+    if not is_admin(message.from_user.id): return
     await show_terminal(message)
 
 # Handle BACK TO MENU separately if not already global
 
 
 # ==========================================
-# 🗄️ DATABASE & ENV MANAGEMENT
+# 💎 ELITE HELP — PAGINATED AGENT GUIDE
 # ==========================================
 
-def migrate_env_vars(new_client):
-    """
-    Ensures the target DB has the bot_secrets from the current valid session.
-    Only copies if they are missing in the destination.
-    """
-    try:
-        # 1. Get current secrets from MEMORY (loaded at start)
-        if not BOT_TOKEN:
-            return "⚠️ Current session has no secrets to migrate."
-            
-        target_db = new_client["MSANodeDB"]
-        target_col = target_db["bot_secrets"]
-        
-        # 2. Check if target has secrets
-        existing = target_col.find_one({"bot": "bot4"})
-        if existing:
-            # User Feedback: Confirm we found it and are using it.
-            return "✅ Target DB already has `bot_secrets`. Used existing data (No Overwrite)."
-            
-        # 3. Migrate
-        # We need to construct the secret object. 
-        # Since we don't have the raw files in memory as base64 strings easily available unless we re-read them.
-        # Let's re-read the local files if they exist.
-        
-        files_data = {}
-        if os.path.exists('credentials.json'):
-            with open('credentials.json', "rb") as f:
-                files_data['credentials.json'] = base64.b64encode(f.read()).decode('utf-8')
-        if os.path.exists('token.pickle'):
-            with open('token.pickle', "rb") as f:
-                files_data['token.pickle'] = base64.b64encode(f.read()).decode('utf-8')
-                
-        secret_doc = {
-            "bot": "bot4",
-            "BOT_TOKEN": BOT_TOKEN,
-            "OWNER_ID": str(OWNER_ID),
-            "PARENT_FOLDER_ID": PARENT_FOLDER_ID,
-            "files": files_data
-        }
-        
-        target_col.insert_one(secret_doc)
-        return "🚀 Secrets Migrated to New DB successfully."
-        
-    except Exception as e:
-        return f"❌ Migration Failed: {e}"
+_ELITE_GUIDE_PAGES = [
+    # ── PAGE 1 / 4 ── PDF GENERATION ENGINE (Deep Dive)
+    (
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "  💎  <b>MSANODE GOD-MODE PREMIER MANUAL</b>\n"
+        "  <i>Classified Operational Protocol v6.0</i>  ·  Page 1 / 4\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "📄 <b>1. PDF GENERATION ENGINE</b>\n\n"
+        "<b>Step-by-step:</b>\n"
+        "  ① Press <b>📄 Generate PDF</b> from the main menu\n"
+        "  ② A list of recent codes appears for reference\n"
+        "  ③ Send your unique <b>Project Code</b> (e.g. <code>S19</code>, <code>MSA042</code>)\n"
+        "     ↳ Code must NOT already exist in the DB\n"
+        "     ↳ Alphanumeric only — no spaces or special chars\n"
+        "  ④ Paste your full script/content as the next message\n"
+        "     ↳ Multiple messages auto-merge into one script\n"
+        "  ⑤ Bot renders the PDF using ReportLab + Google Drive\n"
+        "  ⑥ Drive link saved to MongoDB, bound to your code ✅\n\n"
+        "<b>📐 FORMATTING SYNTAX CODES:</b>\n"
+        "  <code>******url******</code>  →  🔵 Clickable Blue Hyperlink\n"
+        "  <code>*****TEXT*****</code>  →  ⚫ BLACK · BOLD · CAPS\n"
+        "  <code>****TEXT****</code>   →  🔵 BLUE · BOLD · CAPS\n"
+        "  <code>***TEXT***</code>    →  🔴 RED · BOLD · CAPS\n"
+        "  <code>*TEXT*</code>        →  ⚫ Bold Black (normal case)\n"
+        "  <code>I. Title</code>      →  🔴 Auto Red Section Header\n"
+        "  <code>II. Title</code>     →  🔴 Auto Red Section Header\n\n"
+        "<b>⚠️ Rules & Notes:</b>\n"
+        "  • Duplicate codes are rejected — check library first\n"
+        "  • Drive folder is shared — keep codes unique\n"
+        "  • PDF is permanent until manually removed or nuked\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "💎 <b>MSA NODE BOT 4</b>  |  <i>God-Mode Manual</i>  |  Page 1 of 4"
+    ),
+    # ── PAGE 2 / 4 ── VAULT & LIBRARY + GET LINK + EDIT PDF
+    (
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "  💎  <b>MSANODE GOD-MODE PREMIER MANUAL</b>\n"
+        "  <i>Classified Operational Protocol v6.0</i>  ·  Page 2 / 4\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "🗃️ <b>2. VAULT & LIBRARY</b>\n\n"
+        "📋 <b>SHOW LIBRARY</b>\n"
+        "  • Full PDF index sorted by Date (newest first)\n"
+        "  • Each row: <code>Index · Code · Date · 🔗 Link</code>\n"
+        "  • Restored files marked <b>[R]</b> for traceability\n"
+        "  • Live <b>🔍 Search</b> — type code or partial name\n"
+        "  • NEXT / PREV pagination (15 entries per page)\n\n"
+        "🔗 <b>GET LINK</b>\n"
+        "  ① Press <b>🔗 Get Link</b> → choose retrieval mode:\n"
+        "     ↳ <b>Single</b> — enter one code, get its Drive URL\n"
+        "     ↳ <b>Bulk Range</b> — enter range e.g. <code>1-10</code>\n"
+        "  ② Mode: <b>PDF File</b> (download) or <b>Link</b> (URL only)\n"
+        "  ③ Link returned instantly — no expiry if Drive is public\n\n"
+        "✏️ <b>EDIT PDF</b>\n"
+        "  ① Press <b>✏️ Edit PDF</b> → pick edit mode:\n"
+        "     ↳ <b>Edit Code</b> — renames MSA code in MongoDB\n"
+        "     ↳ <b>Edit Link</b> — replaces stored Google Drive URL\n"
+        "  ② Single or Bulk mode available\n"
+        "  ③ Enter target → enter new value → saved instantly ✅\n"
+        "  ⚠️ Editing code does NOT rename the Drive file\n\n"
+        "🗑 <b>REMOVE PDF</b>\n"
+        "  • Soft-delete: moved to Recycle Bin (recoverable)\n"
+        "  • Modes: Single · Bulk Range · Permanent (hard-delete)\n"
+        "  • Confirmation required before executing any deletion\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "💎 <b>MSA NODE BOT 4</b>  |  <i>God-Mode Manual</i>  |  Page 2 of 4"
+    ),
+    # ── PAGE 3 / 4 ── SECURITY + ADMIN CONFIG
+    (
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "  💎  <b>MSANODE GOD-MODE PREMIER MANUAL</b>\n"
+        "  <i>Classified Operational Protocol v6.0</i>  ·  Page 3 / 4\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "🛡 <b>3. SECURITY SYSTEMS</b>\n\n"
+        "  🚨 <b>Unauthorized Access Alerts</b>\n"
+        "     Any non-admin who triggers /start is instantly\n"
+        "     reported to Owner with: Name · ID · Username · Time\n\n"
+        "  🤖 <b>Anti-Spam Auto-Ban</b>\n"
+        "     >5 messages in 2 seconds → silent auto-ban\n"
+        "     Owner receives instant BAN LOG notification\n\n"
+        "  ⚠️ <b>NUKE ALL DATA</b> ☠️\n"
+        "     Permanently wipes ALL MongoDB records in one action.\n"
+        "     Wipes: PDFs · Admins · Banned Users · All Collections\n"
+        "     Requires <b>TRIPLE confirmation</b> before executing.\n"
+        "     <b>No recovery possible. Emergency use only.</b>\n\n"
+        "⚙️ <b>4. ADMIN CONFIG — Full Control Panel</b>\n\n"
+        "  ➕ <b>Add Admin</b> — Grant access by Telegram User ID\n"
+        "     → New admins receive all permissions by default\n"
+        "  ➖ <b>Remove Admin</b> — Permanently revoke access\n"
+        "  🔒 <b>Lock Admin</b> — Freeze without removing record\n"
+        "  🔓 <b>Unlock Admin</b> — Restore a locked admin\n"
+        "  🛡️ <b>Permissions</b> — Toggle per-feature access:\n"
+        "     Generate PDF · Get Link · Show Library · Edit PDF\n"
+        "     Storage Info · Diagnosis · Terminal · Remove · NUKE\n"
+        "  🏅 <b>Roles</b> — Assign named titles (Chief Editor…)\n"
+        "  📜 <b>List Admins</b> — Full roster with status + role\n"
+        "  🚫 <b>Banned Users</b> — Ban · Unban · List blacklist\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "💎 <b>MSA NODE BOT 4</b>  |  <i>God-Mode Manual</i>  |  Page 3 of 4"
+    ),
+    # ── PAGE 4 / 4 ── LIVE TOOLS + BACKUP SYSTEMS + STATUS
+    (
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "  💎  <b>MSANODE GOD-MODE PREMIER MANUAL</b>\n"
+        "  <i>Classified Operational Protocol v6.0</i>  ·  Page 4 / 4\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "💻 <b>LIVE TERMINAL</b>\n"
+        "  • Streams last 50 lines of real-time bot console\n"
+        "  • Press <b>🔄 REFRESH TERMINAL</b> to pull latest logs\n"
+        "  • Shows: DB queries · errors · PDF events · admin ops\n"
+        "  • Critical for live debugging and monitoring\n\n"
+        "📊 <b>STORAGE INFO</b>\n"
+        "  • Total PDFs in library (active + locked)\n"
+        "  • Recycle Bin items (soft-deleted, recoverable)\n"
+        "  • MongoDB Atlas latency (live ping in ms)\n"
+        "  • DB connection status: 🟢 Online / 🔴 Offline\n\n"
+        "🩺 <b>SYSTEM DIAGNOSIS</b>\n"
+        "  • Full health check: MongoDB · Drive API · Bot latency\n"
+        "  • Reports any anomalies or high latency instantly\n\n"
+        "📦 <b>5. BACKUP SYSTEMS</b>\n\n"
+        "  📲 <b>Manual Backup</b> (click 📦 Backup):\n"
+        "     ↳ Text Report — Admin list + full PDF library\n"
+        "     ↳ JSON Dump — Full DB export, restore-ready\n"
+        "     ↳ Sent directly to Owner via Telegram\n\n"
+        "  🕐 <b>Weekly Auto-Pilot</b>:\n"
+        "     Every <b>Sunday @ 03:00 AM</b> — full snapshot auto-sent\n\n"
+        "  📅 <b>Monthly Auto-Backup</b>:\n"
+        "     1st of each month @ <b>03:30 AM</b> — JSON + Text\n"
+        "     Dedup-guard: skips if month already backed up\n\n"
+        "  📊 <b>Daily Status Reports</b>:\n"
+        "     Sent at <b>08:40 AM</b> and <b>08:40 PM</b> (local time)\n"
+        "     Shows: PDFs generated · links fetched · errors today\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "🚀 <b>SYSTEM STATUS:</b> 🟢 OPTIMAL\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "💎 <b>MSA NODE BOT 4</b>  |  <i>God-Mode Manual</i>  |  Page 4 of 4\n"
+        "<i>Press ⬅️ PREV PAGE to go back or 🔙 Back to Menu to exit.</i>"
+    ),
+]
 
-@dp.message(F.text == "🗄️ Databases")
-async def handle_databases_btn(message: types.Message):
+def _elite_guide_kb(page: int, total: int) -> ReplyKeyboardMarkup:
+    """Navigation keyboard for Elite Help — PREV / NEXT + Back to Menu."""
+    row_nav = []
+    if page > 1:
+        row_nav.append(KeyboardButton(text="⬅️ PREV PAGE"))
+    if page < total:
+        row_nav.append(KeyboardButton(text="NEXT PAGE ➡️"))
+    rows = []
+    if row_nav:
+        rows.append(row_nav)
+    rows.append([KeyboardButton(text="🔙 Back to Menu")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+@dp.message(F.text == "\U0001F48E Full Guide")
+async def elite_help(message: types.Message, state: FSMContext):
+    """Open the Bot 4 Full Guide — page 1."""
     if not is_admin(message.from_user.id): return
-    
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="🍃 MongoDB"), KeyboardButton(text="🔐 Env Variables"))
-    builder.row(KeyboardButton(text="🔙 Back to Menu"))
-    
-    await message.answer(
-        "🗄️ **DATABASE MANAGEMENT**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Manage your data persistence layers.\n\n"
-        "<b>🍃 MongoDB:</b> Switch core database connections.\n"
-        "<b>🔐 Env Variables:</b> Manage API Keys and Secret Files.",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="HTML"
-    )
-
-# --- MONGODB MENU ---
-@dp.message(F.text == "🍃 MongoDB")
-async def handle_mongodb_btn(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    
-    config = load_db_config()
-    active_alias = config.get("active", "Unknown")
-    
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="➕ Add Mongo"), KeyboardButton(text="👁️ Show Mongo"))
-    builder.row(KeyboardButton(text="🔄 Switch Mongo"), KeyboardButton(text="🗑️ Remove Mongo"))
-    builder.row(KeyboardButton(text="🔙 Back"), KeyboardButton(text="🏠 Main Menu"))
-    
-    await message.answer(
-        f"🍃 **MONGODB DASHBOARD**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Active Connection:</b> <code>{active_alias}</code>\n\n"
-        f"Select an operation:",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="HTML"
-    )
-
-# --- ADD MONGO ---
-@dp.message(F.text == "➕ Add Mongo")
-async def add_mongo_btn(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    
-    await message.answer(
-        "➕ **ADD CONNECTION**\n"
-        "Please send the **MongoDB Connection String (URI)**.\n"
-        "<i>Format: mongodb+srv://...</i>",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back")]], resize_keyboard=True),
-        parse_mode="HTML"
-    )
-    await state.set_state(BotState.waiting_for_mongo_url)
-
-@dp.message(BotState.waiting_for_mongo_url)
-async def process_mongo_url(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Back": return await handle_mongodb_btn(message)
-    
-    uri = message.text.strip()
-    
-    # Check for Duplicate URI
-    config = load_db_config()
-    existing_uris = config["connections"].values()
-    if uri in existing_uris:
-        await message.answer("⚠️ **Duplicate Connection!**\nThis MongoDB URI is already saved.\nPlease send a different one or Go Back.")
-        return
-        
-    msg = await message.answer("🔄 Testing Connection...")
-    
-    try:
-        # Test Connection
-        client = pymongo.MongoClient(
-            uri,
-            serverSelectionTimeoutMS=15000,
-            socketTimeoutMS=30000,
-            connectTimeoutMS=15000,
-            retryWrites=True,
-            retryReads=True
-        )
-        client.server_info() # Trigger connection
-        client.close()
-        
-        await msg.edit_text("✅ **Connection Successful!**\nNow send a **Name/Alias** for this connection (e.g., 'Production', 'Backup').", parse_mode="Markdown")
-        await state.update_data(new_mongo_uri=uri)
-        await state.set_state(BotState.waiting_for_mongo_alias)
-        
-    except Exception as e:
-        await msg.edit_text(f"❌ **Connection Failed:**\n`{e}`\n\nPlease try again or Go Back.", parse_mode="Markdown")
-
-@dp.message(BotState.waiting_for_mongo_alias)
-async def process_mongo_alias(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Back": return await handle_mongodb_btn(message)
-    
-    alias = message.text.strip()
-    
-    # Check for Duplicate Alias
-    config = load_db_config()
-    if alias in config["connections"]:
-        await message.answer(f"⚠️ **Duplicate Name!**\nThe name `{alias}` is already used.\nPlease choose a different name.")
-        return
-        
-    data = await state.get_data()
-    uri = data.get("new_mongo_uri")
-    
-    config["connections"][alias] = uri
-    
-    # Save Timestamp
-    import datetime
-    now = datetime.datetime.now().strftime("%I:%M %p") # 12h format e.g. 04:30 PM
-    if "timestamps" not in config: config["timestamps"] = {}
-    config["timestamps"][alias] = now
-    
-    save_db_config(config)
-    
-    # AUTO-MIGRATE / CHECK ENV
-    migration_report = ""
-    try:
-        temp_client = pymongo.MongoClient(
-            uri,
-            serverSelectionTimeoutMS=15000,
-            socketTimeoutMS=30000,
-            connectTimeoutMS=15000,
-            retryWrites=True,
-            retryReads=True
-        )
-        migration_status = migrate_env_vars(temp_client)
-        migration_report = f"\n📝 {migration_status}"
-        temp_client.close()
-    except Exception as e:
-        migration_report = f"\n⚠️ Migration Check Failed: {e}"
-    
-    await message.answer(
-        f"✅ **Saved!**\n"
-        f"Connection `{alias}` added to configuration.\n"
-        f"{migration_report}", 
-        parse_mode="Markdown"
-    )
     await state.clear()
-    await handle_mongodb_btn(message)
-
-# --- SHOW MONGO ---
-@dp.message(F.text == "👁️ Show Mongo")
-async def show_mongo_btn(message: types.Message):
-    if not is_admin(message.from_user.id): return
-
-    config = load_db_config()
-    conns = config.get("connections", {})
-    timestamps = config.get("timestamps", {})
-    active = config.get("active", "")
-    
-    text = "👁️ **AVAILABLE CONNECTIONS**\n━━━━━━━━━━━━━━━━━━━━\n"
-    
-    if not conns:
-        text += "_No connections found._"
-    else:
-        for i, (alias, uri) in enumerate(conns.items(), 1):
-            status = "✅ (Active)" if alias == active else ""
-            added_time = timestamps.get(alias, "Unknown")
-            
-            # User requested FULL URL (No masking) and Copyable
-            # SECURITY NOTE: Only admins can see this now.
-            text += f"{i}. <b>{alias}</b> {status}\n   📅 Added: {added_time}\n   <code>{uri}</code>\n\n"            
-    await message.answer(text, parse_mode="HTML")
-
-# --- REMOVE MONGO ---
-@dp.message(F.text == "🗑️ Remove Mongo")
-async def remove_mongo_btn(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    
-    config = load_db_config()
-    conns = config.get("connections", {})
-    active = config.get("active", "")
-    
-    conn_list_text = ""
-    builder = ReplyKeyboardBuilder()
-    
-    for i, alias in enumerate(conns.keys(), 1):
-        if alias == active:
-             conn_list_text += f"{i}. <b>{alias}</b> (Active - Cannot Remove)\n"
-        else:
-             conn_list_text += f"{i}. <b>{alias}</b>\n"
-             builder.add(KeyboardButton(text=str(i)))
-            
-    builder.adjust(4)
-    builder.row(KeyboardButton(text="🔙 Back"))
-    
+    await state.set_state(BotState.viewing_elite_help)
+    await state.update_data(elite_help_page=1)
     await message.answer(
-        f"🗑️ **REMOVE CONNECTION**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{conn_list_text}\n"
-        f"👇 **Tap the number to remove:**", 
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="HTML"
-    )
-    await state.set_state(BotState.waiting_for_remove_index)
-
-@dp.message(BotState.waiting_for_remove_index, F.text == "🔙 Back")
-async def back_from_remove(message: types.Message, state: FSMContext):
-    await state.clear()
-    await handle_mongodb_btn(message)
-
-@dp.message(BotState.waiting_for_remove_index, F.text.regexp(r'^\d+$'))
-async def process_remove_mongo_index(message: types.Message, state: FSMContext):
-    idx_str = message.text.strip()
-    target_idx = int(idx_str)
-    
-    config = load_db_config()
-    conns = list(config["connections"].keys())
-    
-    if target_idx < 1 or target_idx > len(conns):
-        await message.answer("⚠️ Invalid Index Number.")
-        return
-        
-    alias = conns[target_idx - 1]
-    
-    if alias == config.get("active"):
-        await message.answer("⚠️ Cannot remove the **Active** connection.", parse_mode="Markdown")
-        return
-        
-    # Ask for confirmation
-    await state.update_data(remove_target_alias=alias)
-    await state.set_state(BotState.waiting_for_remove_mongo_confirm)
-    
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="✅ YES, DELETE"), KeyboardButton(text="🔙 NO, CANCEL"))
-    
-    await message.answer(
-        f"⚠️ **CONFIRM DELETION**\n\n"
-        f"Are you sure you want to delete **{alias}**?\n"
-        f"<i>This action cannot be undone.</i>",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="HTML"
-    )
-
-@dp.message(BotState.waiting_for_remove_mongo_confirm)
-async def process_remove_mongo_confirm(message: types.Message, state: FSMContext):
-    if message.text == "🔙 NO, CANCEL":
-        await state.clear()
-        await message.answer("❌ Deletion Cancelled.")
-        await remove_mongo_btn(message, state) # Return to list
-        return
-        
-    if message.text == "✅ YES, DELETE":
-        data = await state.get_data()
-        alias = data.get("remove_target_alias")
-        
-        config = load_db_config()
-        if alias in config["connections"]:
-            del config["connections"][alias]
-            # Remove timestamp too
-            if "timestamps" in config and alias in config["timestamps"]:
-                 del config["timestamps"][alias]
-            
-            save_db_config(config)
-            await message.answer(f"🗑️ Connection `{alias}` has been **permanently deleted**.", parse_mode="Markdown")
-        else:
-            await message.answer("⚠️ Connection was already removed or not found.")
-            
-        await state.clear()
-        await remove_mongo_btn(message, state) # Back to list
-        return
-        
-    await message.answer("Please choose YES or NO.")
-
-# --- SWITCH MONGO ---
-@dp.message(F.text == "🔄 Switch Mongo")
-async def switch_mongo_btn(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    
-    config = load_db_config()
-    conns = config.get("connections", {})
-    active = config.get("active", "")
-    
-    # User Request: If only 1 URL (the active one), show alert to ADD first.
-    if len(conns) < 2:
-        await message.answer(
-            "⚠️ **SWITCH OPTION UNAVAILABLE**\n\n"
-            "You only have **1** database connection configured.\n"
-            "Please **➕ Add Mongo** first to have something to switch to!",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # User requested Index in buttons: "only index is enough 1 2 3 so on"
-    # Strategy: Show List in Text, Buttons are numbers.
-    
-    conn_list_text = ""
-    target_map = {} # Map Index -> Alias
-    
-    builder = ReplyKeyboardBuilder()
-    
-    for i, alias in enumerate(conns.keys(), 1):
-        status = "✅ (Active)" if alias == active else ""
-        conn_list_text += f"{i}. <b>{alias}</b> {status}\n"
-        
-        if alias != active:
-            builder.add(KeyboardButton(text=str(i)))
-        else:
-             # User Request: "3 bu in buttons 2 3 are displayed fix it please"
-             # They want ALL buttons to be visible, even if one is active.
-             # We will just show it. If clicked, the handler handles it.
-             builder.add(KeyboardButton(text=str(i)))
-    
-    builder.adjust(4) # Compact grid of numbers
-    builder.row(KeyboardButton(text="🔙 Back"))
-    
-    await message.answer(
-        f"🔄 **SWITCH CONNECTION**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{conn_list_text}\n"
-        f"👇 **Tap the number to switch:**", 
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="HTML"
-    )
-    # Set state to capture digits only for this context
-    await state.set_state(BotState.waiting_for_switch_index)
-
-@dp.message(BotState.waiting_for_switch_index, F.text == "🔙 Back")
-async def back_from_switch(message: types.Message, state: FSMContext):
-    await state.clear()
-    await handle_mongodb_btn(message)
-
-@dp.message(BotState.waiting_for_switch_index, F.text.regexp(r'^\d+$')) # Match digits only
-async def process_switch_mongo_index(message: types.Message, state: FSMContext):
-    # User sent a number (e.g. "2")
-    idx_str = message.text.strip()
-    target_idx = int(idx_str)
-    
-    config = load_db_config()
-    conns = list(config["connections"].keys()) # Order is preserved in Python 3.7+
-    
-    if target_idx < 1 or target_idx > len(conns):
-        await message.answer("⚠️ Invalid Index Number.")
-        return
-        
-    # Map 1-based index to 0-based list
-    target_alias = conns[target_idx - 1]
-    
-    # Check if already active
-    if target_alias == config.get("active"):
-         await message.answer("⚠️ that is already the active connection!")
-         return
-    
-    # State cleared only after successful switch or back? 
-    # Actually, we should clear it if successful, or keep it if failed? 
-    # Usually clear on success.
-    await state.clear() 
-         
-    target_uri = config["connections"][target_alias]
-    msg = await message.answer(f"🔄 **Switching to {target_alias}...**")
-    
-    try:
-        # 1. Connect and Verify
-        new_client = pymongo.MongoClient(
-            target_uri,
-            serverSelectionTimeoutMS=15000,
-            socketTimeoutMS=30000,
-            connectTimeoutMS=15000,
-            retryWrites=True,
-            retryReads=True
-        )
-        new_client.server_info()
-        
-        # 2. Migrate Env/Secrets (Idempotent Check)
-        migration_status = migrate_env_vars(new_client)
-        
-        # 3. Update Config
-        config["active"] = target_alias
-        save_db_config(config)
-        
-        # 4. Update .env
-        update_env_file("MONGO_URI", target_uri)
-        
-        # 5. Update Runtime Global
-        global MONGO_URI, db_client
-        MONGO_URI = target_uri
-        
-        # 6. Reconnect Runtime
-        if connect_db():
-            await msg.delete() # Clean up status message
-            await message.answer(
-                f"✅ **SWITCH COMPLETE!**\n"
-                f"Now connected to: `{target_alias}`\n"
-                f"📝 {migration_status}\n"
-                f"♻️ **Bot Runtime Reloaded.**",
-                parse_mode="Markdown"
-            )
-            # User requested: "gets udpated in displlaay lsit as well properly"
-            # So we show the updated list immediately.
-            await switch_mongo_btn(message, state) # Show the switch menu again (updated)
-        else:
-             await msg.edit_text("⚠️ Switched `.env` but Runtime Reconnection Failed. Please Restart Bot.")
-             
-    except Exception as e:
-        await msg.edit_text(f"❌ **Switch Failed:** `{e}`", parse_mode="Markdown")
-
-# --- ENV VARIABLES MENU ---
-@dp.message(F.text == "🔐 Env Variables")
-async def handle_env_btn(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="👁️ View Files"), KeyboardButton(text="📝 Replace File"))
-    builder.row(KeyboardButton(text="🔙 Back"), KeyboardButton(text="🏠 Main Menu"))
-    
-    await message.answer(
-        "🔐 **ENV FILE MANAGER**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Manage your configuration files directly.\n\n"
-        "👁️ **View**: See content of `.env`, `credentials.json`, etc.\n"
-        "📝 **Replace**: Overwrite files with new text or uploads.",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="HTML"
-    )
-
-# Common File List for Operations
-ENV_FILES = ["credentials.json", "token.pickle", "db_config.json", ".env"]
-
-# --- VIEW FILES ---
-@dp.message(F.text == "👁️ View Files")
-async def view_files_menu(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    
-    builder = ReplyKeyboardBuilder()
-    text = "👁️ **SELECT FILE TO VIEW**\n━━━━━━━━━━━━━━━━━━━━\n"
-    
-    for i, fname in enumerate(ENV_FILES, 1):
-        if os.path.exists(fname):
-            size = os.path.getsize(fname)
-            text += f"{i}. <b>{fname}</b> ({size} bytes)\n"
-            builder.add(KeyboardButton(text=f"👁️ {i}. {fname}"))
-        else:
-            text += f"{i}. {fname} (Missing)\n"
-            
-    builder.adjust(2)
-    builder.row(KeyboardButton(text="🔙 Back"))
-    
-    await message.answer(text, reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML")
-
-@dp.message(F.text.startswith("👁️ "))
-async def process_view_file(message: types.Message):
-    # This handler catches the button clicks from View Menu
-    # Format: "👁️ 1. filename"
-    try:
-        if ". " not in message.text: return # Ignore non-file buttons
-        parts = message.text.replace("👁️ ", "").split(". ", 1)
-        fname = parts[1]
-    except:
-        return
-        
-    if not os.path.exists(fname):
-        await message.answer("❌ File not found.")
-        return
-        
-    # Check if binary
-    if fname.endswith(".pickle"):
-        size = os.path.getsize(fname)
-        await message.answer(f"📦 **Binary File** (`{fname}`)\nSize: {size} bytes\n_Cannot display binary content as text._", parse_mode="Markdown")
-        return
-        
-    try:
-        if fname != ".env":
-            with open(fname, "r", encoding='utf-8') as f:
-                content = f.read()
-        else:
-            # STRICT FILTERING FOR .ENV
-            # User request: "only bot 4 related items"
-            allowed_keys = ["MONGO_URI", "BOT_TOKEN", "OWNER_ID", "PARENT_FOLDER_ID", "PORT"]
-            content = ""
-            with open(".env", "r", encoding='utf-8') as f:
-                for line in f:
-                    # Check if line starts with any allowed key
-                    if any(line.strip().startswith(k + "=") for k in allowed_keys):
-                        content += line
-                    elif not line.strip(): 
-                         pass # Skip empty lines in filtered view or keep? Let's skip to be clean.
-            
-            if not content: content = "# No Bot 4 relevant keys found in .env"
-            
-        if len(content) > 3000:
-            # Send as file if too long
-            f = FSInputFile(fname)
-            await message.reply_document(f, caption=f"📄 **{fname}** (Too long to print)")
-        else:
-            # Escape HTML tags for safety
-            import html
-            safe_content = html.escape(content)
-            await message.answer(f"📄 **{fname}** (Filtered View)\n━━━━━━━━━━━━━━━━━━━━\n<pre>{safe_content}</pre>\n\n_Note: Only showing Bot 4 related keys._", parse_mode="HTML")
-    except Exception as e:
-        await message.answer(f"❌ Error reading file: {e}")
-
-# --- REPLACE FILES ---
-@dp.message(F.text == "📝 Replace File")
-async def replace_files_menu(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    
-    builder = ReplyKeyboardBuilder()
-    text = "📝 **SELECT FILE TO REPLACE**\n━━━━━━━━━━━━━━━━━━━━\n"
-    
-    for i, fname in enumerate(ENV_FILES, 1):
-        exists = "✅" if os.path.exists(fname) else "❌"
-        text += f"{i}. <b>{fname}</b> {exists}\n"
-        builder.add(KeyboardButton(text=f"📝 {i}. {fname}"))
-            
-    builder.adjust(2)
-    builder.row(KeyboardButton(text="🔙 Back"))
-    
-    await message.answer(text, reply_markup=builder.as_markup(resize_keyboard=True), parse_mode="HTML")
-    await state.set_state(BotState.waiting_for_env_file_selection)
-
-@dp.message(BotState.waiting_for_env_file_selection, F.text.startswith("📝 "))
-async def process_replace_selection(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Back":
-        await state.clear()
-        await handle_env_btn(message)
-        return
-
-    try:
-        if ". " not in message.text: return
-        parts = message.text.replace("📝 ", "").split(". ", 1)
-        fname = parts[1]
-    except:
-        await message.answer("⚠️ Selection error.")
-        return
-        
-    await state.update_data(replace_target=fname)
-    
-    # GRANULAR EDIT LOGIC FOR .ENV
-    if fname == ".env":
-        # Parse Keys & Content for Preview
-        found_keys = []
-        env_content_display = ""
-        allowed_keys = ["MONGO_URI", "BOT_TOKEN", "OWNER_ID", "PARENT_FOLDER_ID", "PORT"]
-        
-        try:
-             with open(fname, "r", encoding="utf-8") as f:
-                 lines = f.readlines()
-                 
-                 # 1. Build Keys List
-                 for line in lines:
-                     if "=" in line and not line.strip().startswith("#"):
-                         key = line.split("=", 1)[0].strip()
-                         if key: found_keys.append(key)
-                 
-                 # 2. Build Filtered Display (Reuse logic)
-                 filtered_lines = []
-                 for line in lines:
-                     if any(line.strip().startswith(k + "=") for k in allowed_keys):
-                         filtered_lines.append(line)
-                 
-                 if filtered_lines:
-                     import html
-                     safe_env = html.escape("".join(filtered_lines))
-                     env_content_display = f"\n<pre>{safe_env}</pre>"
-                 else:
-                     env_content_display = "_(No Bot 4 keys found)_"
-
-        except Exception as e: 
-            env_content_display = f"_(Error reading file: {e})_"
-            pass
-        
-        # Only offer granular if we found relevant keys
-        relevant_keys = [k for k in found_keys if k in allowed_keys]
-        
-        if relevant_keys:
-            builder = ReplyKeyboardBuilder()
-            for k in relevant_keys:
-                builder.add(KeyboardButton(text=f"🔑 {k}"))
-            
-            builder.adjust(2)
-            builder.row(KeyboardButton(text="📄 Replace Entire File"))
-            builder.row(KeyboardButton(text="🔙 Back"))
-            
-            await message.answer(
-                f"📝 **Editing `{fname}`**\n"
-                f"**Current Configuration:**\n{env_content_display}\n\n"
-                f"Select a **Specific Variable** to edit, or replace the whole file.",
-                reply_markup=builder.as_markup(resize_keyboard=True),
-                parse_mode="HTML"
-            )
-            await state.set_state(BotState.waiting_for_granular_option)
-            return
-
-    # Default (Non-.env or No Keys found) -> Full Replace
-    # SHOW CURRENT CONTENT (Limited)
-    curr_content_display = ""
-    try:
-        with open(fname, "r", encoding="utf-8") as f:
-            raw = f.read(2048) # Read first 2kb
-            import html
-            safe = html.escape(raw)
-            if len(raw) >= 2048: safe += "..."
-            curr_content_display = f"\n<pre>{safe}</pre>"
-    except: curr_content_display = "_(Binary or unreadable)_"
-
-    await message.answer(
-        f"📝 **Replacing `{fname}`**\n"
-        f"**Current Content:**\n{curr_content_display}\n\n"
-        "Please send the **NEW CONTENT**:\n"
-        "• Send **Text Message** to paste content.\n"
-        "• Or **Upload a File** to overwrite it.",
+        _ELITE_GUIDE_PAGES[0],
         parse_mode="HTML",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Cancel")]], resize_keyboard=True)
+        reply_markup=_elite_guide_kb(1, len(_ELITE_GUIDE_PAGES)),
     )
-    await state.set_state(BotState.waiting_for_env_replacement_content)
 
-@dp.message(BotState.waiting_for_env_value)
-async def process_env_value(message: types.Message, state: FSMContext):
-    if message.text == "❌ Cancel": return await handle_env_btn(message)
-    
-    new_value = message.text.strip()
+@dp.message(F.text == "NEXT PAGE ➡️")
+async def elite_help_next(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
     data = await state.get_data()
-    key = data.get("env_key")
-    
-    # 0. Capture Old Value
-    old_value = os.environ.get(key, "Not Set")
-    
-    # 1. Update Local File
-    update_env_file(key, new_value)
-    
-    # 2. Hot-reload check
-    os.environ[key] = new_value
-    
-    # 3. Update MongoDB (CRITICAL for Bot 4 Secrets)
-    db_status = ""
-    if key in ["BOT_TOKEN", "OWNER_ID", "PARENT_FOLDER_ID"]:
-        try:
-             client = pymongo.MongoClient(
-                 os.getenv("MONGO_URI"),
-                 serverSelectionTimeoutMS=15000,
-                 socketTimeoutMS=30000,
-                 connectTimeoutMS=15000,
-                 retryWrites=True,
-                 retryReads=True
-             )
-             db = client["MSANodeDB"]
-             col = db["bot_secrets"]
-             col.update_one(
-                 {"bot": "bot4"},
-                 {"$set": {key: new_value}},
-                 upsert=True
-             )
-             client.close()
-             db_status = "\n✅ **Synced to MongoDB Secrets**"
-        except Exception as e:
-             db_status = f"\n⚠️ **DB Sync Failed:** {e}"
-    
-    # 4. Read NEW Full Content for Feedack
-    final_view = ""
-    allowed_keys = ["MONGO_URI", "BOT_TOKEN", "OWNER_ID", "PARENT_FOLDER_ID", "PORT"]
-    try:
-        with open(".env", "r", encoding="utf-8") as f:
-             lines = f.readlines()
-             filtered = [l for l in lines if any(l.strip().startswith(k + "=") for k in allowed_keys)]
-             import html
-             safe_final = html.escape("".join(filtered))
-             final_view = f"<pre>{safe_final}</pre>"
-    except: final_view = "(Could not read file)"
-
-    # SHOW DIFF & FULL RESULT
+    page = min(data.get("elite_help_page", 1) + 1, len(_ELITE_GUIDE_PAGES))
+    await state.update_data(elite_help_page=page)
     await message.answer(
-        f"✅ **VARIABLE UPDATED**\n"
-        f"Key: <code>{key}</code>\n"
-        f"Old: <code>{old_value}</code>\n"
-        f"New: <code>{new_value}</code>\n"
-        f"{db_status}\n\n"
-        f"**📄 Full New Config:**\n{final_view}", 
-        parse_mode="HTML"
+        _ELITE_GUIDE_PAGES[page - 1],
+        parse_mode="HTML",
+        reply_markup=_elite_guide_kb(page, len(_ELITE_GUIDE_PAGES)),
     )
-    await asyncio.sleep(2) # Brief pause for reading
-    await state.clear()
-    
-    # 5. SELF-RESTART if Identity Changed
-    if key == "BOT_TOKEN":
-        await message.answer(
-            "⚠️ **IDENTITY CHANGE DETECTED**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "The Bot Token has been updated.\n"
-            "I must **RESTART** now to apply the new identity.\n\n"
-            "<i>System is rebooting... (Approx 5s)</i>", 
-            parse_mode="HTML"
-        )
-        await asyncio.sleep(2) # Allow message to send
-        print(f"🔄 RESTARTING BOT DUE TO TOKEN CHANGE ({new_value[:10]}...)")
-        
-        # Robust Restart Logic (Hybrid)
-        import subprocess
-        
-        python = sys.executable
-        script_path = os.path.abspath("bot4.py")
-        
-        print(f"🔄 RESTARTING: {python} {script_path}")
-        
-        if sys.platform == 'win32':
-            # Windows: execv can be flaky with spaces/paths. Spawn new, kill old.
-            subprocess.Popen([python, script_path])
-            os._exit(0) # Exit immediately without cleanup/traceback
-        else:
-            # Linux/Render: execv is standard and cleaner (replaces PID)
-            os.execv(python, [python, script_path])
-    
-    # implied by context, go back to env menu
-    await handle_env_btn(message)
 
-
-
-@dp.message(BotState.waiting_for_granular_option)
-async def process_granular_option(message: types.Message, state: FSMContext):
-    text = message.text
-    if text == "🔙 Back":
-        await replace_files_menu(message, state) # Go back to file list
-        return
-        
-    if text == "📄 Replace Entire File":
-        # Proceed to full replace logic
-        data = await state.get_data()
-        fname = data.get("replace_target")
-        
-        # Show Content Logic
-        curr_content_display = ""
-        try:
-            with open(fname, "r", encoding="utf-8") as f:
-                raw = f.read(2048)
-                import html
-                safe = html.escape(raw)
-                if len(raw) >= 2048: safe += "..."
-                curr_content_display = f"\n<pre>{safe}</pre>"
-        except: curr_content_display = "_(Binary or unreadable)_"
-        
-        await message.answer(
-            f"📝 **Replacing `{fname}` (FULL)**\n"
-            f"**Current Content:**\n{curr_content_display}\n\n"
-            "Please send the **NEW CONTENT** (Text or File).",
-            parse_mode="HTML",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Cancel")]], resize_keyboard=True)
-        )
-        await state.set_state(BotState.waiting_for_env_replacement_content)
-        return
-        
-    if text.startswith("🔑 "):
-        # Specific Key Selected
-        key = text.replace("🔑 ", "").strip()
-        await state.update_data(env_key=key)
-        
-        # Fetch current value for display
-        current_val = os.getenv(key, "Not Set / Empty")
-        
-        await message.answer(
-            f"🔑 **Editing Variable: `{key}`**\n"
-            f"**Current Value:**\n<code>{current_val}</code>\n\n"
-            f"👇 Send the **NEW VALUE** now:",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Cancel")]], resize_keyboard=True),
-            parse_mode="HTML"
-        )
-        # Reuse existing handler which does Sync
-        await state.set_state(BotState.waiting_for_env_value)
-    else:
-        await message.answer("⚠️ Invalid Option.")
-
-@dp.message(BotState.waiting_for_env_replacement_content)
-async def process_replace_content(message: types.Message, state: FSMContext):
-    if message.text == "❌ Cancel":
-        await state.clear()
-        await handle_env_btn(message)
-        return
-
+@dp.message(F.text == "⬅️ PREV PAGE")
+async def elite_help_prev(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
     data = await state.get_data()
-    target_file = data.get("replace_target")
-    result = "Unknown"
-    
-    try:
-        # Handle File Upload
-        if message.document:
-            file_id = message.document.file_id
-            file = await bot.get_file(file_id)
-            # Download and overwrite
-            # Note: aiogram download_file return BytesIO or path
-            await bot.download_file(file.file_path, destination=target_file)
-            result = "File Uploaded"
-            
-        # Handle Text Paste
-        elif message.text:
-            with open(target_file, "w", encoding='utf-8') as f:
-                f.write(message.text)
-            result = "Text Content Updated"
-        else:
-             await message.answer("⚠️ Please send Text or File.")
-             return
-            
-        await message.answer(f"✅ **Success!**\n`{target_file}` has been updated.\n({result})", parse_mode="Markdown")
-        
-        # Reload Dotenv if .env changed
-        if target_file == ".env":
-            load_dotenv(override=True)
-            await message.answer("♻️ Environment Variables Reloaded.")
-            
-    except Exception as e:
-        await message.answer(f"❌ **Update Failed:** `{e}`", parse_mode="Markdown")
-        
-    await state.clear()
-    await handle_env_btn(message)
+    page = max(data.get("elite_help_page", 1) - 1, 1)
+    await state.update_data(elite_help_page=page)
+    await message.answer(
+        _ELITE_GUIDE_PAGES[page - 1],
+        parse_mode="HTML",
+        reply_markup=_elite_guide_kb(page, len(_ELITE_GUIDE_PAGES)),
+    )
+
+
+# ==========================================
+# 🗄️ DATABASE & ENV MANAGEMENT
+# ==========================================
 
 # --- BACK NAVIGATION ---
 @dp.message(F.text == "🔙 Back")
 async def back_router(message: types.Message, state: FSMContext):
-    await handle_databases_btn(message)
+    await start(message, state)
     
 @dp.message(F.text == "🏠 Main Menu")
 async def main_menu_return(message: types.Message, state: FSMContext):
     await start(message, state)
-
-# --- ADD TEXT VAR ---
-@dp.message(F.text == "➕ Add Env Var")
-async def add_env_text_btn(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    await message.answer(
-        "📝 **ENTER VARIABLE KEY**\n"
-        "Example: `BOT_TOKEN`, `MONGO_URI`\n"
-        "Send the **KEY** name now:",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Cancel")]], resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    await state.set_state(BotState.waiting_for_env_key)
-
-# ... (Key/Value states remain same) ...
-
-# --- UPLOAD FILE ---
-@dp.message(F.text == "➕ Upload File")
-async def add_env_file_btn(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    await message.answer(
-        "📂 **UPLOAD CONFIG FILE**\n"
-        "Supported: `credentials.json`, `token.pickle`, `.env`\n\n"
-        "👇 **Send the file now:**",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Cancel")]], resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    await state.set_state(BotState.waiting_for_env_file)
-
-@dp.message(BotState.waiting_for_env_key)
-async def process_env_key(message: types.Message, state: FSMContext):
-    if message.text == "❌ Cancel": return await handle_env_btn(message)
-    
-    key = message.text.strip().upper()
-    # Simple validation
-    if " " in key or "=" in key:
-        await message.answer("⚠️ Invalid Key format. Use UPPERCASE_UNDERSCORE only.")
-        return
-        
-    await state.update_data(env_key=key)
-    await message.answer(f"🔑 **Key:** `{key}`\nNow send the **VALUE**:", parse_mode="Markdown")
-    await state.set_state(BotState.waiting_for_env_value)
-
-@dp.message(BotState.waiting_for_env_value)
-async def process_env_value(message: types.Message, state: FSMContext):
-    if message.text == "❌ Cancel": return await handle_env_btn(message)
-    
-    new_value = message.text.strip()
-    data = await state.get_data()
-    key = data.get("env_key")
-    
-    # 0. Capture Old Value
-    old_value = os.environ.get(key, "Not Set")
-    
-    # 1. Update Local File
-    update_env_file(key, new_value)
-    
-    # 2. Hot-reload check
-    os.environ[key] = new_value
-    
-    # 3. Update MongoDB (CRITICAL for Bot 4 Secrets)
-    db_status = ""
-    if key in ["BOT_TOKEN", "OWNER_ID", "PARENT_FOLDER_ID"]:
-        try:
-             client = pymongo.MongoClient(
-                 os.getenv("MONGO_URI"),
-                 serverSelectionTimeoutMS=15000,
-                 socketTimeoutMS=30000,
-                 connectTimeoutMS=15000,
-                 retryWrites=True,
-                 retryReads=True
-             )
-             db = client["MSANodeDB"]
-             col = db["bot_secrets"]
-             col.update_one(
-                 {"bot": "bot4"},
-                 {"$set": {key: new_value}},
-                 upsert=True
-             )
-             client.close()
-             db_status = "\n✅ **Synced to MongoDB Secrets**"
-        except Exception as e:
-             db_status = f"\n⚠️ **DB Sync Failed:** {e}"
-    
-    # 4. Read NEW Full Content for Feedback
-    final_view = ""
-    allowed_keys = ["MONGO_URI", "BOT_TOKEN", "OWNER_ID", "PARENT_FOLDER_ID", "PORT"]
-    try:
-        with open(".env", "r", encoding="utf-8") as f:
-             lines = f.readlines()
-             filtered = [l for l in lines if any(l.strip().startswith(k + "=") for k in allowed_keys)]
-             import html
-             safe_final = html.escape("".join(filtered))
-             final_view = f"<pre>{safe_final}</pre>"
-    except: final_view = "(Could not read file)"
-
-    # SHOW DIFF & FULL RESULT
-    await message.answer(
-        f"✅ **VARIABLE UPDATED**\n"
-        f"Key: <code>{key}</code>\n"
-        f"Old: <code>{old_value}</code>\n"
-        f"New: <code>{new_value}</code>\n"
-        f"{db_status}\n\n"
-        f"**📄 New Config State:**\n{final_view}", 
-        parse_mode="HTML"
-    )
-    await asyncio.sleep(2) # Brief pause for reading
-    await state.clear()
-    
-    # implied by context, go back to env menu
-    await handle_env_btn(message)
-
-# --- ADD FILE ---
-@dp.message(F.text == "📄 Upload File")
-async def add_env_file_btn(message: types.Message, state: FSMContext):
-    await message.answer(
-        "📄 **UPLOAD FILE**\n"
-        "Send the file you want to save (e.g., `credentials.json`).\n"
-        "<i>It will overwrite any existing file with the same name!</i>",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back")]], resize_keyboard=True),
-        parse_mode="HTML"
-    )
-    await state.set_state(BotState.waiting_for_env_file)
-
-@dp.message(BotState.waiting_for_env_file, F.document)
-async def process_env_file_upload(message: types.Message, state: FSMContext):
-    doc = message.document
-    file_name = doc.file_name
-    
-    valid_files = ["credentials.json", "token.pickle", "db_config.json", ".env"]
-    
-    if file_name not in valid_files and not file_name.endswith(".json"):
-        await message.answer("⚠️ **Warning:** Uncommon file name. Saving anyway...")
-    
-    file_id = doc.file_id
-    file = await bot.get_file(file_id)
-    file_path = file.file_path
-    
-    destination = file_name
-    await bot.download_file(file_path, destination)
-    
-    await message.answer(f"✅ **FILE SAVED:** `{file_name}`", parse_mode="Markdown")
-    await state.clear()
-    await handle_env_btn(message)
-
 
 # ==========================================
 # 🛡️ SYSTEM HEALTH & MONITORING
@@ -5603,16 +4469,7 @@ async def auto_health_monitor():
         except Exception as e:
             issues.append(f"Database DOWN: {e}")
             
-        # 2. DRIVE CHECK
-        try:
-            # Simple metadata call
-            # We skip full auth scan to save API quota, just check service obj
-            if not get_drive_service():
-                 issues.append("Drive Service: NoneType (Auth Failed)")
-        except Exception as e:
-            issues.append(f"Drive API Error: {e}")
-            
-        # 3. REPORT IF ISSUES
+        # 2. REPORT IF ISSUES
         if issues:
             report = (
                 f"⚠️ **AUTO-CHECKUP WARNING**\n"
@@ -5620,7 +4477,7 @@ async def auto_health_monitor():
                 f"Your system has detected irregularities:\n"
             )
             for i in issues: report += f"• 🔴 {i}\n"
-            report += f"\n🕐 Time: {datetime.now().strftime('%I:%M %p')}"
+            report += f"\n🕐 Time: {now_local().strftime('%I:%M:%S %p')}"
             
             try: await bot.send_message(OWNER_ID, report, parse_mode="Markdown")
             except: pass
@@ -5639,84 +4496,113 @@ async def reset_daily_stats():
         wait_secs = (tomorrow - now).total_seconds()
         await asyncio.sleep(max(wait_secs, 1))
         DAILY_STATS_BOT4 = {"pdfs_generated": 0, "pdfs_deleted": 0, "errors": 0, "links_retrieved": 0}
+        await _persist_stats()
         print(f"🔄 Daily stats reset at {now_local().strftime('%I:%M %p')}")
 
 
 async def strict_daily_report():
     """
     Sends a detailed report EXACTLY at 08:40 AM and 08:40 PM (local timezone).
-    Uses now_local() so timezone is always correct.
+    Uses sleep-until so the report fires correctly after any restart — no missed slots.
     """
     print("🕰️ Strict Daily Report: Online (08:40 AM/PM)")
+    _slots = [(8, 40, "08:40 AM"), (20, 40, "08:40 PM")]
+
     while True:
-        now = now_local()
-        current_time = now.strftime("%I:%M %p")  # e.g. "08:40 AM"
+        try:
+            # ── Calculate exact sleep until next slot ──────────────────────────
+            now = now_local()
+            next_fire = None
+            next_label = None
+            for hour, minute, label in _slots:
+                candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate <= now:          # already passed — push to tomorrow
+                    candidate += timedelta(days=1)
+                if next_fire is None or candidate < next_fire:
+                    next_fire = candidate
+                    next_label = label
 
-        if current_time in ["08:40 AM", "08:40 PM"]:
+            wait_secs = (next_fire - now_local()).total_seconds()
+            h_w = int(wait_secs // 3600)
+            m_w = int((wait_secs % 3600) // 60)
+            print(f"🕰️ Next daily report '{next_label}' in {h_w}h {m_w}m")
+            await asyncio.sleep(max(wait_secs, 1))
+
+            # ── Dedup guard: skip if already sent within 20 min of this slot ──────
+            _DEDUP_WINDOW = 20 * 60   # 20 minutes
+            if col_bot4_state is not None:
+                try:
+                    rec = col_bot4_state.find_one({"_id": "last_report_sent"})
+                    if rec:
+                        last_ts = rec.get("ts")
+                        if last_ts and (datetime.now() - last_ts).total_seconds() < _DEDUP_WINDOW:
+                            print(f"🕰️ Report dedup: already sent within last {_DEDUP_WINDOW//60}m — skipping.")
+                            await asyncio.sleep(60)
+                            continue
+                except Exception:
+                    pass
+
+            # ── Fire the report ───────────────────────────────────────────────
+            now = now_local()
+            current_time = now.strftime("%I:%M %p")   # e.g. "08:40 AM"
+
+            uptime_secs = int(time.time() - START_TIME)
+            uptime_str = f"{uptime_secs // 3600}h {(uptime_secs % 3600) // 60}m"
+            admin_count  = col_admins.count_documents({}) if col_admins  is not None else 0
+            banned_count = col_banned.count_documents({}) if col_banned  is not None else 0
+            pdf_count    = col_pdfs.count_documents({})   if col_pdfs    is not None else 0
+            locked_count = col_locked.count_documents({}) if col_locked  is not None else 0
+
+            db_status = "🔴 Offline"
             try:
-                # GATHER METRICS
-                uptime_secs = int(time.time() - START_TIME)
-                uptime_str = f"{uptime_secs // 3600}h {(uptime_secs % 3600) // 60}m"
-                admin_count = col_admins.count_documents({}) if col_admins is not None else 0
-                banned_count = col_banned.count_documents({}) if col_banned is not None else 0
-                pdf_count = col_pdfs.count_documents({}) if col_pdfs is not None else 0
-                locked_count = col_locked.count_documents({}) if col_locked is not None else 0
-                trash_count = col_trash.count_documents({}) if col_trash is not None else 0
+                t0 = time.time()
+                db_client.admin.command('ping')
+                lat = (time.time() - t0) * 1000
+                db_status = f"🟢 Connected ({lat:.0f}ms)"
+            except Exception:
+                pass
 
-                # Check Drive
-                drive_status = "🟢 Online"
+            report = (
+                f"📅 **DAILY SYSTEM REPORT · BOT 4**\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 **Time:** `{current_time}`  |  📆 `{now.strftime('%b %d, %Y')}`\n"
+                f"⚙️ **System:** 🟢 OPERATIONAL  |  ⏱ Uptime: `{uptime_str}`\n\n"
+                f"📊 **LIBRARY:**\n"
+                f"• 📚 PDFs Active: `{pdf_count}`\n"
+                f"• 🔒 Locked Content: `{locked_count}`\n\n"
+                f"👤 **USERS:**\n"
+                f"• 👥 Admins: `{admin_count}`\n"
+                f"• 🚫 Blacklisted: `{banned_count}`\n\n"
+                f"📈 **TODAY'S ACTIVITY:**\n"
+                f"• 📄 PDFs Generated: `{DAILY_STATS_BOT4['pdfs_generated']}`\n"
+                f"• 🔗 Links Retrieved: `{DAILY_STATS_BOT4['links_retrieved']}`\n"
+                f"• 🗑️ PDFs Deleted: `{DAILY_STATS_BOT4['pdfs_deleted']}`\n"
+                f"• ⚠️ Errors Today: `{DAILY_STATS_BOT4['errors']}`\n\n"
+                f"🛡️ **INFRASTRUCTURE:**\n"
+                f"• 🗄️ MongoDB Atlas: {db_status}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💎 **MSA NODE SYSTEMS** | Verified."
+            )
+
+            await bot.send_message(OWNER_ID, report, parse_mode="Markdown")
+            print(f"✅ Daily Report Sent at {current_time}")
+
+            # ── Mark sent in MongoDB to prevent duplicate on restart ─────────
+            if col_bot4_state is not None:
                 try:
-                    if not get_drive_service():
-                        drive_status = "🔴 Offline (Auth Failed)"
+                    col_bot4_state.update_one(
+                        {"_id": "last_report_sent"},
+                        {"$set": {"ts": datetime.now(), "label": next_label, "time": current_time}},
+                        upsert=True
+                    )
                 except Exception:
-                    drive_status = "🔴 Error"
+                    pass
 
-                # Check DB with latency
-                db_status = "🟢 Online"
-                try:
-                    t0 = time.time()
-                    db_client.admin.command('ping')
-                    lat = (time.time() - t0) * 1000
-                    db_status = f"🟢 Connected ({lat:.0f}ms)"
-                except Exception:
-                    db_status = "🔴 Offline"
-
-                report = (
-                    f"📅 **DAILY SYSTEM REPORT · BOT 4**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 **Time:** `{current_time}`  |  📆 `{now.strftime('%b %d, %Y')}`\n"
-                    f"⚙️ **System:** 🟢 OPERATIONAL  |  ⏱ Uptime: `{uptime_str}`\n\n"
-                    f"📊 **LIBRARY:**\n"
-                    f"• 📚 PDFs Active: `{pdf_count}`\n"
-                    f"• 🔒 Locked Content: `{locked_count}`\n"
-                    f"• 🗑️ Recycle Bin: `{trash_count}`\n\n"
-                    f"👤 **USERS:**\n"
-                    f"• 👥 Admins: `{admin_count}`\n"
-                    f"• 🚫 Blacklisted: `{banned_count}`\n\n"
-                    f"📈 **TODAY'S ACTIVITY:**\n"
-                    f"• 📄 PDFs Generated: `{DAILY_STATS_BOT4['pdfs_generated']}`\n"
-                    f"• 🔗 Links Retrieved: `{DAILY_STATS_BOT4['links_retrieved']}`\n"
-                    f"• 🗑️ PDFs Deleted: `{DAILY_STATS_BOT4['pdfs_deleted']}`\n"
-                    f"• ⚠️ Errors Today: `{DAILY_STATS_BOT4['errors']}`\n\n"
-                    f"🛡️ **INFRASTRUCTURE:**\n"
-                    f"• ☁️ Google Drive: {drive_status}\n"
-                    f"• 🗄️ MongoDB Atlas: {db_status}\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💎 **MSA NODE SYSTEMS** | Verified."
-                )
-
-                await bot.send_message(OWNER_ID, report, parse_mode="Markdown")
-                print(f"✅ Daily Report Sent at {current_time}")
-
-                # Sleep 65s to avoid double-fire within the same minute
-                await asyncio.sleep(65)
-
-            except Exception as e:
-                print(f"Daily Report Failed: {e}")
-                await asyncio.sleep(60)
-        else:
-            # Check every 30 seconds
-            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Daily Report Failed: {e}")
+            await asyncio.sleep(60)   # back off then re-calculate next slot
 
 
 # ==========================================
@@ -5787,17 +4673,12 @@ async def monthly_backup():
             with open(json_filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, default=str)
 
-            # Upload both to Drive
-            txt_link  = await asyncio.to_thread(upload_to_drive, txt_filename)  if txt_filename  else "N/A"
-            json_link = await asyncio.to_thread(upload_to_drive, json_filename)
-
             caption = (
                 f"📅 <b>MONTHLY AUTO-BACKUP · {month_label}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📆 <b>Date:</b> {fire_now.strftime('%b %d, %Y  ·  %I:%M %p')}\n"
                 f"📊 <b>PDFs:</b> {len(data['pdfs'])} | <b>Admins:</b> {len(data['admins'])} | <b>Banned:</b> {len(data['banned'])}\n"
-                f"☁️ <a href='{txt_link}'><b>Text Report on Drive</b></a>\n"
-                f"☁️ <a href='{json_link}'><b>Full JSON Dump on Drive</b></a>\n"
+                f"💾 <b>Storage:</b> MongoDB Atlas\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ <i>All data for {month_label} secured.</i>"
             )
@@ -5816,12 +4697,10 @@ async def monthly_backup():
                 db["bot4_monthly_backups"].update_one(
                     {"month_key": month_key},
                     {"$set": {
-                        "month_key":  month_key,
-                        "month":      month_label,
-                        "date":       fire_now,
-                        "pdf_count":  len(data['pdfs']),
-                        "txt_link":   txt_link,
-                        "json_link":  json_link,
+                        "month_key": month_key,
+                        "month":     month_label,
+                        "date":      fire_now,
+                        "pdf_count": len(data["pdfs"]),
                     }},
                     upsert=True
                 )
@@ -5842,6 +4721,43 @@ async def monthly_backup():
         # Sleep 2 hours after firing to avoid re-trigger
         await asyncio.sleep(7200)
 
+
+async def _migrate_permissions():
+    """
+    Temporary migration: Ensure all existing admins have 'elite_help'.
+    Also ensures 'nuke_data' if missing, for consistency.
+    """
+    if col_admins is None: return
+    try:
+        # 1. Update all admins to include 'elite_help' if not present
+        # We can just push it to the set, but Mongo stores as list.
+        # Efficient way: Add to set if not exists.
+        
+        # Get all admins
+        dirs = list(col_admins.find({}))
+        count = 0
+        for d in dirs:
+            perms = set(d.get("permissions", []))
+            updated = False
+            
+            # Auto-grant Elite Help
+            if "elite_help" not in perms:
+                perms.add("elite_help")
+                updated = True
+                
+            # Save back if changed
+            if updated:
+                col_admins.update_one(
+                    {"_id": d["_id"]},
+                    {"$set": {"permissions": list(perms)}}
+                )
+                count += 1
+        
+        if count > 0:
+            print(f"🔄 Migrated {count} admins: Added 'elite_help' permission.")
+    except Exception as e:
+        print(f"⚠️ Migration Error: {e}")
+
 async def main():
     # Retry loop for network startup
     while True:
@@ -5860,6 +4776,10 @@ async def main():
     asyncio.create_task(reset_daily_stats())        # Midnight stat reset
     asyncio.create_task(strict_daily_report())      # 08:40 AM/PM live timezone
     asyncio.create_task(auto_health_monitor())      # Every 5 minutes deep-scan
+    
+    # Run migration once on startup
+    await _migrate_permissions()
+    await _load_persisted_stats()   # Restore daily stats (survives restarts, no duplicates)
     
     print("💎 MSANODE BOT 4 ONLINE")
     
@@ -5960,106 +4880,6 @@ async def main():
         except Exception:
             pass
 
-# ==========================================
-# 🗄️ DATABASE HANDLERS (Main Bot)
-# ==========================================
-class DBState(StatesGroup):
-    waiting_for_mongo_url = State()
-
-@dp.message(F.text == "🗄️ Databases")
-async def database_menu_main(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
-        await message.answer("⛔ **ACCESS DENIED:** Only the Supreme Owner can access the Core Database.")
-        return
-        
-    masked_uri = MONGO_URI.split("@")[-1] if MONGO_URI and "@" in MONGO_URI else "Unknown"
-    
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="👁️ Show Full Connection String"))
-    builder.row(KeyboardButton(text="🔌 Switch/Update Database"))
-    builder.row(KeyboardButton(text="🔙 Back to Menu"))
-    
-    await message.answer(
-        f"🗄️ **CORE DATABASE CONTROL**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 **Current:** `...{masked_uri}`\n\n"
-        f"⚠️ **Warning:** Changing this will switch the Bot's entire memory.",
-        reply_markup=builder.as_markup(resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-
-@dp.message(F.text == "👁️ Show Full Connection String")
-async def show_full_db_uri(message: types.Message):
-    if message.from_user.id != OWNER_ID: return
-    # Send as monospaced code for easy copying, but warn
-    await message.answer(
-        f"🔐 **CORE SECRET REVEALED**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"`{MONGO_URI}`\n\n"
-        f"⚠️ **KEEP THIS SAFE.** Do not share this screenshot.",
-        parse_mode="Markdown"
-    )
-
-@dp.message(F.text == "🔌 Switch/Update Database")
-async def switch_db_main(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID: return
-    
-    await message.answer(
-        "🔌 **ENTER NEW MONGODB URI**\n"
-        "Format: `mongodb+srv://user:pass@cluster...`\n\n"
-        "🔎 I will **verify** the connection first.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True)
-    )
-    await state.set_state(DBState.waiting_for_mongo_url)
-
-@dp.message(DBState.waiting_for_mongo_url)
-async def process_db_switch(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text == "🔙 Back to Menu": return await start(message, state) 
-    
-    # Handle user confusion if they type the command manually
-    if "show mongo" in text.lower():
-         return await show_full_db_uri(message)
-
-    if not text.startswith("mongodb"):
-        await message.answer(
-            "❌ **Invalid Format.**\n"
-            "Must start with `mongodb://` or `mongodb+srv://`\n\n"
-            "Please try again or go 🔙 Back.",
-            parse_mode="Markdown"
-        )
-        return
-
-    status_msg = await message.answer("⏳ **Testing Handshake...**")
-    
-    try:
-        def test_connect():
-            # 5s timeout to prevent hanging
-            client = pymongo.MongoClient(
-                text,
-                serverSelectionTimeoutMS=15000,
-                socketTimeoutMS=30000,
-                connectTimeoutMS=15000,
-                retryWrites=True,
-                retryReads=True
-            )
-            return client.server_info()
-            
-        await asyncio.to_thread(test_connect)
-        
-        # Update .env
-        update_env_file("MONGO_URI", text)
-        
-        await status_msg.edit_text(
-            "✅ **CONNECTION VERIFIED**\n"
-            "The database is reachable.\n\n"
-            "💾 **Configuration Saved.**\n"
-            "🔄 **RESTART REQUIRED** to switch context."
-        )
-        await state.clear()
-        
-    except Exception as e:
-        await status_msg.edit_text(f"❌ **FAILED:** Unreachable.\nError: `{e}`")
 
 if __name__ == "__main__":
     print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 4")
