@@ -16,6 +16,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
@@ -37,7 +38,7 @@ REVIEW_LOG_CHANNEL = int(os.getenv("REVIEW_LOG_CHANNEL", 0))   # Support ticket 
 # Fallback link shown to users when no content link is stored in DB
 BOT_FALLBACK_LINK = os.getenv("BOT_FALLBACK_LINK", "https://t.me/msanodebot")
 # Render web-service health check port (Render sets PORT automatically)
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", 8088))
 
 # ==========================================
 # ⚠️ STARTUP VALIDATION - Fail fast
@@ -118,6 +119,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress noisy library loggers — keep only WARNING+ for aiogram
+logging.getLogger("aiogram").setLevel(logging.WARNING)
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
+logging.getLogger("aiogram.client").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
 # Suppress noisy pymongo background pool/network warnings (auto-recovered by pymongo itself)
 logging.getLogger("pymongo.client").setLevel(logging.CRITICAL)
 logging.getLogger("pymongo.pool").setLevel(logging.CRITICAL)
@@ -188,10 +196,12 @@ try:
         w="majority",            # Write concern – durable
     )
     db = client[MONGO_DB_NAME]
+    # Shared DB — bot9 writes tutorials/content here; bot8 reads from it
+    db_shared = client["MSANodeDB"]
     col_user_verification = db["user_verification"]
     col_msa_ids = db["msa_ids"]  # Collection for MSA+ ID tracking
-    col_pdfs = db["bot9_pdfs"]   # Collection for PDF/Affiliate/YT data
-    col_ig_content = db["bot9_ig_content"] # IG Content Collection
+    col_pdfs = db_shared["bot9_pdfs"]   # ✅ Uses shared MSANodeDB — same as bot9
+    col_ig_content = db_shared["bot9_ig_content"] # ✅ Uses shared MSANodeDB — same as bot9
     col_support_tickets = db["support_tickets"]  # Collection for support ticket tracking
     col_banned_users = db["banned_users"]  # Collection for banned users (managed by Bot 10)
     col_suspended_features = db["suspended_features"]  # Collection for suspended features (managed by Bot 10)
@@ -220,7 +230,7 @@ try:
         col_banned_users.create_index("ban_expires")  # TTL hint only
         col_support_tickets.create_index([("user_id", 1), ("status", 1)])
         col_support_tickets.create_index("created_at")
-        col_support_tickets.create_index("resolved_at")
+        # resolved_at is managed as a TTL index below — do NOT create a plain index here
         db["bot10_user_tracking"].create_index("user_id", unique=True)
         db["bot8_state_persistence"].create_index("key", unique=True)
         col_bot8_backups.create_index([("backup_date", -1)])
@@ -228,6 +238,33 @@ try:
         logger.info("✅ Database indexes created/verified")
     except Exception as idx_error:
         logger.warning(f"⚠️ Index creation warning: {idx_error}")
+
+    # ── TTL: auto-purge resolved/archived tickets after 30 days ─────────
+    try:
+        try:
+            col_support_tickets.drop_index("resolved_at_1")
+        except Exception:
+            pass
+        col_support_tickets.create_index(
+            [("resolved_at", 1)],
+            expireAfterSeconds=2_592_000,  # 30 days (MongoDB TTL index)
+            sparse=True                    # only affects docs that HAVE resolved_at
+        )
+        logger.info("✅ Support ticket TTL index set (30d auto-purge on resolved/archived)")
+    except Exception as ttl_err:
+        logger.warning(f"⚠️ TTL index warning: {ttl_err}")
+
+    # ── Partial unique: prevent duplicate open tickets per user ──────────
+    try:
+        col_support_tickets.create_index(
+            [("user_id", 1)],
+            unique=True,
+            partialFilterExpression={"status": "open"},
+            name="unique_open_ticket_per_user"
+        )
+        logger.info("✅ Unique partial index: one open ticket per user enforced")
+    except Exception as uniq_err:
+        logger.warning(f"⚠️ Partial unique index warning (may already exist): {uniq_err}")
 
 except Exception as e:
     logger.error(f"❌ MongoDB connection failed: {e}")
@@ -266,6 +303,26 @@ def log_to_terminal(action_type: str, user_id: int, details: str = ""):
 # ==========================================
 # USER SOURCE TRACKING (permanent first-source lock)
 # ==========================================
+
+def _is_new_unique_click(user_id: int, item_id, click_type: str) -> bool:
+    """
+    Per-user click deduplication.
+    Returns True (and records the click) if this is the FIRST time user clicked
+    this item+type. Returns False if already counted — caller should skip $inc.
+    Uses bot9_user_activity for storage so bot9 analytics stay in sync.
+    """
+    try:
+        col_dedup = db["bot9_user_activity"]
+        key = {"user_id": user_id, "item_id": str(item_id), "click_type": click_type}
+        existing = col_dedup.find_one(key, {"_id": 1})
+        if existing:
+            return False  # Already counted — no increment
+        col_dedup.insert_one({**key, "first_click_at": now_local()})
+        return True  # New unique click
+    except Exception as e:
+        logger.warning(f"Dedup check failed ({click_type}): {e}; allowing increment")
+        return True  # On error, allow increment (fail-open)
+
 def track_user_source(user_id: int, source: str, username: str, first_name: str, msa_id: str):
     """
     Record traffic source PERMANENTLY on first start only.
@@ -1491,29 +1548,22 @@ CONTENT_PACKS = {
 # ==========================================
 
 def get_next_msa_id() -> tuple[str, int]:
-    """Get the next available MSA+ ID by finding gaps in sequence"""
-    # Get all allocated MSA numbers sorted ascending
-    allocated_ids = list(col_msa_ids.find({}, {"msa_number": 1}).sort("msa_number", 1))
-    allocated_numbers = [doc["msa_number"] for doc in allocated_ids]
-    
-    if not allocated_numbers:
-        # First user ever
-        next_number = 0
-    else:
-        # Find first gap in sequence
-        next_number = None
-        for i in range(len(allocated_numbers)):
-            if allocated_numbers[i] != i:
-                next_number = i
-                break
-        
-        # If no gap found, use next sequential number
-        if next_number is None:
-            next_number = len(allocated_numbers)
-    
-    # Format as MSA000000000 (9 digits)
-    msa_id = f"MSA{next_number:09d}"
-    return msa_id, next_number
+    """Get the next available MSA+ ID — randomly allocated, never repeats."""
+    # Build a set of all already-allocated numbers for O(1) lookup
+    allocated_set = {
+        doc["msa_number"]
+        for doc in col_msa_ids.find({}, {"msa_number": 1})
+    }
+
+    # Generate a unique random 9-digit number (100000000–999999999)
+    max_attempts = 1000
+    for _ in range(max_attempts):
+        candidate = random.randint(100_000_000, 999_999_999)
+        if candidate not in allocated_set:
+            msa_id = f"MSA{candidate:09d}"
+            return msa_id, candidate
+
+    raise RuntimeError("Could not generate a unique MSA ID after exhaustive attempts")
 
 def allocate_msa_id(user_id: int, username: str, first_name: str) -> str:
     """Allocate MSA+ ID to a user (prevents duplicates)"""
@@ -1647,12 +1697,13 @@ async def require_vault_access(handler_func):
 # 📋 MENU KEYBOARDS
 # ==========================================
 def get_main_menu():
-    """Create the main menu keyboard with 5 buttons"""
+    """Create the main menu keyboard — 6 core buttons"""
     keyboard = [
         [KeyboardButton(text="📊 DASHBOARD")],
         [KeyboardButton(text="🔍 SEARCH CODE")],
-        [KeyboardButton(text="📜 RULES")],
+        [KeyboardButton(text="📺 WATCH TUTORIAL")],
         [KeyboardButton(text="📖 AGENT GUIDE")],
+        [KeyboardButton(text="📜 RULES")],
         [KeyboardButton(text="📞 SUPPORT")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -1689,10 +1740,12 @@ def get_user_menu(user_id: int):
             keyboard.append([KeyboardButton(text="📊 DASHBOARD")])
         if "SEARCH_CODE" not in suspended:
             keyboard.append([KeyboardButton(text="🔍 SEARCH CODE")])
-        if "RULES" not in suspended:
-            keyboard.append([KeyboardButton(text="📜 RULES")])
+        if "TUTORIAL" not in suspended:
+            keyboard.append([KeyboardButton(text="📺 WATCH TUTORIAL")])
         if "GUIDE" not in suspended:
             keyboard.append([KeyboardButton(text="📖 AGENT GUIDE")])
+        if "RULES" not in suspended:
+            keyboard.append([KeyboardButton(text="📜 RULES")])
         
         # Always show SUPPORT
         keyboard.append([KeyboardButton(text="📞 SUPPORT")])
@@ -1725,7 +1778,7 @@ def get_support_menu():
         [KeyboardButton(text="📄 PDF/LINK ISSUES")],
         [KeyboardButton(text="🔧 TROUBLESHOOTING")],
         [KeyboardButton(text="❓ OTHER ISSUES")],
-        [KeyboardButton(text="🎫 RAISE A TICKET")],
+        [KeyboardButton(text="🎫 RAISE A TICKET"), KeyboardButton(text="📋 MY TICKET")],
         [KeyboardButton(text="🔙 BACK TO MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -2053,25 +2106,27 @@ async def cmd_start(message: types.Message, state: FSMContext):
                     msa_id = allocate_msa_id(user_id, username, first_name)
                 
                 if source == "ig":
-                    # Increment IG start clicks counter and update timestamp
-                    col_pdfs.update_one(
-                        {"_id": pdf_data["_id"]},
-                        {
-                            "$inc": {"ig_start_clicks": 1, "clicks": 1},
-                            "$set": {"last_ig_click": now_local(), "last_clicked_at": now_local()}
-                        }
-                    )
+                    # Deduplicated IG start click — only count each user once per PDF
+                    if _is_new_unique_click(user_id, pdf_data["_id"], "ig_start"):
+                        col_pdfs.update_one(
+                            {"_id": pdf_data["_id"]},
+                            {
+                                "$inc": {"ig_start_clicks": 1, "clicks": 1},
+                                "$set": {"last_ig_click": now_local(), "last_clicked_at": now_local()}
+                            }
+                        )
                     # Track user source permanently (first start only — never overwritten)
                     track_user_source(user_id, "IG", username, first_name, msa_id)
                 elif source == "yt":
-                    # Increment YT start clicks counter and update timestamp
-                    col_pdfs.update_one(
-                        {"_id": pdf_data["_id"]},
-                        {
-                            "$inc": {"yt_start_clicks": 1, "clicks": 1},
-                            "$set": {"last_yt_click": now_local(), "last_clicked_at": now_local()}
-                        }
-                    )
+                    # Deduplicated YT start click — only count each user once per PDF
+                    if _is_new_unique_click(user_id, pdf_data["_id"], "yt_start"):
+                        col_pdfs.update_one(
+                            {"_id": pdf_data["_id"]},
+                            {
+                                "$inc": {"yt_start_clicks": 1, "clicks": 1},
+                                "$set": {"last_yt_click": now_local(), "last_clicked_at": now_local()}
+                            }
+                        )
                     # Track user source permanently (first start only — never overwritten)
                     track_user_source(user_id, "YT", username, first_name, msa_id)
                 logger.info(f"📊 Analytics: User {user_id} clicked {source.upper()} link for PDF '{pdf_data.get('name')}'")
@@ -2083,6 +2138,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
             # ==========================================
             is_in_vault = await check_channel_membership(user_id)
             if not is_in_vault:
+                # Save the pending payload so it can be delivered upon verification
+                col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
+                
                 user_data = get_user_verification_status(user_id)
                 was_ever_verified = user_data.get('ever_verified', False)
                 vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
@@ -2107,14 +2165,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
                         f"✨ **The fix is simple:**\n"
                         f"Join the Vault → Come back → Get everything."
                     )
-                await message.answer(
+                _vault_ans = await message.answer(
                     vault_msg,
                     reply_markup=vault_kb,
                     parse_mode=ParseMode.MARKDOWN
                 )
-                await message.answer(
+                _locked_ans = await message.answer(
                     "🔒 Menu locked until you rejoin the Vault.",
                     reply_markup=ReplyKeyboardRemove()
+                )
+                col_user_verification.update_one(
+                    {"user_id": user_id},
+                    {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]}},
+                    upsert=True
                 )
                 return
 
@@ -2248,14 +2311,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
             
             final_footer = base_footer 
 
-            # Select Random Affiliate Button
-            aff_btn_text = random.choice(CONTENT_PACKS["AFFILIATE_BUTTONS"])
-            if not affiliate_link or len(affiliate_link) < 5: 
-                affiliate_link = BOT_FALLBACK_LINK
-
+            # Final message — random button text from packs, always both IG + YT links
+            ig_btn_text = random.choice(CONTENT_PACKS["IG_CODES_BUTTONS"])
+            yt_btn_text = random.choice(CONTENT_PACKS["YT_CODES_BUTTONS"])
             network_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=target_btn_text, url=target_link)],
-                [InlineKeyboardButton(text=aff_btn_text, url=affiliate_link)]
+                [
+                    InlineKeyboardButton(text=ig_btn_text, url=INSTAGRAM_LINK),
+                    InlineKeyboardButton(text=yt_btn_text, url=YOUTUBE_LINK)
+                ]
             ])
             
             await message.answer(
@@ -2288,6 +2351,42 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     # 🎥 NEW FLOW: YT CODE PROMPT (Force MSA Code Entry)
     elif parse_result["status"] == "yt_code_prompt":
+        # 🔒 VAULT ACCESS CHECK — Block non-members for YTCODE links
+        is_in_vault = await check_channel_membership(user_id)
+        if not is_in_vault:
+            col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
+            user_data = get_user_verification_status(user_id)
+            was_ever_verified = user_data.get('ever_verified', False)
+            vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
+            if was_ever_verified:
+                vault_msg = (
+                    f"🔐 **{user_name}, THE VAULT IS CLOSED TO YOU**\n\n"
+                    f"You clicked the link. The content is right there.\n"
+                    f"But the system doesn't deliver to those who walked out.\n\n"
+                    f"**You left the Vault.**\n"
+                    f"That means you left your privileges at the door.\n\n"
+                    f"💎 **One action separates you from everything:**\n"
+                    f"Rejoin the Vault → Unlock full delivery. Instantly.\n\n"
+                    f"*The content waits. The clock doesn't.*"
+                )
+            else:
+                vault_msg = (
+                    f"🔒 **{user_name}, ACCESS LOCKED**\n\n"
+                    f"You found the link. You even clicked it.\n"
+                    f"That tells us you're serious.\n\n"
+                    f"**But the system only delivers to Vault members.**\n"
+                    f"No vault = No content. No exceptions.\n\n"
+                    f"✨ **The fix is simple:**\n"
+                    f"Join the Vault → Come back → Get everything."
+                )
+            _vault_ans = await message.answer(vault_msg, reply_markup=vault_kb, parse_mode=ParseMode.MARKDOWN)
+            _locked_ans = await message.answer("🔒 Menu locked until you join the Vault.", reply_markup=ReplyKeyboardRemove())
+            col_user_verification.update_one(
+                {"user_id": user_id},
+                {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]}},
+                upsert=True
+            )
+            return
         # 🎬 ANIMATION: SOURCE VALIDATION
         msg = await message.answer("📡")
         await asyncio.sleep(ANIM_MEDIUM)
@@ -2407,14 +2506,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 if not msa_id:
                     msa_id = allocate_msa_id(user_id, username, first_name)
                 
-                # Increment IG CC clicks counter and update timestamp
-                col_ig_content.update_one(
-                    {"_id": ig_content["_id"]},
-                    {
-                        "$inc": {"ig_cc_clicks": 1},
-                        "$set": {"last_ig_cc_click": now_local()}
-                    }
-                )
+                # Deduplicated IG CC click — only count each user once per IG content
+                if _is_new_unique_click(user_id, ig_content["_id"], "ig_cc"):
+                    col_ig_content.update_one(
+                        {"_id": ig_content["_id"]},
+                        {
+                            "$inc": {"ig_cc_clicks": 1},
+                            "$set": {"last_ig_cc_click": now_local()}
+                        }
+                    )
                 
                 # Track user source permanently (first start only — never overwritten)
                 track_user_source(user_id, "IGCC", username, first_name, msa_id)
@@ -2428,6 +2528,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
             # ==========================================
             is_in_vault = await check_channel_membership(user_id)
             if not is_in_vault:
+                # Save the pending payload so it can be delivered upon verification
+                col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
+                
                 user_data = get_user_verification_status(user_id)
                 was_ever_verified = user_data.get('ever_verified', False)
                 vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
@@ -2452,14 +2555,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
                         f"✨ **The fix is simple:**\n"
                         f"Join the Vault → Come back → Get everything."
                     )
-                await message.answer(
+                _vault_ans = await message.answer(
                     vault_msg,
                     reply_markup=vault_kb,
                     parse_mode=ParseMode.MARKDOWN
                 )
-                await message.answer(
+                _locked_ans = await message.answer(
                     "🔒 Menu locked until you rejoin the Vault.",
                     reply_markup=ReplyKeyboardRemove()
+                )
+                col_user_verification.update_one(
+                    {"user_id": user_id},
+                    {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]}},
+                    upsert=True
                 )
                 return
 
@@ -2491,38 +2599,34 @@ async def cmd_start(message: types.Message, state: FSMContext):
             await safe_delete_message(wait_msg)
 
             # ---------------------------------------------------------
-            # 2️⃣ MESSAGE 2: AFFILIATE UPSELL
+            # 2️⃣ MESSAGE 2: AFFILIATE UPSELL (Only if affiliate link exists)
             # ---------------------------------------------------------
-            # msg_text = random.choice(CONTENT_PACKS["IGCCC_CODES"]) # Removed per user request
-            title_text = random.choice(CONTENT_PACKS["AFFILIATE_TITLES"])
-            footer_template = random.choice(CONTENT_PACKS["AFFILIATE_FOOTERS"])
-            try:
-                footer_text = footer_template.format(name=user_name)
-            except:
-                footer_text = footer_template
+            aff_link = ig_content.get("affiliate_link", "")
+            has_affiliate = bool(aff_link and len(aff_link) >= 5)
+            
+            if has_affiliate:
+                title_text = random.choice(CONTENT_PACKS["AFFILIATE_TITLES"])
+                footer_template = random.choice(CONTENT_PACKS["AFFILIATE_FOOTERS"])
+                try:
+                    footer_text = footer_template.format(name=user_name)
+                except:
+                    footer_text = footer_template
+                    
+                aff_msg = f"{title_text}\n\n`{footer_text}`"
                 
-            aff_msg = f"{title_text}\n\n`{footer_text}`"
-            
-            # Button: Affiliate Link Only
-            aff_link = ig_content.get("affiliate_link", BOT_FALLBACK_LINK)
-            if not aff_link: aff_link = BOT_FALLBACK_LINK
-            
-            # Helper to clean link (if somehow it's empty string)
-            if len(aff_link) < 5: aff_link = BOT_FALLBACK_LINK
-
-            aff_btn_text = random.choice(CONTENT_PACKS["AFFILIATE_BUTTONS"])
-            kb_aff = [[InlineKeyboardButton(text=aff_btn_text, url=aff_link)]]
-            
-            await message.answer(aff_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_aff), parse_mode="Markdown")
-            
-            # ⏳ DOT ANIMATION 2
-            wait_msg = await message.answer("▪️")
-            await asyncio.sleep(ANIM_MEDIUM)
-            await wait_msg.edit_text("▪️▪️")
-            await asyncio.sleep(ANIM_MEDIUM)
-            await wait_msg.edit_text("▪️▪️▪️")
-            await asyncio.sleep(ANIM_MEDIUM)
-            await safe_delete_message(wait_msg)
+                aff_btn_text = random.choice(CONTENT_PACKS["AFFILIATE_BUTTONS"])
+                kb_aff = [[InlineKeyboardButton(text=aff_btn_text, url=aff_link)]]
+                
+                await message.answer(aff_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_aff), parse_mode="Markdown")
+                
+                # ⏳ DOT ANIMATION 2
+                wait_msg = await message.answer("▪️")
+                await asyncio.sleep(ANIM_MEDIUM)
+                await wait_msg.edit_text("▪️▪️")
+                await asyncio.sleep(ANIM_MEDIUM)
+                await wait_msg.edit_text("▪️▪️▪️")
+                await asyncio.sleep(ANIM_MEDIUM)
+                await safe_delete_message(wait_msg)
 
             # ---------------------------------------------------------
             # 3️⃣ MESSAGE 3: NETWORK CONNECTION (IG + YT)
@@ -2549,11 +2653,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             
             final_network_msg = f"{network_msg}\n\n`{network_footer}`"
             
-            # Select Random Affiliate Button & Link
-            aff_btn_text = random.choice(CONTENT_PACKS["AFFILIATE_BUTTONS"])
-            aff_link = ig_content.get("affiliate_link", BOT_FALLBACK_LINK)
-            if not aff_link or len(aff_link) < 5: aff_link = BOT_FALLBACK_LINK
-
+            # Always just 2 buttons — no affiliate button in this message
             kb_network = [
                 [
                     InlineKeyboardButton(text="📸 EXPLORE MORE IG", url=INSTAGRAM_LINK),
@@ -2669,7 +2769,16 @@ You've just taken the first step into something **extraordinary**. The MSA NODE 
     # Mark as verified if not already
     if not user_data.get('verified'):
         update_verification_status(user_id, verified=True)
-    
+
+    # Fetch MSA ID to display (allocate if somehow missing)
+    user_msa_id = get_user_msa_id(user_id)
+    _uname_track = message.from_user.username or "unknown"
+    if not user_msa_id:
+        user_msa_id = allocate_msa_id(user_id, _uname_track, user_name)
+    # Ensure user is in bot10_user_tracking for broadcast targeting
+    # Source is set ONCE at first-ever tracking; source never overwritten for existing users
+    track_user_source(user_id, "UNKNOWN", _uname_track, user_name, user_msa_id)
+
     # Final: Enhanced premium interface with ONLINE status
     welcome_text = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2687,7 +2796,7 @@ Welcome back, **{user_name}** 👋
 ✅ **Verified Member**
 🔓 **Full Access Enabled**
 💎 **MSA NODE Elite**
-🆔 **Member ID**: Active
+🆔 **MSA+ ID**: `{user_msa_id}`
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2699,11 +2808,14 @@ Welcome back, **{user_name}** 👋
 🔍 **SEARCH CODE**
    Unlock content with your MSA CODES
 
-📜 **RULES**
-   Community code of conduct
+📺 **WATCH TUTORIAL**
+   Your exclusive MSA NODE starter video
 
 📖 **AGENT GUIDE**
    Full manual — how to use MSA NODE Agent
+
+📜 **RULES**
+   Community code of conduct
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2711,6 +2823,7 @@ Welcome back, **{user_name}** 👋
 • Use the menu buttons below
 • Tap links from videos — content auto-delivers
 • Enter codes manually via **SEARCH CODE**
+• Watch **TUTORIAL** for a full walkthrough
 • Check **DASHBOARD** for your live stats
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2729,6 +2842,99 @@ _Select a service from the menu ⬇️_
         parse_mode=ParseMode.MARKDOWN
     )
     
+    # --- 🚀 NEW FEATURE: AUTO-DELIVER PENDING PAYLOAD ---
+    pending_payload = user_data.get("pending_payload") if user_data else None
+    if pending_payload:
+        logger.info(f"⚡ Delivering pending payload '{pending_payload}' to returning user {user_id} on /start")
+        # Clear pending payload
+        col_user_verification.update_one({"user_id": user_id}, {"$unset": {"pending_payload": ""}})
+        
+        # Mock Message for Delivery
+        class MockChat:
+            def __init__(self, chat_id):
+                self.id = chat_id
+            
+        class MockMessageForDelivery:
+            def __init__(self, m_user_id, m_first_name, m_username, payload_text):
+                self.from_user = type('MockUser', (), {'id': m_user_id, 'first_name': m_first_name, 'username': m_username})()
+                self.text = f"/start {payload_text}"
+                self.chat = MockChat(m_user_id)
+                self.message_id = int(time.time())
+                
+            async def answer(self, text, **kwargs):
+                return await bot.send_message(self.from_user.id, text, **kwargs)
+                
+            async def edit_text(self, text, **kwargs):
+                pass
+        
+        mock_msg = MockMessageForDelivery(user_id, user_name, _uname_track, pending_payload)
+        
+        # Manual FSM Resolving
+        key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+        fsm_state = FSMContext(storage=dp.storage, key=key)
+        
+        # Process Payload directly via cmd_start
+        async def _deliver_payload():
+            try:
+                user_last_command.pop(user_id, None)  # Clear rate limit for pending delivery
+                clear_user_processing(user_id)
+                await cmd_start(mock_msg, fsm_state)
+                logger.info("✅ Auto-delivery via cmd_start completed successfully.")
+            except Exception as e:
+                import traceback
+                logger.error(f"❌ Auto-delivery failed inside cmd_start: {e}")
+                logger.error(traceback.format_exc())
+                
+        asyncio.create_task(_deliver_payload()) 
+    # ── 🎬 STARTER TUTORIAL — Only on plain empty /start (no referral payload) ──
+    # Looks up the universal tutorial link stored via bot9 TUTORIAL manager.
+    # Delivered as a premium framed message with an inline watch button.
+    # If no link stored yet → professional "coming soon" message instead.
+    if not payload:
+        try:
+            pk_tut = db_shared["bot9_tutorials"].find_one({"type": "PK"})
+            await asyncio.sleep(ANIM_FAST)
+            if pk_tut and pk_tut.get("link"):
+                pk_link = pk_tut["link"]
+                kb_pk = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="▶️ WATCH MSA AGENT TUTORIAL", url=pk_link)]
+                ])
+                await message.answer(
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "🎬 **YOUR EXCLUSIVE TUTORIAL IS HERE**\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "💎 **You're now inside the vault.** This is where it starts.\n\n"
+                    "Most people get access and don't know where to begin.\n"
+                    "This tutorial removes that confusion — entirely.\n\n"
+                    "In one watch, you'll know:\n"
+                    "  ✅ Exactly how MSA NODE works\n"
+                    "  ✅ How to unlock content with your codes\n"
+                    "  ✅ How to get the most from your elite membership\n\n"
+                    "⚡ **Don't skip this. It changes everything.**\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "_Your guide is one tap away ⬇️_",
+                    reply_markup=kb_pk,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await message.answer(
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "🎬 **AGENT TUTORIAL IS COMING**\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "🛠️ **We're putting the final touches on it.**\n\n"
+                    "Your exclusive video guide is being prepared — built specifically "
+                    "to walk you through every part of MSA NODE from day one.\n\n"
+                    "While you wait, everything is already unlocked for you:\n"
+                    "  📊 Check your **Dashboard** for your MSA+ ID\n"
+                    "  🔍 Use **Search Code** to unlock content\n"
+                    "  📖 Open **Agent Guide** for the full manual\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "🔔 _Agent tutorial drops very soon. Stay ready._ 🚀",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except Exception as _pk_err:
+            logger.warning(f"PK tutorial delivery failed for {user_id}: {_pk_err}")
+
     # Check for deep link payload (Legacy check or fallback)
     if payload == "80919449_YTCODE":
         # Track user source for bot10 broadcasts
@@ -2820,7 +3026,11 @@ async def handle_vault_join(event: ChatMemberUpdated):
         # Allocate MSA+ ID if not already assigned
         username = event.from_user.username or "unknown"
         msa_id = allocate_msa_id(user_id, username, user_name)
-        
+
+        # Track as UNKNOWN source if user has no tracked source yet
+        # (only sets source once — won't overwrite IG/YT/IGCC/YTCODE)
+        track_user_source(user_id, "UNKNOWN", username, user_name, msa_id)
+
         # Delete the verification message if it exists
         if verification_msg_id:
             try:
@@ -2836,6 +3046,17 @@ async def handle_vault_join(event: ChatMemberUpdated):
                 logger.info(f"Deleted rejoin message {rejoin_msg_id} for user {user_id}")
             except Exception as e:
                 logger.error(f"Failed to delete verification message: {e}")
+        
+        # Delete any deep-link vault block messages stored when user was blocked from content
+        pending_delete_ids = user_data.get('pending_delete_msg_ids', [])
+        for _mid in pending_delete_ids:
+            try:
+                await bot.delete_message(user_id, _mid)
+                logger.info(f"Deleted pending vault message {_mid} for user {user_id}")
+            except Exception:
+                pass
+        if pending_delete_ids:
+            col_user_verification.update_one({"user_id": user_id}, {"$unset": {"pending_delete_msg_ids": ""}})
         
         # Send welcome message to user's DM
         try:
@@ -2854,6 +3075,53 @@ async def handle_vault_join(event: ChatMemberUpdated):
             )
             
             logger.info(f"Auto-welcomed user {user_id} after vault join")
+            
+            # --- 🚀 NEW FEATURE: AUTO-DELIVER PENDING PAYLOAD ---
+            pending_payload = user_data.get("pending_payload") if user_data else None
+            if pending_payload:
+                logger.info(f"⚡ Delivering pending payload '{pending_payload}' to user {user_id} after verification")
+                # Clear pending payload
+                col_user_verification.update_one({"user_id": user_id}, {"$unset": {"pending_payload": ""}})
+                
+                # Mock Message for Delivery
+                class MockChat:
+                    def __init__(self, chat_id):
+                        self.id = chat_id
+                    
+                class MockMessageForDelivery:
+                    def __init__(self, m_user_id, m_first_name, m_username, payload_text):
+                        self.from_user = type('MockUser', (), {'id': m_user_id, 'first_name': m_first_name, 'username': m_username})()
+                        self.text = f"/start {payload_text}"
+                        self.chat = MockChat(m_user_id)
+                        self.message_id = int(time.time())
+                        
+                    async def answer(self, text, **kwargs):
+                        return await bot.send_message(self.from_user.id, text, **kwargs)
+                        
+                    async def edit_text(self, text, **kwargs):
+                        pass
+                
+                mock_msg = MockMessageForDelivery(user_id, user_name, username, pending_payload)
+                
+                # Manual FSM Resolving
+                key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+                state = FSMContext(storage=dp.storage, key=key)
+                
+                # Process Payload directly via cmd_start
+                async def _deliver_payload():
+                    try:
+                        user_last_command.pop(user_id, None)  # Clear rate limit for pending delivery
+                        clear_user_processing(user_id)
+                        await cmd_start(mock_msg, state)
+                        logger.info("✅ Auto-delivery via cmd_start completed successfully.")
+                    except Exception as e:
+                        import traceback
+                        logger.error(f"❌ Auto-delivery failed inside cmd_start: {e}")
+                        logger.error(traceback.format_exc())
+                        
+                asyncio.create_task(_deliver_payload())
+                
+
         except Exception as e:
             logger.error(f"Failed to send welcome message to {user_id}: {e}")
     
@@ -2878,6 +3146,13 @@ async def handle_vault_join(event: ChatMemberUpdated):
         
         # Send instant rejoin message with button and store message ID
         try:
+            # Instantly remove reply keyboard — no /start required
+            await bot.send_message(
+                user_id,
+                "🔒 **ACCESS SUSPENDED**\n\nYour MSA NODE vault membership was removed.",
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode=ParseMode.MARKDOWN
+            )
             rejoin_msg = await bot.send_message(
                 user_id,
                 f"💫 **{user_name}, Your Journey Paused**\n\nWe see you've stepped away from the Vault. Life happens—we understand.\n\n💎 **Here's the thing:** Your spot? Still reserved.\n🎯 **Your community?** Still rooting for you.\n\n**When you're ready to return, we'll be right here.** One click brings you back.\n\n*No pressure. Just opportunity.* ✨",
@@ -2978,6 +3253,68 @@ def _build_announcement_section() -> str:
             "📢 **ANNOUNCEMENTS**\n"
             "⚠️ _Could not load announcements._"
         )
+
+
+_ANN_PAGE_MAX_CHARS = 900  # max broadcast chars per dashboard page
+
+def _build_ann_page(broadcasts: list, page: int) -> str:
+    """
+    Build dashboard ANNOUNCEMENTS section for a SINGLE page (1 broadcast).
+    Reads full text — no preview truncation except hard cap.
+    Always reflects live DB data (caller should pass fresh query result).
+    """
+    if not broadcasts:
+        return (
+            "📢 **ANNOUNCEMENTS**\n"
+            "―――――――――――――――――\n\n"
+            "🔔 _No announcements yet._\n"
+            "_Stay tuned for exclusive content!_"
+        )
+
+    total = len(broadcasts)
+    page  = page % total            # wrap around safely
+    b     = broadcasts[page]
+
+    created_at = b.get("created_at")
+    raw_text   = (b.get("message_text") or "").strip()
+    media_type = b.get("media_type", "")
+    b_index    = b.get("index", page + 1)
+
+    date_str = (
+        created_at.strftime("%b %d, %Y  ·  %I:%M %p")
+        if created_at else "—"
+    )
+
+    if raw_text:
+        if len(raw_text) > _ANN_PAGE_MAX_CHARS:
+            raw_text = raw_text[:_ANN_PAGE_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+        preview = raw_text
+    elif media_type:
+        preview = f"📎 _[{media_type.capitalize()} content]_"
+    else:
+        preview = "_[No preview available]_"
+
+    # NEW badge for broadcasts within last 48 h
+    is_new = False
+    if created_at:
+        try:
+            from datetime import timezone as _tz
+            age = now_local() - created_at.replace(
+                tzinfo=created_at.tzinfo or _tz.utc
+            )
+            is_new = age.total_seconds() < 172800   # 48 h
+        except Exception:
+            pass
+
+    new_tag = " 🆕" if is_new else ""
+
+    return (
+        f"📢 **ANNOUNCEMENTS** _· {page + 1} of {total}_\n"
+        f"―――――――――――――――――\n\n"
+        f"🗂 **Broadcast #{b_index}**{new_tag}\n\n"
+        f"{preview}\n\n"
+        f"🕐 _{date_str}_"
+    )
 
 
 def _build_dashboard_text(user_name, display_msa_id, member_since, ann_text) -> str:
@@ -3104,34 +3441,91 @@ async def dashboard(message: types.Message):
     # Format MSA ID (remove + if present for display)
     display_msa_id = msa_id.replace("+", "") if msa_id else 'Not Assigned'
 
-    # Build announcement section (always latest 3 only)
-    ann_text = _build_announcement_section()
+    # Build announcement section with per-page navigation (live from DB)
+    all_broadcasts = list(col_broadcasts.find({}).sort("index", -1))
+    total_bc = len(all_broadcasts)
+    page = 0
+    ann_text = _build_ann_page(all_broadcasts, page)
     dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
 
-    # Character-limit guard: trim announcement block if needed
-    if len(dashboard_text) > _DASH_CHAR_LIMIT:
-        # Progressively trim preview until it fits
-        for cap in [120, 80, 40]:
-            trimmed = col_broadcasts.find({}).sort("index", -1).limit(3)
-            short_lines = []
-            for b in trimmed:
-                raw = (b.get("message_text") or "").strip()
-                short_lines.append(raw[:cap] + ("…" if len(raw) > cap else ""))
-            if short_lines:
-                ann_text = (
-                    "📢 **ANNOUNCEMENTS** _· Latest 3_\n"
-                    "―――――――――――――――――\n"
-                    + "\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n".join(short_lines)
-                )
-            dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
-            if len(dashboard_text) <= _DASH_CHAR_LIMIT:
-                break
+    # Build inline nav keyboard (shows PREV/NEXT when more than 1 broadcast)
+    ann_kb = None
+    if total_bc > 1:
+        ann_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️", callback_data=f"ann_pg:{user_id}:{total_bc - 1}"),
+            InlineKeyboardButton(text=f"📢 1/{total_bc}", callback_data="ann_noop"),
+            InlineKeyboardButton(text="▶️", callback_data=f"ann_pg:{user_id}:1"),
+        ]])
 
     await msg.edit_text(
         dashboard_text,
+        reply_markup=ann_kb,
         parse_mode=ParseMode.MARKDOWN
     )
     logger.info(f"User {message.from_user.id} accessed Dashboard")
+
+# ==========================================
+# 📢 ANNOUNCEMENT NAVIGATION CALLBACKS
+# ==========================================
+
+@dp.callback_query(F.data.startswith("ann_pg:"))
+async def ann_page_callback(callback: types.CallbackQuery):
+    """Navigate announcement pages in the dashboard (PREV / NEXT)."""
+    try:
+        parts   = callback.data.split(":")
+        uid     = int(parts[1])
+        page    = int(parts[2])
+
+        # Rebuild user profile data live from DB
+        msa_id         = get_user_msa_id(uid)
+        display_msa_id = msa_id.replace("+", "") if msa_id else "Not Assigned"
+        user_name      = callback.from_user.first_name or "User"
+
+        member_since = "Unknown"
+        msa_record   = col_msa_ids.find_one({"user_id": uid})
+        if msa_record and "assigned_at" in msa_record:
+            member_since = msa_record["assigned_at"].strftime("%B %Y")
+        else:
+            user_data = col_user_verification.find_one({"user_id": uid})
+            if user_data and "first_start" in user_data:
+                member_since = user_data["first_start"].strftime("%B %Y")
+
+        # Fetch broadcasts live — reflects any edits or deletions from bot10
+        all_broadcasts = list(col_broadcasts.find({}).sort("index", -1))
+        total_bc = len(all_broadcasts)
+        if total_bc == 0:
+            await callback.answer("No announcements available.", show_alert=False)
+            return
+
+        page     = page % total_bc          # wrap around
+        ann_text = _build_ann_page(all_broadcasts, page)
+        dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
+
+        # Rebuild nav keyboard with updated page numbers
+        prev_pg = (page - 1) % total_bc
+        next_pg = (page + 1) % total_bc
+        ann_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️",            callback_data=f"ann_pg:{uid}:{prev_pg}"),
+            InlineKeyboardButton(text=f"📢 {page + 1}/{total_bc}", callback_data="ann_noop"),
+            InlineKeyboardButton(text="▶️",            callback_data=f"ann_pg:{uid}:{next_pg}"),
+        ]])
+
+        await callback.message.edit_text(
+            dashboard_text,
+            reply_markup=ann_kb,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"ann_page_callback error: {e}")
+        await callback.answer("Error loading page.", show_alert=True)
+
+
+@dp.callback_query(F.data == "ann_noop")
+async def ann_noop_callback(callback: types.CallbackQuery):
+    """No-op: page indicator button in announcement nav bar."""
+    await callback.answer()
+
 
 # ==========================================
 # 🚫 CANCEL SEARCH HANDLER
@@ -3332,15 +3726,24 @@ async def process_search_code(message: types.Message, state: FSMContext):
     
     # 📊 TRACK CLICK ANALYTICS for YT Code clicks
     try:
-        # Increment YT code clicks counter and update timestamp
-        col_pdfs.update_one(
-            {"_id": pdf_doc["_id"]},
-            {
-                "$inc": {"yt_code_clicks": 1, "clicks": 1},
-                "$set": {"last_yt_code_click": now_local(), "last_clicked_at": now_local()}
-            }
-        )
-        logger.info(f"📊 Analytics: User {message.from_user.id} entered YT code for PDF '{pdf_doc.get('name')}'")
+        yt_uid = message.from_user.id
+        # Deduplicated YT code click — only count each user once per PDF
+        if _is_new_unique_click(yt_uid, pdf_doc["_id"], "yt_code"):
+            col_pdfs.update_one(
+                {"_id": pdf_doc["_id"]},
+                {
+                    "$inc": {"yt_code_clicks": 1, "clicks": 1},
+                    "$set": {"last_yt_code_click": now_local(), "last_clicked_at": now_local()}
+                }
+            )
+        # Track user source permanently
+        yt_username = message.from_user.username or "unknown"
+        yt_firstname = message.from_user.first_name or "User"
+        yt_msa_id = get_user_msa_id(yt_uid)
+        if not yt_msa_id:
+            yt_msa_id = allocate_msa_id(yt_uid, yt_username, yt_firstname)
+        track_user_source(yt_uid, "YTCODE", yt_username, yt_firstname, yt_msa_id)
+        logger.info(f"📊 Analytics: User {yt_uid} entered YT code for PDF '{pdf_doc.get('name')}'")
     except Exception as analytics_err:
         logger.error(f"⚠️ Analytics tracking failed: {analytics_err}")
     
@@ -3499,6 +3902,103 @@ async def process_search_code(message: types.Message, state: FSMContext):
     )
     # State remains active - user can enter another code or cancel
 
+@dp.message(F.text == "📺 WATCH TUTORIAL")
+@rate_limit(3.0)
+@anti_spam("tutorial")
+async def main_tutorial_handler(message: types.Message, state: FSMContext):
+    """Handle 📺 TUTORIAL button from main menu."""
+    if await _check_freeze(message): return
+    if await check_maintenance_mode(message): return
+    user_id = message.from_user.id
+
+    ban_doc = await check_if_banned(user_id)
+    if ban_doc:
+        await message.answer(
+            "🚫 **ACCESS DENIED**\n\nYou are banned.",
+            reply_markup=get_banned_user_keyboard(ban_doc.get("ban_type", "permanent")),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    suspend_doc = col_suspended_features.find_one({"user_id": user_id})
+    if suspend_doc and "TUTORIAL" in suspend_doc.get("suspended_features", []):
+        await message.answer(
+            "⚠️ **FEATURE SUSPENDED**\n\nTutorial access has been suspended for your account.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    is_vault = await check_channel_membership(user_id)
+    if not is_vault:
+        await message.answer(
+            "🔒 **Tutorials are vault-exclusive.**\n\n"
+            "Rejoin the vault channel and run /start to unlock.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    await state.clear()
+
+    # 🎬 TUTORIAL FETCH ANIMATION
+    msg = await message.answer("📡 Loading agent tutorial...")
+    await asyncio.sleep(ANIM_FAST)
+    steps = ["▱▱▱▱▱", "▰▱▱▱▱", "▰▰▱▱▱", "▰▰▰▱▱", "▰▰▰▰▱", "▰▰▰▰▰"]
+    for step in steps:
+        await msg.edit_text(f"[{step}] Fetching tutorial link...")
+        await asyncio.sleep(0.1)
+    await safe_delete_message(msg)
+
+    try:
+        tut_doc = db_shared["bot9_tutorials"].find_one({"type": "PK"})
+        link = tut_doc.get("link") if tut_doc else None
+    except Exception as e:
+        logger.warning(f"Main menu tutorial lookup failed for {user_id}: {e}")
+        link = None
+
+    if not link:
+        await message.answer(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🎬 **AGENT TUTORIAL IS COMING**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🛠️ **It's being prepared for you right now.**\n\n"
+            "Your exclusive MSA NODE video guide is almost ready.\n"
+            "When it drops, you'll find it right here — one tap away.\n\n"
+            "In the meantime, your vault is fully unlocked:\n"
+            "  📊 **Dashboard** — your MSA+ ID & live stats\n"
+            "  🔍 **Search Code** — unlock exclusive content\n"
+            "  📖 **Agent Guide** — everything you need to know\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔔 _Check back soon. It drops shortly!_ 🚀",
+            reply_markup=get_user_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️  Watch MSA AGENT Tutorial", url=link)]
+    ])
+    await message.answer(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎬 **YOUR MSA NODE TUTORIAL**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💎 **This video was made for you.**\n\n"
+        "Everything you need to know about MSA NODE —\n"
+        "how it works, what you have access to, and\n"
+        "exactly how to get the most from your membership.\n\n"
+        "🎯 **One watch. Zero confusion. Full clarity.**\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "_Tap below and start right now ⬇️_",
+        reply_markup=kb,
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await message.answer(
+        "_Questions? **📞 SUPPORT** is always available._",
+        reply_markup=get_user_menu(user_id),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    logger.info(f"User {user_id} accessed TUTORIAL from main menu")
+
+
 @dp.message(F.text == "📜 RULES")
 @rate_limit(3.0)  # 3 second cooldown for rules
 @anti_spam("rules")
@@ -3562,61 +4062,85 @@ async def rules_regulations(message: types.Message):
     
     rules_text = """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  📜  **MSA NODE AGENT — RULES**
+  📜  **MSA NODE AGENT — CODE OF CONDUCT**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-These rules apply to every member who accesses the vault through **MSA NODE Agent**. Read them carefully — your continued access depends on it.
+Every member who enters the vault through **MSA NODE Agent** operates under these rules. This is not optional reading — your access, your identity, and your standing in this community depend on full compliance.
+
+By using this agent, you unconditionally accept every rule below.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**⚖️ CORE PRINCIPLES**
+**⚖️ SECTION I — CORE CONDUCT**
 
 1️⃣ **Respect & Professionalism**
-   • Treat all members and admins with respect
-   • Harassment, hate speech, and toxic behaviour are strictly prohibited
-   • Keep all communication professional and constructive
+   • Every member — new or elite — is treated with full dignity
+   • Harassment, verbal abuse, hate speech, or threats of any kind are **zero-tolerance offences**
+   • Toxic behaviour, passive aggression, and provocations will be actioned immediately
+   • All communication must remain constructive, focused, and professional
+   • Admins have final authority — do not argue or undermine their decisions publicly
 
 2️⃣ **Vault Content Integrity**
-   • Do NOT share vault content outside the community
-   • Do NOT redistribute or re-upload MSA CODES or blueprints
-   • All materials are exclusively for verified vault members
+   • **Vault content is classified.** Do NOT share PDFs, blueprints, or exclusive files outside this community
+   • Do NOT screenshot, screen-record, or redistribute any unlocked material
+   • **MSA CODES** are personal — sharing them grants unauthorized access and violates member trust
+   • Re-uploading or repurposing vault content for personal gain is an **instant permanent ban**
+   • All materials are exclusively for verified vault members — zero exceptions
 
 3️⃣ **Privacy & Account Security**
-   • Never share your **MSA+ ID** with anyone
-   • Do not disclose personal information of other members
-   • Report any suspicious activity to an admin immediately
+   • Your **MSA+ ID** is your unique credential — never share it with anyone
+   • Do not request, store, or distribute personal information of other members
+   • If your account is compromised, open a **📞 SUPPORT** ticket immediately
+   • Do not attempt to access another member's content or data for any reason
+   • Report suspicious behaviour, scam links, or impersonation attempts to an admin
 
 4️⃣ **Agent Usage Rules**
-   • Do NOT spam buttons, commands, or messages
-   • Do NOT attempt to exploit or reverse-engineer **MSA NODE Agent**
-   • Use all features as intended — one action at a time
-   • Respect cooldowns and rate limits at all times
+   • Do NOT spam commands, buttons, or messages — automatic rate limits are enforced
+   • Do NOT probe or attempt to reverse-engineer **MSA NODE Agent** or its internal logic
+   • Do NOT flood support channels with repeated requests
+   • Use every feature as designed — one clean action at a time
+   • Automated scripts, bots, or macros interacting with this agent are **strictly forbidden**
+   • Cooldowns exist by design — any attempt to bypass them is a violation
 
 5️⃣ **Identity & Honesty**
-   • Do not impersonate admins, other members, or **MSA NODE Agent**
-   • Do not use fake accounts to bypass restrictions
-   • Any form of manipulation or deception leads to immediate ban
+   • Impersonating admins, vault members, or **MSA NODE Agent** itself is an **instant ban**
+   • Creating multiple accounts to bypass bans or restrictions is strictly prohibited
+   • Providing false information to gain access or lift bans constitutes fraud
+   • All deception — at any scale — destroys trust and results in permanent removal
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**🚨 VIOLATION CONSEQUENCES**
+**🚨 SECTION II — VIOLATION CONSEQUENCES**
 
-⚡ **Strike 1** — Account freeze (automatic cooldown applies)
-⛔ **Strike 2** — Temporary suspension from all features
-🔴 **Strike 3** — Permanent ban from **MSA NODE Agent**
+Violations are tracked by **MSA NODE Agent** and reviewed by admins.
 
-> Severe violations (scamming, hacking attempts, data abuse) result in an instant permanent ban — no warnings.
+⚡ **Strike 1** — Formal warning issued + automatic feature cooldown applied
+⛔ **Strike 2** — Temporary suspension from all agent features (duration set by admin)
+🔴 **Strike 3** — Permanent ban from **MSA NODE Agent** with no reinstatement
+
+> **INSTANT PERMANENT BAN — NO WARNINGS:**
+> Scamming, hacking, data theft, content redistribution for profit, or impersonating MSA NODE Agent or its admins.
+
+_There are no exceptions. There are no second chances for critical violations._
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**📩 APPEALS & QUESTIONS**
-Open a support ticket via **📞 SUPPORT** if you believe an action was made in error. Provide your **MSA+ ID** and a clear explanation.
+**📩 SECTION III — APPEALS & DISPUTES**
+
+If you believe an action was taken in error:
+
+  ① Press **📞 SUPPORT** in the main menu
+  ② Open a new ticket — include your **MSA+ ID**
+  ③ Provide a clear, honest explanation of the situation
+  ④ Wait for admin review — do NOT open duplicate tickets
+
+_Providing false information in an appeal is itself a violation and will result in escalation._
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 💎 **MSA NODE Agent**  |  _Your Exclusive Gateway_
-_By using this agent, you agree to all the rules above._
-_Rules are subject to updates without prior notice._
+_Accessing this agent confirms your agreement to every rule above._
+_Rules are subject to updates. Continued use means continued acceptance._
 """
     
     await msg.edit_text(
@@ -3806,7 +4330,6 @@ async def guide_bot8_prev(message: types.Message, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=_agent_guide_kb(page, len(_AGENT_GUIDE_PAGES)),
     )
-
 @dp.message(F.text == "📚 GUIDE MENU")
 async def guide_legacy_menu_btn(message: types.Message, state: FSMContext):
     """Legacy GUIDE MENU button — shows Agent Guide page 1."""
@@ -3833,13 +4356,81 @@ async def guide_back_to_main_bot8(message: types.Message, state: FSMContext):
     """Return to main menu, clearing any guide state (bot8)."""
     await state.clear()
     user_id = message.from_user.id
+    first_name = message.from_user.first_name or "Member"
+
+    msg = await message.answer("🔄 Returning to main menu...")
+    await asyncio.sleep(ANIM_FAST)
+    await safe_delete_message(msg)
+
     await message.answer(
-        "📋 **Main Menu**\n\nSelect an option:",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"  📋  **MSA NODE AGENT — MAIN MENU**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Welcome back, **{first_name}**! 👋\n\n"
+        f"🚀 **All your services are live and ready.**\n\n"
+        f"  📊 **DASHBOARD** — Your vault stats & MSA+ ID\n"
+        f"  🔍 **SEARCH CODE** — Unlock exclusive content\n"
+        f"  📺 **WATCH TUTORIAL** — Your starter guide video\n"
+        f"  📖 **AGENT GUIDE** — Full bot manual\n"
+        f"  📜 **RULES** — Community code of conduct\n"
+        f"  📞 **SUPPORT** — Open a ticket anytime\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 _MSA NODE Agent  |  Your Exclusive Gateway_",
         reply_markup=get_user_menu(user_id),
         parse_mode=ParseMode.MARKDOWN,
     )
     logger.info(f"User {user_id} returned to main menu from guide")
 
+
+
+@dp.message(Command("checkvault"))
+async def cmd_checkvault(message: types.Message):
+    """Owner-only: Show vault and MSA statistics"""
+    if message.from_user.id != OWNER_ID:
+        return  # silently ignore non-owners
+    try:
+        total_members   = col_msa_ids.count_documents({})
+        total_banned    = col_banned_users.count_documents({})
+        perm_banned     = col_banned_users.count_documents({"ban_type": "permanent"})
+        temp_banned     = col_banned_users.count_documents({"ban_type": "temporary"})
+        total_suspended = col_suspended_features.count_documents({})
+        _tracking = db["bot10_user_tracking"]
+        total_tracked   = _tracking.count_documents({})
+
+        yt_count      = _tracking.count_documents({"source": "YT"})
+        ig_count      = _tracking.count_documents({"source": "IG"})
+        igcc_count    = _tracking.count_documents({"source": "IGCC"})
+        ytcode_count  = _tracking.count_documents({"source": "YTCODE"})
+        unknown_count = _tracking.count_documents({"source": "UNKNOWN"})
+
+        # 9-digit MSA pool: 100000000–999999999 = 900,000,000 possible
+        TOTAL_POOL = 900_000_000
+        available   = TOTAL_POOL - total_members
+        utilization = (total_members / TOTAL_POOL * 100)
+
+        report = (
+            "🔐 **VAULT STATS — /checkvault**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 **MSA Members:** {total_members:,}\n"
+            f"🔴 **Banned:** {total_banned} (Perm: {perm_banned}, Temp: {temp_banned})\n"
+            f"⏸️ **Suspended users:** {total_suspended}\n"
+            f"📊 **Total tracked:** {total_tracked:,}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📍 **Traffic Sources:**\n"
+            f"  📺 YT: {yt_count}   📸 IG: {ig_count}\n"
+            f"  📎 IGCC: {igcc_count}   🔗 YTCODE: {ytcode_count}\n"
+            f"  👤 UNKNOWN: {unknown_count}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🆔 **MSA Code Pool (9-digit):**\n"
+            f"  🎯 Total Possible: {TOTAL_POOL:,}\n"
+            f"  ✅ Allocated: {total_members:,}\n"
+            f"  🟢 Available: {available:,}\n"
+            f"  📈 Used: {utilization:.6f}%\n\n"
+            f"🕒 {now_local().strftime('%b %d, %Y  %I:%M:%S %p')}"
+        )
+        await message.answer(report, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await message.answer(f"❌ checkvault error: {str(e)[:150]}", parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.message(Command("menu"))
@@ -3861,8 +4452,21 @@ async def cmd_menu(message: types.Message):
         )
         return
     
+    first_name = message.from_user.first_name or "Member"
     await message.answer(
-        "📋 **Main Menu**\n\nSelect an option:",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"  📋  **MSA NODE AGENT — MAIN MENU**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Hey **{first_name}**! 👋\n\n"
+        f"🚀 **All your services are live and ready.**\n\n"
+        f"  📊 **DASHBOARD** — Your vault stats & MSA+ ID\n"
+        f"  🔍 **SEARCH CODE** — Unlock exclusive content\n"
+        f"  📺 **WATCH TUTORIAL** — Your starter guide video\n"
+        f"  📖 **AGENT GUIDE** — Full bot manual\n"
+        f"  📜 **RULES** — Community code of conduct\n"
+        f"  📞 **SUPPORT** — Open a ticket anytime\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 _MSA NODE Agent  |  Your Exclusive Gateway_",
         reply_markup=get_user_menu(message.from_user.id),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -4703,6 +5307,232 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     
     logger.info(f"User {user_id} ticket confirmed")
 
+
+# ==========================================
+# 📋 MY TICKET — STATUS + HISTORY + PAGINATION
+# ==========================================
+
+@dp.message(F.text == "📋 MY TICKET")
+@rate_limit(2.0)
+@anti_spam("my_ticket")
+async def my_ticket_handler(message: types.Message):
+    """Show active ticket status (with cancel button) or full ticket history."""
+    if await _check_freeze(message): return
+    if await check_maintenance_mode(message):
+        return
+
+    user_id    = message.from_user.id
+    first_name = message.from_user.first_name or "Member"
+
+    msg = await message.answer("📋 Checking your tickets...")
+    await asyncio.sleep(ANIM_FAST)
+
+    # ── Active ticket? ──────────────────────────────────────────────
+    open_ticket = col_support_tickets.find_one({"user_id": user_id, "status": "open"})
+
+    if open_ticket:
+        created_at     = open_ticket.get("created_at", now_local())
+        date_str       = created_at.strftime("%B %d, %Y at %I:%M %p")
+        ticket_type    = open_ticket.get("ticket_type", "Text Only")
+        char_count     = open_ticket.get("character_count", 0)
+        issue_raw      = (open_ticket.get("issue_text") or "")
+        issue_preview  = issue_raw[:200] + ("…" if len(issue_raw) > 200 else "")
+
+        await safe_delete_message(msg)
+        cancel_kb = ReplyKeyboardMarkup(keyboard=[
+            [KeyboardButton(text="❌ CANCEL MY TICKET")],
+            [KeyboardButton(text="🔙 BACK TO SUPPORT")]
+        ], resize_keyboard=True)
+        await message.answer(
+            f"🎫 **YOUR ACTIVE TICKET**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"**Status:** ⏳ Awaiting Admin Review\n"
+            f"**Submitted:** {date_str}\n"
+            f"**Type:** {ticket_type}\n"
+            f"**Characters:** {char_count}\n\n"
+            f"📝 **Your Message:**\n"
+            f"_{issue_preview}_\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⚠️ You cannot submit a new ticket until this one is resolved.\n\n"
+            f"💡 Admin typically responds within 24-48 hours.\n\n"
+            f"_Tap **❌ CANCEL MY TICKET** to permanently withdraw your request._",
+            reply_markup=cancel_kb,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info(f"User {user_id} viewed active ticket status")
+        return
+
+    # ── No open ticket → show ticket history ────────────────────────
+    all_tickets = list(col_support_tickets.find({"user_id": user_id}).sort("created_at", -1))
+    total = len(all_tickets)
+
+    if total == 0:
+        await safe_delete_message(msg)
+        await message.answer(
+            f"📋 **NO TICKET HISTORY**\n\n"
+            f"{first_name}, you haven't submitted any support tickets yet.\n\n"
+            f"Tap **🎫 RAISE A TICKET** whenever you need help!",
+            reply_markup=get_support_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    await safe_delete_message(msg)
+    await _send_ticket_history_page(message, user_id, all_tickets, 0, first_name)
+    logger.info(f"User {user_id} viewed ticket history ({total} tickets)")
+
+
+# ─── Helpers ────────────────────────────────────────────────────────
+
+def _esc_md(text: str) -> str:
+    """Escape markdown special characters to prevent format breaking."""
+    if not text:
+        return ""
+    # Only escaping standard Markdown (not MarkdownV2 which requires all chars)
+    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in escape_chars:
+        text = text.replace(char, f"\\{char}")
+    return text
+
+def _build_ticket_history_page(tickets: list, page: int, first_name: str) -> str:
+    """Build a single page of ticket history (1 ticket per page)."""
+    total = len(tickets)
+    page  = page % total
+    t     = tickets[page]
+
+    created_at  = t.get("created_at", now_local())
+    resolved_at = t.get("resolved_at")
+    status      = t.get("status", "open")
+    ticket_type = t.get("ticket_type", "Text Only")
+    char_count  = t.get("character_count", 0)
+    support_num = t.get("support_count", page + 1)
+    issue_text  = (t.get("issue_text") or "")
+    preview     = _esc_md(issue_text)
+
+    date_str = created_at.strftime("%B %d, %Y at %I:%M %p")
+    status_badge = {
+        "open":     "⏳ Awaiting Review",
+        "resolved": "✅ Resolved",
+        "archived": "🗄️ Archived",
+    }.get(status, f"❓ {status.capitalize()}")
+
+    resolved_line = ""
+    if resolved_at:
+        resolved_line = f"**Resolved:** {resolved_at.strftime('%B %d, %Y at %I:%M %p')}\n"
+
+    return (
+        f"📋 **TICKET HISTORY** _· {page + 1} of {total}_\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎫 **Ticket #{support_num}**\n\n"
+        f"**Status:** {status_badge}\n"
+        f"**Submitted:** {date_str}\n"
+        f"{resolved_line}"
+        f"**Type:** {ticket_type}\n"
+        f"**Characters:** {char_count}\n\n"
+        f"📝 **Your Message:**\n"
+        f"_{preview}_\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+async def _send_ticket_history_page(message_or_cb, user_id: int, tickets: list, page: int, first_name: str):
+    """Send (new message) or edit (callback) a ticket history page with PREV/NEXT nav."""
+    total = len(tickets)
+    page  = page % total
+    text  = _build_ticket_history_page(tickets, page, first_name)
+
+    if total > 1:
+        prev_pg = (page - 1) % total
+        next_pg = (page + 1) % total
+        nav_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️",                callback_data=f"tkt_pg:{user_id}:{prev_pg}"),
+            InlineKeyboardButton(text=f"🎫 {page + 1}/{total}", callback_data="tkt_noop"),
+            InlineKeyboardButton(text="▶️",                callback_data=f"tkt_pg:{user_id}:{next_pg}"),
+        ]])
+    else:
+        nav_kb = None
+
+    if isinstance(message_or_cb, types.Message):
+        await message_or_cb.answer(text, reply_markup=nav_kb, parse_mode=ParseMode.MARKDOWN)
+    else:
+        # CallbackQuery — edit existing message
+        await message_or_cb.message.edit_text(text, reply_markup=nav_kb, parse_mode=ParseMode.MARKDOWN)
+
+
+@dp.callback_query(F.data.startswith("tkt_pg:"))
+async def ticket_history_page_callback(callback: types.CallbackQuery):
+    """Navigate ticket history pages (PREV / NEXT)."""
+    try:
+        parts      = callback.data.split(":")
+        uid        = int(parts[1])
+        page       = int(parts[2])
+        first_name = callback.from_user.first_name or "Member"
+
+        all_tickets = list(col_support_tickets.find({"user_id": uid}).sort("created_at", -1))
+        if not all_tickets:
+            await callback.answer("No tickets found.", show_alert=False)
+            return
+
+        await _send_ticket_history_page(callback, uid, all_tickets, page, first_name)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"ticket_history_page_callback error: {e}")
+        await callback.answer("Error loading page.", show_alert=True)
+
+
+@dp.callback_query(F.data == "tkt_noop")
+async def ticket_noop_callback(callback: types.CallbackQuery):
+    """No-op: page indicator button in ticket history nav bar."""
+    await callback.answer()
+
+
+@dp.message(F.text == "❌ CANCEL MY TICKET")
+@rate_limit(3.0)
+async def cancel_ticket_handler(message: types.Message):
+    """Allow a user to permanently delete their open support ticket from DB + review channel."""
+    if await _check_freeze(message): return
+
+    uid        = message.from_user.id
+    first_name = message.from_user.first_name or "Member"
+    ticket     = col_support_tickets.find_one({"user_id": uid, "status": "open"})
+
+    if not ticket:
+        await message.answer(
+            "ℹ️ **NO OPEN TICKET**\n\nYou don't have an active ticket to cancel.",
+            reply_markup=get_support_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # ── 1. Delete from review channel ──────────────────────────────
+    channel_msg_id = ticket.get("channel_message_id")
+    if channel_msg_id and REVIEW_LOG_CHANNEL:
+        try:
+            await bot.delete_message(REVIEW_LOG_CHANNEL, channel_msg_id)
+            logger.info(f"Deleted ticket channel msg {channel_msg_id} for user {uid}")
+        except Exception as e:
+            logger.warning(f"Could not delete channel msg {channel_msg_id}: {e}")
+
+    # ── 2. Permanently delete from database ────────────────────────
+    col_support_tickets.delete_one({"_id": ticket["_id"]})
+    logger.info(f"User {uid} cancelled + permanently deleted open ticket from DB")
+
+    await message.answer(
+        f"❌ **TICKET CANCELLED**\n\n"
+        f"{first_name}, your open ticket has been permanently withdrawn.\n\n"
+        f"✅ **Removed from:** Database + Review Channel\n\n"
+        f"💡 You can raise a new ticket any time you need help.",
+        reply_markup=get_support_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@dp.message(F.text == "🔙 BACK TO SUPPORT")
+async def back_to_support_handler(message: types.Message):
+    """Return to support menu from ticket view."""
+    await message.answer("↩️ Support Menu", reply_markup=get_support_menu())
+
+
 @dp.message(Command("resolve"))
 @rate_limit(10.0)  # Strict 10 second cooldown for admin command
 async def cmd_resolve_ticket(message: types.Message):
@@ -4798,10 +5628,19 @@ async def back_to_menu_handler(message: types.Message, state: FSMContext):
     await safe_delete_message(msg)
     
     await message.answer(
-        f"📋 **MAIN MENU**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"  📋  **MSA NODE AGENT — MAIN MENU**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Welcome back, **{first_name}**! 👋\n\n"
-        f"You've returned to the main control center.\n"
-        f"Select any service below to continue.",
+        f"🚀 **All your services are live and ready.**\n\n"
+        f"  📊 **DASHBOARD** — Your vault stats & MSA+ ID\n"
+        f"  🔍 **SEARCH CODE** — Unlock exclusive content\n"
+        f"  📺 **WATCH TUTORIAL** — Your starter guide video\n"
+        f"  📖 **AGENT GUIDE** — Full bot manual\n"
+        f"  📜 **RULES** — Community code of conduct\n"
+        f"  📞 **SUPPORT** — Open a ticket anytime\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 _MSA NODE Agent  |  Your Exclusive Gateway_",
         reply_markup=get_user_menu(message.from_user.id),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -5252,7 +6091,7 @@ async def _build_daily_report(period: str) -> str:
     minutes = int((uptime.total_seconds() % 3600) // 60)
 
     # ── DB Stats (run in executor to avoid blocking) ─────────────
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _get_stats():
         total_users = col_user_verification.count_documents({})
