@@ -15,6 +15,7 @@ import json
 import time
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -55,6 +56,7 @@ if sys.platform == 'win32':
 # Redirect Streams
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
+
 
 
 # Timezone support
@@ -983,9 +985,49 @@ async def merge_script(message: types.Message, state: FSMContext):
     if not data.get('timer_active'):
         await state.update_data(timer_active=True)
         async def auto_finish(uid, st):
-            await asyncio.sleep(5)
-            await finalize_pdf(uid, st)
+            try:
+                await asyncio.sleep(5)
+                await finalize_pdf(uid, st)
+            except Exception as _task_err:
+                logging.error(f"auto_finish unhandled error for uid={uid}: {_task_err}")
         asyncio.create_task(auto_finish(message.from_user.id, state))
+
+async def _safe_send_message(user_id, text, parse_mode="HTML", max_wait=300):
+    """Send a message, retrying once on TelegramRetryAfter up to max_wait seconds."""
+    try:
+        return await bot.send_message(user_id, text, parse_mode=parse_mode)
+    except TelegramRetryAfter as e:
+        wait = min(e.retry_after, max_wait)
+        logging.warning(f"Flood control on send_message to {user_id}: retry in {e.retry_after}s (waiting {wait}s)")
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            return await bot.send_message(user_id, text, parse_mode=parse_mode)
+        except Exception as inner:
+            logging.error(f"send_message retry also failed for {user_id}: {inner}")
+            return None
+    except Exception as e:
+        logging.error(f"send_message failed for {user_id}: {e}")
+        return None
+
+
+async def _safe_send_document(user_id, file, caption, parse_mode="HTML", max_retries=5):
+    """Send a document, retrying on TelegramRetryAfter with capped backoff."""
+    for attempt in range(max_retries):
+        try:
+            return await bot.send_document(user_id, file, caption=caption, parse_mode=parse_mode)
+        except TelegramRetryAfter as e:
+            wait = min(e.retry_after, 300)  # cap at 5 minutes per attempt
+            logging.warning(
+                f"Flood control on send_document to {user_id} (attempt {attempt+1}/{max_retries}): "
+                f"Telegram says retry in {e.retry_after}s, waiting {wait}s"
+            )
+            await asyncio.sleep(wait)
+        except Exception as e:
+            logging.error(f"send_document failed for {user_id}: {e}")
+            raise
+    raise RuntimeError(f"send_document to {user_id} failed after {max_retries} retries due to flood control")
+
 
 async def finalize_pdf(user_id, state):
     global DAILY_STATS_BOT4
@@ -993,7 +1035,10 @@ async def finalize_pdf(user_id, state):
     code = data.get('code')
     script = data.get('raw_script', '').strip()
     if not script or not code: return
-    msg = await bot.send_message(user_id, "⏳ <b>Compiling Assets...</b>", parse_mode="HTML")
+
+    # Non-critical status message — skip silently if flood-limited
+    msg = await _safe_send_message(user_id, "⏳ <b>Compiling Assets...</b>", parse_mode="HTML", max_wait=30)
+
     filename = f"{code}.pdf"
     try:
         await asyncio.to_thread(create_goldmine_pdf, script, filename)
@@ -1013,21 +1058,29 @@ async def finalize_pdf(user_id, state):
         col_pdfs.delete_many({"code": code})
         col_pdfs.insert_one({"code": code, "link": link, "timestamp": datetime.now()})
 
-        # Send PDF file + link to user
+        # Send PDF file + link to user (retries on flood control)
         caption = f"✅ <b>READY</b>\nCode: <code>{code}</code>"
         if link:
             caption += f"\n🔗 <a href='{link}'>Drive Link</a>"
-        await bot.send_document(user_id, FSInputFile(filename), caption=caption, parse_mode="HTML")
+        await _safe_send_document(user_id, FSInputFile(filename), caption=caption, parse_mode="HTML")
         DAILY_STATS_BOT4["pdfs_generated"] += 1
         asyncio.create_task(_persist_stats())
-        await msg.delete()
+        if msg:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
         await asyncio.sleep(2)
         if os.path.exists(filename):
             try: os.remove(filename)
             except: pass
     except Exception as e:
-        await bot.send_message(user_id, f"❌ Error: <code>{e}</code>", parse_mode="HTML")
-        await notify_error_bot4("PDF Generation Failed", f"Code: {code} | Error: {e}")
+        logging.error(f"finalize_pdf error for code={code}: {e}")
+        await _safe_send_message(user_id, f"❌ Error generating PDF: <code>{e}</code>", parse_mode="HTML")
+        try:
+            await notify_error_bot4("PDF Generation Failed", f"Code: {code} | Error: {e}")
+        except Exception:
+            pass
         DAILY_STATS_BOT4["errors"] += 1
         asyncio.create_task(_persist_stats())
     await state.clear()
