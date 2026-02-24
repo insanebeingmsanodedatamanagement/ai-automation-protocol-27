@@ -57,6 +57,7 @@ if sys.platform == 'win32':
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
+# Load environment variables from bot4.env
 
 # Timezone support
 try:
@@ -979,17 +980,25 @@ async def code_input(message: types.Message, state: FSMContext):
 async def merge_script(message: types.Message, state: FSMContext):
     if message.text == "🔙 Back to Menu": return await start(message, state)
     data = await state.get_data()
-    updated = data.get('raw_script', '') + "\n\n" + message.text
-    await state.update_data(raw_script=updated)
-    if not data.get('timer_active'):
-        await state.update_data(timer_active=True)
-        async def auto_finish(uid, st):
-            try:
-                await asyncio.sleep(5)
+    # Append new chunk preserving exact order
+    updated = data.get('raw_script', '') + ("\n\n" if data.get('raw_script', '') else "") + message.text
+    # Increment generation counter so any running timer knows it's stale
+    gen = data.get('script_gen', 0) + 1
+    await state.update_data(raw_script=updated, script_gen=gen, timer_active=True)
+
+    uid = message.from_user.id
+
+    async def auto_finish(my_gen, uid, st):
+        try:
+            await asyncio.sleep(5)
+            # Only finalize if no newer chunk arrived (generation unchanged)
+            current = await st.get_data()
+            if current.get('script_gen', 0) == my_gen:
                 await finalize_pdf(uid, st)
-            except Exception as _task_err:
-                logging.error(f"auto_finish unhandled error for uid={uid}: {_task_err}")
-        asyncio.create_task(auto_finish(message.from_user.id, state))
+        except Exception as _task_err:
+            logging.error(f"auto_finish unhandled error for uid={uid}: {_task_err}")
+
+    asyncio.create_task(auto_finish(gen, uid, state))
 
 async def _safe_send_message(user_id, text, parse_mode="HTML", max_wait=300):
     """
@@ -2449,9 +2458,28 @@ async def fetch_link(message: types.Message, state: FSMContext):
                 except: pass
                 
         else:
+            drive_link = doc.get('link', '').strip()
+            if not drive_link:
+                await message.answer(
+                    f"⚠️ <b>NO DRIVE LINK</b> for <code>{doc.get('code')}</code>\n"
+                    f"This PDF was stored without a Drive link — it may have been generated before Drive was connected, "
+                    f"or the upload failed.\n\n"
+                    f"💡 Re-generate this PDF to get a fresh Drive link.",
+                    parse_mode="HTML"
+                )
+                return
             DAILY_STATS_BOT4["links_retrieved"] += 1
             asyncio.create_task(_persist_stats())
-            await message.answer(f"✅ **RESOURCE ACQUIRED**\nCode: `{doc.get('code')}`\n🔗 {doc.get('link')}")
+            await message.answer(
+                f"✅ <b>RESOURCE ACQUIRED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📄 Code: <code>{doc.get('code')}</code>\n"
+                f"🔗 <a href='{drive_link}'>Open on Google Drive</a>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<code>{drive_link}</code>",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
             
     else:
         await message.answer(f"❌ Code `{text}` not found. Select from the buttons or try again.")
@@ -2579,9 +2607,13 @@ async def process_bulk_range(message: types.Message, state: FSMContext):
             
             for i, doc in enumerate(selected_docs):
                 current_num = start_idx + i
-                report.append(f"**{current_num}. {doc.get('code')}**")
-                report.append(f"🔗 {doc.get('link')}")
-                report.append("") 
+                drive_link = doc.get('link', '').strip()
+                report.append(f"<b>{current_num}. {doc.get('code')}</b>")
+                if drive_link:
+                    report.append(f"🔗 <a href='{drive_link}'>{drive_link}</a>")
+                else:
+                    report.append("⚠️ <i>No Drive link stored for this PDF</i>")
+                report.append("")
                 
             report.append("━━━━━━━━━━━━━━━━━━━━")
             
@@ -2589,9 +2621,9 @@ async def process_bulk_range(message: types.Message, state: FSMContext):
             if len(full_msg) > 4000:
                 chunks = [full_msg[i:i+4000] for i in range(0, len(full_msg), 4000)]
                 for chunk in chunks:
-                    await message.answer(chunk, disable_web_page_preview=True)
+                    await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
             else:
-                await message.answer(full_msg, disable_web_page_preview=True)
+                await message.answer(full_msg, parse_mode="HTML", disable_web_page_preview=True)
             DAILY_STATS_BOT4["links_retrieved"] += len(selected_docs)
             asyncio.create_task(_persist_stats())
             
