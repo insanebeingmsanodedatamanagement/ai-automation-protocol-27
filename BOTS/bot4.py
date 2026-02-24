@@ -58,6 +58,7 @@ sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
 # Load environment variables from bot4.env
+ # loads BOT_4_TOKEN, MONGO_URI, OWNER_ID etc.
 
 # Timezone support
 try:
@@ -4511,6 +4512,44 @@ async def main_menu_return(message: types.Message, state: FSMContext):
     await start(message, state)
 
 # ==========================================
+# 🛽 CATCH-ALL HANDLERS (must be LAST)
+# Prevents aiogram "Update is not handled" warnings
+# These fire only when NO other handler matched.
+# ==========================================
+
+@dp.message()
+async def _catchall_message(message: types.Message, state: FSMContext):
+    """
+    Silently absorbs any message that no specific handler matched.
+    - Non-admins / strangers: drop silently (no response).
+    - Admins: redirect to main menu (they likely pressed an unknown button).
+    """
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+    # Admins hitting an unrecognised button → send them back to menu
+    if is_admin(uid):
+        await state.clear()
+        await message.answer(
+            "⚠️ <b>Unrecognised command.</b>\nReturning to main menu.",
+            parse_mode="HTML",
+            reply_markup=get_main_menu(uid)
+        )
+    # Strangers: silently ignore (no "not handled" noise in logs)
+
+
+@dp.callback_query()
+async def _catchall_callback(callback: types.CallbackQuery):
+    """Silently ack any callback query not matched by a specific handler."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+
+
+# ==========================================
 # 🛡️ SYSTEM HEALTH & MONITORING
 # ==========================================
 
@@ -4816,6 +4855,110 @@ async def monthly_backup():
 
         # Sleep 2 hours after firing to avoid re-trigger
         await asyncio.sleep(7200)
+
+
+async def weekly_backup():
+    """
+    Runs every Sunday at 03:00 AM local time.
+    Sends a full JSON dump + text report to Owner.
+    Dedup-guard: will not fire twice within 1 hour of the same slot.
+    """
+    print("🗓️ Weekly Backup Scheduler: Online (Sun @ 03:00 AM)")
+    while True:
+        try:
+            now = now_local()
+            # Days until next Sunday (weekday 6)
+            days_until_sunday = (6 - now.weekday()) % 7
+            if days_until_sunday == 0:
+                # Today is Sunday — check if 03:00 AM has passed
+                target_today = now.replace(hour=3, minute=0, second=0, microsecond=0)
+                if now >= target_today:
+                    days_until_sunday = 7  # push to next Sunday
+            target = (now + timedelta(days=days_until_sunday)).replace(
+                hour=3, minute=0, second=0, microsecond=0
+            )
+            wait_secs = (target - now).total_seconds()
+            print(f"🗓️ Weekly Backup in {wait_secs / 3600:.1f}h (on {target.strftime('%a %b %d, %Y at %I:%M %p')})")
+            await asyncio.sleep(max(wait_secs, 1))
+
+            # --- fire ---
+            fire_now = now_local()
+            week_key = fire_now.strftime("%Y-W%U")  # e.g. "2026-W08"
+
+            # Dedup guard: skip if already sent this week
+            try:
+                if col_bot4_state is not None:
+                    rec = col_bot4_state.find_one({"_id": "last_weekly_backup"})
+                    if rec and rec.get("week_key") == week_key:
+                        print(f"🗓️ Weekly Backup for {week_key} already sent — skipping.")
+                        await asyncio.sleep(3600)
+                        continue
+            except Exception:
+                pass
+
+            # Text report
+            txt_filename = await asyncio.to_thread(generate_system_backup)
+
+            # JSON dump
+            date_label = fire_now.strftime("%Y-%m-%d")
+            json_filename = f"MSANODE_WEEKLY_{date_label}.json"
+            data = {
+                "backup_type": "weekly",
+                "week_key": week_key,
+                "generated_at": fire_now.strftime("%b %d, %Y  ·  %I:%M %p"),
+                "pdfs":         list(col_pdfs.find({}, {"_id": 0}))         if col_pdfs         is not None else [],
+                "admins":       list(col_admins.find({}, {"_id": 0}))       if col_admins       is not None else [],
+                "banned":       list(col_banned.find({}, {"_id": 0}))       if col_banned       is not None else [],
+                "trash":        list(col_trash.find({}, {"_id": 0}))        if col_trash        is not None else [],
+                "locked":       list(col_locked.find({}, {"_id": 0}))       if col_locked       is not None else [],
+                "trash_locked": list(col_trash_locked.find({}, {"_id": 0})) if col_trash_locked is not None else [],
+            }
+            with open(json_filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, default=str)
+
+            caption = (
+                f"🗓️ <b>WEEKLY AUTO-BACKUP</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📆 <b>Date:</b> {fire_now.strftime('%a %b %d, %Y  ·  %I:%M %p')}\n"
+                f"📊 <b>PDFs:</b> {len(data['pdfs'])} | <b>Admins:</b> {len(data['admins'])} | <b>Banned:</b> {len(data['banned'])}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ <i>Weekly snapshot secured.</i>"
+            )
+
+            await _safe_send_document(
+                OWNER_ID,
+                FSInputFile(json_filename),
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+            # Mark sent
+            try:
+                if col_bot4_state is not None:
+                    col_bot4_state.update_one(
+                        {"_id": "last_weekly_backup"},
+                        {"$set": {"week_key": week_key, "ts": datetime.now()}},
+                        upsert=True
+                    )
+            except Exception:
+                pass
+
+            print(f"✅ Weekly Backup Sent — {week_key}")
+
+            # Cleanup local files
+            for f in [txt_filename, json_filename]:
+                if f and os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            await notify_error_bot4("Weekly Backup Failed", str(e))
+
+        await asyncio.sleep(3600)  # wait before re-calculating
 
 
 async def _migrate_permissions():
