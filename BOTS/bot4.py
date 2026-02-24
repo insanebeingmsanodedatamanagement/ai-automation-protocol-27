@@ -57,7 +57,6 @@ if sys.platform == 'win32':
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
-# Load environment variables from bot4.env
  # loads BOT_4_TOKEN, MONGO_URI, OWNER_ID etc.
 
 # Timezone support
@@ -4998,7 +4997,7 @@ async def _migrate_permissions():
         print(f"⚠️ Migration Error: {e}")
 
 async def main():
-    # Retry loop for network startup
+    # ── 1. Network startup (retry until Telegram responds) ──────────────────
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
@@ -5007,84 +5006,76 @@ async def main():
         except Exception as e:
             print(f"⚠️ Network Startup Error: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
-    
+
+    # ── 2. Background tasks ──────────────────────────────────────────────────
     asyncio.create_task(auto_janitor())
     asyncio.create_task(weekly_backup())
-    asyncio.create_task(monthly_backup())           # 1st of each month · 03:30 AM
+    asyncio.create_task(monthly_backup())
     asyncio.create_task(system_guardian())
-    asyncio.create_task(reset_daily_stats())        # Midnight stat reset
-    asyncio.create_task(strict_daily_report())      # 08:40 AM/PM live timezone
-    asyncio.create_task(auto_health_monitor())      # Every 5 minutes deep-scan
-    
-    # Run migration once on startup
+    asyncio.create_task(reset_daily_stats())
+    asyncio.create_task(strict_daily_report())
+    asyncio.create_task(auto_health_monitor())
+
+    # ── 3. One-time startup tasks ────────────────────────────────────────────
     await _migrate_permissions()
-    await _load_persisted_stats()   # Restore daily stats (survives restarts, no duplicates)
-    
+    await _load_persisted_stats()
+
     print("💎 MSANODE BOT 4 ONLINE")
 
-    # ── Online notification: one clean message, waits flood ban if active ──
-    async def _send_online_notify():
-        boot_time = now_local().strftime('%I:%M %p · %b %d, %Y')
+    # ── 4. ONLINE notification (awaited directly — never silently lost) ──────
+    boot_time = now_local().strftime('%I:%M %p · %b %d, %Y')
+    _online_msg = (
+        "💎 <b>MSA NODE BOT 4: ONLINE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🟢 <b>Status:</b> OPERATIONAL\n"
+        f"🕐 <b>Booted:</b> {boot_time}\n\n"
+        "<i>I am awake and ready to serve, Master.</i>"
+    )
+    for _attempt in range(3):
         try:
-            await bot.send_message(
-                OWNER_ID,
-                "💎 <b>MSA NODE BOT 4: ONLINE</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "🟢 <b>Status:</b> OPERATIONAL\n"
-                f"🕐 <b>Booted:</b> {boot_time}\n\n"
-                "<i>I am awake and ready to serve, Master.</i>",
-                parse_mode="HTML"
-            )
+            await bot.send_message(OWNER_ID, _online_msg, parse_mode="HTML")
             print("✅ Online notification sent.")
+            break
         except TelegramRetryAfter as _fl:
-            # Flood ban active — wait it out once, then send
-            logging.info(f"Online notify delayed {_fl.retry_after}s (flood control settling).")
+            logging.info(f"Online notify flood-wait {_fl.retry_after}s — retrying...")
             await asyncio.sleep(_fl.retry_after + 1)
-            try:
-                await bot.send_message(
-                    OWNER_ID,
-                    "💎 <b>MSA NODE BOT 4: ONLINE</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "🟢 <b>Status:</b> OPERATIONAL\n"
-                    f"🕐 <b>Booted:</b> {boot_time}\n\n"
-                    "<i>I am awake and ready to serve, Master.</i>",
-                    parse_mode="HTML"
-                )
-                print("✅ Online notification sent (after flood wait).")
-            except Exception:
-                pass
-        except Exception as e:
-            logging.warning(f"Online notify failed: {e}")
+        except Exception as _e:
+            logging.warning(f"Online notify attempt {_attempt + 1} failed: {_e}")
+            await asyncio.sleep(2)
 
-    asyncio.create_task(_send_online_notify())
-
+    # ── 5. Polling loop (auto-restarts on transient network errors) ──────────
     try:
-        # 🔄 Polling Loop (Robust)
         while True:
             try:
                 await dp.start_polling(bot, skip_updates=True)
-                print("⚠️ Polling loop returned. Restarting...")
+                print("⚠️ Polling loop returned. Restarting in 5s...")
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
-                raise  # bubble up to finally
+                raise
             except Exception as e:
                 logging.error(f"Polling Network Error: {e}. Retrying in 5s...")
                 await asyncio.sleep(5)
+
     finally:
-        # 🔴 Offline notification — one attempt, silent if flood-controlled
+        # ── 6. OFFLINE notification (awaited in finally — fires before loop closes) ──
         _off_time = now_local().strftime('%I:%M %p · %b %d, %Y')
-        try:
-            await bot.send_message(
-                OWNER_ID,
-                "🔴 <b>MSA NODE BOT 4: OFFLINE</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "🟠 <b>Status:</b> SHUTTING DOWN\n"
-                f"🕐 <b>Time:</b> {_off_time}\n\n"
-                "<i>Bot 4 has stopped. Restart me when needed.</i>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass  # silent — don't block shutdown
+        _offline_msg = (
+            "🔴 <b>MSA NODE BOT 4: OFFLINE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🟠 <b>Status:</b> SHUTTING DOWN\n"
+            f"🕐 <b>Time:</b> {_off_time}\n\n"
+            "<i>Bot 4 has stopped. Restart me when needed.</i>"
+        )
+        for _attempt in range(3):
+            try:
+                await bot.send_message(OWNER_ID, _offline_msg, parse_mode="HTML")
+                print("✅ Offline notification sent.")
+                break
+            except TelegramRetryAfter as _fl:
+                await asyncio.sleep(_fl.retry_after + 1)
+            except Exception as _e:
+                logging.warning(f"Offline notify attempt {_attempt + 1} failed: {_e}")
+                await asyncio.sleep(1)
         try:
             await bot.session.close()
         except Exception:
@@ -5093,11 +5084,7 @@ async def main():
 
 if __name__ == "__main__":
     print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 4")
-    
-    # prepare_secrets() # Load from DB now
-    
     threading.Thread(target=run_health_server, daemon=True).start()
-    
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
