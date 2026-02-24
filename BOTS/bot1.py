@@ -23,6 +23,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError
 
 
+
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -5895,6 +5896,8 @@ async def notify_owner(error_type: str, error_msg: str, severity: str = "CRITICA
         await bot.send_message(OWNER_ID, notification, parse_mode=ParseMode.MARKDOWN)
         logger.info(f"📢 Owner notified of {severity}: {error_type}")
 
+    except TelegramRetryAfter as e:
+        logger.info(f"[notify_owner] Flood control ({e.retry_after}s) — alert '{error_type}' skipped (cooldown will retry)")
     except Exception as e:
         logger.error(f"❌ Failed to notify owner: {e}")
 
@@ -6193,6 +6196,8 @@ async def send_daily_report(period: str):
         await bot.send_message(OWNER_ID, report, parse_mode=ParseMode.MARKDOWN)
         health_stats["reports_sent"] += 1
         logger.info(f"📊 {period} report sent to owner")
+    except TelegramRetryAfter as e:
+        logger.info(f"Daily report skipped — flood control ({e.retry_after}s). Will retry next scheduled run.")
     except Exception as e:
         logger.error(f"❌ Failed to send {period} report: {e}")
 
