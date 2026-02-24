@@ -58,7 +58,6 @@ sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
 
-
 # Timezone support
 try:
     import pytz as _pytz
@@ -656,7 +655,7 @@ async def notify_error_bot4(error_type, details):
             f"📊 <b>Today's Errors:</b> {DAILY_STATS_BOT4['errors'] + 1}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
-        await bot.send_message(OWNER_ID, alert, parse_mode="HTML")
+        await _safe_send_message(OWNER_ID, alert, parse_mode="HTML")
         logging.info(f"🚨 Error Alert Sent: {error_type}")
         
         # Increment error counter
@@ -993,40 +992,38 @@ async def merge_script(message: types.Message, state: FSMContext):
         asyncio.create_task(auto_finish(message.from_user.id, state))
 
 async def _safe_send_message(user_id, text, parse_mode="HTML", max_wait=300):
-    """Send a message, retrying once on TelegramRetryAfter up to max_wait seconds."""
+    """
+    Send a message. If flood-controlled, logs and returns None IMMEDIATELY — no waiting, no retry.
+    The `max_wait` param is kept for API compatibility but is no longer used.
+    """
     try:
         return await bot.send_message(user_id, text, parse_mode=parse_mode)
     except TelegramRetryAfter as e:
-        wait = min(e.retry_after, max_wait)
-        logging.warning(f"Flood control on send_message to {user_id}: retry in {e.retry_after}s (waiting {wait}s)")
-        if wait > 0:
-            await asyncio.sleep(wait)
-        try:
-            return await bot.send_message(user_id, text, parse_mode=parse_mode)
-        except Exception as inner:
-            logging.error(f"send_message retry also failed for {user_id}: {inner}")
-            return None
+        logging.warning(f"send_message skipped (flood control {e.retry_after}s) to {user_id}")
+        return None
     except Exception as e:
         logging.error(f"send_message failed for {user_id}: {e}")
         return None
 
 
-async def _safe_send_document(user_id, file, caption, parse_mode="HTML", max_retries=5):
-    """Send a document, retrying on TelegramRetryAfter with capped backoff."""
+async def _safe_send_document(user_id, file, caption, parse_mode="HTML", max_retries=20):
+    """
+    Send a document. Only called from background tasks so it CAN wait.
+    Honours the exact flood-wait Telegram demands, retries until delivered or max_retries hit.
+    """
     for attempt in range(max_retries):
         try:
             return await bot.send_document(user_id, file, caption=caption, parse_mode=parse_mode)
         except TelegramRetryAfter as e:
-            wait = min(e.retry_after, 300)  # cap at 5 minutes per attempt
             logging.warning(
-                f"Flood control on send_document to {user_id} (attempt {attempt+1}/{max_retries}): "
-                f"Telegram says retry in {e.retry_after}s, waiting {wait}s"
+                f"PDF delivery flood control (attempt {attempt+1}/{max_retries}): "
+                f"waiting {e.retry_after}s..."
             )
-            await asyncio.sleep(wait)
+            await asyncio.sleep(e.retry_after + 1)
         except Exception as e:
             logging.error(f"send_document failed for {user_id}: {e}")
             raise
-    raise RuntimeError(f"send_document to {user_id} failed after {max_retries} retries due to flood control")
+    raise RuntimeError(f"send_document to {user_id} failed after {max_retries} attempts")
 
 
 async def finalize_pdf(user_id, state):
@@ -1036,44 +1033,55 @@ async def finalize_pdf(user_id, state):
     script = data.get('raw_script', '').strip()
     if not script or not code: return
 
-    # Non-critical status message — skip silently if flood-limited
-    msg = await _safe_send_message(user_id, "⏳ <b>Compiling Assets...</b>", parse_mode="HTML", max_wait=30)
-
     filename = f"{code}.pdf"
     try:
+        # Generate PDF (silent — no status messages that could hit flood control)
         await asyncio.to_thread(create_goldmine_pdf, script, filename)
 
-        # Upload to Google Drive and get shareable link
+        # Upload to Google Drive
         link = ""
         if os.path.exists(CREDENTIALS_FILE):
             try:
                 link = await asyncio.to_thread(upload_to_drive, filename)
             except Exception as drive_err:
                 logging.warning(f"Drive upload failed for {code}: {drive_err}")
-                link = ""
         else:
             logging.warning("credentials.json not found — skipping Drive upload.")
 
-        # Save to MongoDB with link
+        # Save to MongoDB
         col_pdfs.delete_many({"code": code})
         col_pdfs.insert_one({"code": code, "link": link, "timestamp": datetime.now()})
-
-        # Send PDF file + link to user (retries on flood control)
-        caption = f"✅ <b>READY</b>\nCode: <code>{code}</code>"
-        if link:
-            caption += f"\n🔗 <a href='{link}'>Drive Link</a>"
-        await _safe_send_document(user_id, FSInputFile(filename), caption=caption, parse_mode="HTML")
         DAILY_STATS_BOT4["pdfs_generated"] += 1
         asyncio.create_task(_persist_stats())
-        if msg:
+
+        # Deliver PDF file in background — waits out flood ban, won't block bot
+        _filename_snap = filename
+        _link_snap = link
+        _code_snap = code
+
+        async def _deliver_file():
+            _caption = (
+                f"✅ <b>PDF READY</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📄 <b>Code:</b> <code>{_code_snap}</code>\n"
+            )
+            if _link_snap:
+                _caption += f"🔗 <a href='{_link_snap}'>Drive Link</a>"
             try:
-                await msg.delete()
-            except Exception:
-                pass
-        await asyncio.sleep(2)
-        if os.path.exists(filename):
-            try: os.remove(filename)
-            except: pass
+                await _safe_send_document(
+                    user_id, FSInputFile(_filename_snap),
+                    caption=_caption, parse_mode="HTML"
+                )
+            except Exception as _de:
+                logging.warning(f"PDF delivery failed for {_code_snap}: {_de}")
+            finally:
+                await asyncio.sleep(2)
+                if os.path.exists(_filename_snap):
+                    try: os.remove(_filename_snap)
+                    except: pass
+
+        asyncio.create_task(_deliver_file())
+
     except Exception as e:
         logging.error(f"finalize_pdf error for code={code}: {e}")
         await _safe_send_message(user_id, f"❌ Error generating PDF: <code>{e}</code>", parse_mode="HTML")
@@ -1489,7 +1497,7 @@ async def weekly_backup():
                     f"💾 <b>Storage:</b> MongoDB Atlas"
                 )
                 try:
-                    await bot.send_document(OWNER_ID, FSInputFile(filename), caption=caption, parse_mode="HTML")
+                    await _safe_send_document(OWNER_ID, FSInputFile(filename), caption=caption, parse_mode="HTML")
                 except Exception as e:
                     logging.error(f"Weekly backup DM failed: {e}")
                 if os.path.exists(filename):
@@ -1919,6 +1927,9 @@ def _drive_delete_file(link: str) -> bool:
         service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
         return True
     except Exception as e:
+        err_str = str(e)
+        if "404" in err_str or "notFound" in err_str or "File not found" in err_str:
+            return True  # Already deleted from Drive — treat as success
         logging.warning(f"Drive delete failed: {e}")
         return False
 
@@ -4494,12 +4505,12 @@ async def global_error_handler(event: types.ErrorEvent):
     )
     
     try:
-        await bot.send_message(OWNER_ID, alert, parse_mode="Markdown")
-    except:
-        print("Failed to send Error Alert to Owner.")
+        await _safe_send_message(OWNER_ID, alert, parse_mode="Markdown")
+    except Exception as _ge:
+        logging.error(f"Failed to send Error Alert to Owner: {_ge}")
         
     # We log it but do not crash the bot
-    print(f"Global Error Caught: {exception}")
+    logging.error(f"Global Error Caught: {exception}")
 
 
 async def auto_health_monitor():
@@ -4532,8 +4543,8 @@ async def auto_health_monitor():
             for i in issues: report += f"• 🔴 {i}\n"
             report += f"\n🕐 Time: {now_local().strftime('%I:%M:%S %p')}"
             
-            try: await bot.send_message(OWNER_ID, report, parse_mode="Markdown")
-            except: pass
+            try: await _safe_send_message(OWNER_ID, report, parse_mode="Markdown")
+            except Exception as _hm: logging.warning(f"Health monitor alert failed: {_hm}")
 
 # ==========================================
 # 🕰️ STRICT DAILY REPORTS (12H · TIMEZONE-AWARE)
@@ -4637,7 +4648,7 @@ async def strict_daily_report():
                 f"💎 **MSA NODE SYSTEMS** | Verified."
             )
 
-            await bot.send_message(OWNER_ID, report, parse_mode="Markdown")
+            await _safe_send_message(OWNER_ID, report, parse_mode="Markdown")
             print(f"✅ Daily Report Sent at {current_time}")
 
             # ── Mark sent in MongoDB to prevent duplicate on restart ─────────
@@ -4737,7 +4748,7 @@ async def monthly_backup():
             )
 
             # Send JSON to Owner
-            await bot.send_document(
+            await _safe_send_document(
                 OWNER_ID,
                 FSInputFile(json_filename),
                 caption=caption,
@@ -4835,73 +4846,42 @@ async def main():
     await _load_persisted_stats()   # Restore daily stats (survives restarts, no duplicates)
     
     print("💎 MSANODE BOT 4 ONLINE")
-    
-    # 🧬 Define Heartbeat Loop (Nested)
-    async def heartbeat_animation(chat_id, message_id):
-        """Keeps the startup message alive with a 'breathing' pulse."""
-        states = [
-            "💓 <b>Pulse:</b> ACTIVE",
-            "💗 <b>Pulse:</b> BEATING",
-            "💖 <b>Pulse:</b> VITAL",
-            "💞 <b>Pulse:</b> ALIVE"
-        ]
-        idx = 0
-        while True:
+
+    # ── Online notification: one clean message, waits flood ban if active ──
+    async def _send_online_notify():
+        boot_time = now_local().strftime('%I:%M %p · %b %d, %Y')
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                "💎 <b>MSA NODE BOT 4: ONLINE</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "🟢 <b>Status:</b> OPERATIONAL\n"
+                f"🕐 <b>Booted:</b> {boot_time}\n\n"
+                "<i>I am awake and ready to serve, Master.</i>",
+                parse_mode="HTML"
+            )
+            print("✅ Online notification sent.")
+        except TelegramRetryAfter as _fl:
+            # Flood ban active — wait it out once, then send
+            logging.info(f"Online notify delayed {_fl.retry_after}s (flood control settling).")
+            await asyncio.sleep(_fl.retry_after + 1)
             try:
-                await asyncio.sleep(6) # 6s delay
-                idx = (idx + 1) % len(states)
-                pulse = states[idx]
-                
-                text = (
+                await bot.send_message(
+                    OWNER_ID,
                     "💎 <b>MSA NODE BOT 4: ONLINE</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "🟢 <b>Status:</b> ALIVE\n"
-                    "🫁 <b>Breath:</b> STABLE\n"
-                    f"{pulse}\n\n"
-                    "<i>I am awake and ready to serve, Master.</i>"
+                    "🟢 <b>Status:</b> OPERATIONAL\n"
+                    f"🕐 <b>Booted:</b> {boot_time}\n\n"
+                    "<i>I am awake and ready to serve, Master.</i>",
+                    parse_mode="HTML"
                 )
-                
-                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML")
-            except Exception as e:
-                await asyncio.sleep(30) # Backoff
+                print("✅ Online notification sent (after flood wait).")
+            except Exception:
+                pass
+        except Exception as e:
+            logging.warning(f"Online notify failed: {e}")
 
-    try: 
-        # 🎥 LIVE ANIMATION (STICKER)
-        # Attempt to send a sticker. If invalid ID, ignores it.
-        try:
-            # Placeholder ID - Replace with valid one if desired
-            # await bot.send_sticker(OWNER_ID, "CAACAgIAAxkBAAEgGqBlz9t6...")
-             pass
-        except: pass 
-
-        # 🧬 "Breathing" Boot Animation Loop
-        boot_msg = await bot.send_message(OWNER_ID, "🔌 **CONNECTING TO NEURAL NET...**")
-        await asyncio.sleep(0.7)
-        
-        await boot_msg.edit_text("🧠 **SYNAPSES: FIRING**")
-        await asyncio.sleep(0.7)
-        
-        await boot_msg.edit_text("🫁 **SYSTEM RESPIRATION: INITIALIZED**")
-        await asyncio.sleep(0.7)
-        
-        await boot_msg.edit_text("💓 **HEARTBEAT: SYNCHRONIZED**")
-        await asyncio.sleep(0.7)
-        
-        await boot_msg.edit_text(
-            "💎 <b>MSA NODE BOT 4: ONLINE</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "🟢 <b>Status:</b> ALIVE\n"
-            "🫁 <b>Breath:</b> STABLE\n"
-            "💓 <b>Pulse:</b> ACTIVE\n\n"
-            "<i>I am awake and ready to serve, Master.</i>", 
-            parse_mode="HTML"
-        )
-        
-        # 🟢 START CONTINUOUS LIFE LOOP
-        asyncio.create_task(heartbeat_animation(OWNER_ID, boot_msg.message_id))
-        
-    except Exception as e:
-        print(f"Startup notify failed: {e}")
+    asyncio.create_task(_send_online_notify())
 
     try:
         # 🔄 Polling Loop (Robust)
@@ -4916,18 +4896,20 @@ async def main():
                 logging.error(f"Polling Network Error: {e}. Retrying in 5s...")
                 await asyncio.sleep(5)
     finally:
-        # 🔴 SHUTDOWN NOTIFICATION
+        # 🔴 Offline notification — one attempt, silent if flood-controlled
+        _off_time = now_local().strftime('%I:%M %p · %b %d, %Y')
         try:
             await bot.send_message(
                 OWNER_ID,
-                f"🔴 **BOT 4 — GOING OFFLINE**\n\n"
-                f"🟠 **Status:** Shutting down\n"
-                f"📅 **Time:** {datetime.now().strftime('%B %d, %Y — %I:%M:%S %p')}\n\n"
-                f"_Bot 4 has stopped. Restart me if needed._",
-                parse_mode="Markdown"
+                "🔴 <b>MSA NODE BOT 4: OFFLINE</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "🟠 <b>Status:</b> SHUTTING DOWN\n"
+                f"🕐 <b>Time:</b> {_off_time}\n\n"
+                "<i>Bot 4 has stopped. Restart me when needed.</i>",
+                parse_mode="HTML"
             )
         except Exception:
-            pass
+            pass  # silent — don't block shutdown
         try:
             await bot.session.close()
         except Exception:
