@@ -57,7 +57,7 @@ if sys.platform == 'win32':
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
- # loads BOT_4_TOKEN, MONGO_URI, OWNER_ID etc.
+# Load environment variables from bot4.env
 
 # Timezone support
 try:
@@ -78,13 +78,93 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import Color, gray, black, HexColor
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, HRFlowable, Table, TableStyle
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+
+# ── Unicode font registration (for ₹, €, £ etc. in PDFs) ──────────────────
+# Try several locations in order; Render (Debian/Ubuntu) ships DejaVuSans.
+_UNICODE_FONT_REGISTERED = False
+_UNICODE_FONT_NAME       = 'Helvetica'      # fallback if no TTF found
+_UNICODE_FONT_BOLD       = 'Helvetica-Bold' # fallback bold
+
+_FONT_CANDIDATES = [
+    # ── PROJECT-BUNDLED DejaVu (works identically on Windows local & Render) ──
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts', 'DejaVuSans.ttf'),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts', 'DejaVuSans-Bold.ttf'),
+    # ── Render / Ubuntu / Debian ──────────────────────────────────────────────
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',
+    # ── NotoSans if installed ─────────────────────────────────────────────────
+    '/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',
+    '/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',
+    # ── macOS ─────────────────────────────────────────────────────────────────
+    '/Library/Fonts/Arial Unicode MS.ttf',
+    '/opt/homebrew/share/fonts/NotoSans-Regular.ttf',
+    # ── Windows fallbacks ─────────────────────────────────────────────────────
+    'C:/Windows/Fonts/Nirmala.ttf',
+    'C:/Windows/Fonts/Nirmalab.ttf',
+    'C:/Windows/Fonts/segoeui.ttf',
+    'C:/Windows/Fonts/segoeuib.ttf',
+    'C:/Windows/Fonts/arial.ttf',
+    'C:/Windows/Fonts/Arial.ttf',
+]
+
+def _register_unicode_font():
+    global _UNICODE_FONT_REGISTERED, _UNICODE_FONT_NAME, _UNICODE_FONT_BOLD
+    if _UNICODE_FONT_REGISTERED:
+        return
+    # Try DejaVu regular + bold
+    reg_path  = None
+    bold_path = None
+    for p in _FONT_CANDIDATES:
+        if os.path.exists(p):
+            name = os.path.basename(p)
+            if 'Bold' in name or 'bold' in name or 'Bd' in name:
+                if bold_path is None:
+                    bold_path = p
+            else:
+                if reg_path is None:
+                    reg_path = p
+        if reg_path and bold_path:
+            break
+    # If Windows Arial found but no DejaVu, use Arial for both
+    if reg_path is None:
+        for p in _FONT_CANDIDATES:
+            if os.path.exists(p) and 'arial' in p.lower():
+                reg_path  = p
+                bold_path = p
+                break
+    try:
+        if reg_path:
+            pdfmetrics.registerFont(TTFont('UniBody',     reg_path))
+            pdfmetrics.registerFont(TTFont('UniBodyBold', bold_path or reg_path))
+            # ── CRITICAL: link regular → bold so <b> tags use DejaVu-Bold not Helvetica-Bold
+            pdfmetrics.registerFontFamily(
+                'UniBody',
+                normal='UniBody',
+                bold='UniBodyBold',
+                italic='UniBody',        # no italic variant — fallback to regular
+                boldItalic='UniBodyBold'
+            )
+            _UNICODE_FONT_NAME = 'UniBody'
+            _UNICODE_FONT_BOLD = 'UniBodyBold'
+            _UNICODE_FONT_REGISTERED = True
+            print(f"✅ PDF Unicode font registered: {os.path.basename(reg_path)}")
+        else:
+            print("⚠️ No Unicode TTF font found — falling back to Helvetica (₹ will show as Rs.)")
+    except Exception as e:
+        print(f"⚠️ Unicode font registration failed: {e} — falling back to Helvetica")
+
+_register_unicode_font()
 
 # ==========================================
 # ⚡ CONFIGURATION
@@ -212,15 +292,15 @@ def connect_db():
     try:
         db_client = pymongo.MongoClient(
             MONGO_URI,
-            serverSelectionTimeoutMS=15000,  # Increased from 5s to 15s
-            maxPoolSize=50,
-            minPoolSize=10,
-            maxIdleTimeMS=60000,  # Increased from 45s to 60s
-            socketTimeoutMS=30000,  # Increased from 20s to 30s
-            connectTimeoutMS=15000,  # Increased from 10s to 15s
-            retryWrites=True,  # Enable automatic retry for write operations
-            retryReads=True   # Enable automatic retry for read operations
-            # Removed socketKeepAlive=True - not a valid pymongo option
+            serverSelectionTimeoutMS=10000,
+            maxPoolSize=10,       # Reduced pool — fewer idle sockets to maintain
+            minPoolSize=1,        # Keep only 1 connection alive when idle
+            maxIdleTimeMS=30000,  # Drop idle connections after 30s
+            socketTimeoutMS=20000,
+            connectTimeoutMS=10000,
+            heartbeatFrequencyMS=60000,  # Check server health every 60s (default 10s) — reduces background noise
+            retryWrites=True,
+            retryReads=True
         )
         db = db_client["MSANodeDB"]
         col_pdfs = db["pdf_library"]
@@ -1002,17 +1082,45 @@ async def merge_script(message: types.Message, state: FSMContext):
 
 async def _safe_send_message(user_id, text, parse_mode="HTML", max_wait=300):
     """
-    Send a message. If flood-controlled, logs and returns None IMMEDIATELY — no waiting, no retry.
-    The `max_wait` param is kept for API compatibility but is no longer used.
+    Send a message, auto-splitting on newline boundaries if > 4096 chars.
+    Telegram's hard limit is 4096 chars per message.
+    Flood control: logs and returns None — no hanging retry.
     """
-    try:
-        return await bot.send_message(user_id, text, parse_mode=parse_mode)
-    except TelegramRetryAfter as e:
-        logging.warning(f"send_message skipped (flood control {e.retry_after}s) to {user_id}")
-        return None
-    except Exception as e:
-        logging.error(f"send_message failed for {user_id}: {e}")
-        return None
+    TG_LIMIT = 4000  # slightly under 4096 for safety
+
+    # Split into chunks if needed
+    if len(text) <= TG_LIMIT:
+        chunks = [text]
+    else:
+        chunks = []
+        current = ""
+        for line in text.splitlines(keepends=True):
+            if len(current) + len(line) > TG_LIMIT:
+                if current:
+                    chunks.append(current)
+                # If a single line is longer than the limit, hard-split it
+                while len(line) > TG_LIMIT:
+                    chunks.append(line[:TG_LIMIT])
+                    line = line[TG_LIMIT:]
+                current = line
+            else:
+                current += line
+        if current:
+            chunks.append(current)
+
+    last = None
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+        try:
+            last = await bot.send_message(user_id, chunk, parse_mode=parse_mode)
+        except TelegramRetryAfter as e:
+            logging.warning(f"send_message skipped (flood control {e.retry_after}s) to {user_id}")
+            return None
+        except Exception as e:
+            logging.error(f"send_message failed for {user_id}: {e}")
+            return None
+    return last
 
 
 async def _safe_send_document(user_id, file, caption, parse_mode="HTML", max_retries=20):
@@ -1035,6 +1143,49 @@ async def _safe_send_document(user_id, file, caption, parse_mode="HTML", max_ret
     raise RuntimeError(f"send_document to {user_id} failed after {max_retries} attempts")
 
 
+def _encrypt_pdf(filepath: str) -> None:
+    """
+    Re-writes the PDF at `filepath` with AES-256 encryption:
+    - User password  = "" (empty) — anyone can OPEN the PDF freely
+    - Owner password = secret    — only owner can change restrictions
+    - Restrictions   : COPY and EXTRACT text disabled
+    Falls back silently if pypdf is unavailable or encryption fails.
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import NameObject
+
+        reader = PdfReader(filepath)
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+
+        # Copy all metadata from source
+        if reader.metadata:
+            writer.add_metadata(dict(reader.metadata))
+
+        # Encrypt: allow_printing=True, allow_copying=False
+        writer.encrypt(
+            user_password="",
+            owner_password="MSANODEVault@2025!",
+            use_128bit=False,   # use AES-256
+            permissions_flag=4,  # 4 = print only; no extract/copy
+        )
+
+        tmp = filepath + ".enc"
+        with open(tmp, "wb") as f:
+            writer.write(f)
+
+        # Atomically replace original
+        os.replace(tmp, filepath)
+        logging.info(f"PDF encrypted (copy-restricted): {filepath}")
+
+    except ImportError:
+        logging.warning("pypdf not available — skipping PDF encryption")
+    except Exception as e:
+        logging.warning(f"PDF encryption failed (PDF still usable): {e}")
+
+
 async def finalize_pdf(user_id, state):
     global DAILY_STATS_BOT4
     data = await state.get_data()
@@ -1044,8 +1195,11 @@ async def finalize_pdf(user_id, state):
 
     filename = f"{code}.pdf"
     try:
-        # Generate PDF (silent — no status messages that could hit flood control)
+        # Generate PDF
         await asyncio.to_thread(create_goldmine_pdf, script, filename)
+
+        # Encrypt: disable copy/extract while keeping PDF freely openable
+        await asyncio.to_thread(_encrypt_pdf, filename)
 
         # Upload to Google Drive
         link = ""
@@ -1561,159 +1715,391 @@ def draw_canvas_extras(canvas_obj, doc):
 
 def process_inline_formatting(text):
     """
-    Process inline formatting markers:
-    - ****** link ****** -> CLICKABLE BLUE LINK
-    - ***** text ***** -> DARK BLACK BOLD ALL CAPS
-    - **** text **** -> BLUE BOLD ALL CAPS
-    - ***text*** -> RED BOLD ALL CAPS
-    - *text* -> DARK BLACK BOLD (no caps)
-    - Normal text -> standard lowercase (no special formatting)
-    """
-    # HIGHEST PRIORITY: Handle ****** link ****** (CLICKABLE LINKS)
-    def create_clickable_link(match):
-        url = match.group(1).strip()  # Extract the URL
-        # Make it a clickable blue link
-        return f'<a href="{url}" color="#1565C0"><u>{url}</u></a>'
-    
-    text = re.sub(r'\*\*\*\*\*\*([^*]+?)\*\*\*\*\*\*', create_clickable_link, text)
-    
-    # Then handle ***** text ***** (DARK BLACK BOLD ALL CAPS)
-    def uppercase_black_5star(match):
-        content = match.group(1).strip().upper()  # Strip spaces and uppercase
-        return f'<font color="#000000"><b>{content}</b></font>'  # Dark black
-    
-    text = re.sub(r'\*\*\*\*\*([^*]+?)\*\*\*\*\*', uppercase_black_5star, text)
+    Process inline formatting markers (ALL CARET-BASED — no asterisks):
 
-    # Then handle **** text **** (BLUE BOLD ALL CAPS)
-    def uppercase_blue(match):
-        content = match.group(1).strip().upper()  # Strip spaces and uppercase
-        return f'<font color="#1565C0"><b>{content}</b></font>'  # Dark blue
-    
-    text = re.sub(r'\*\*\*\*([^*]+?)\*\*\*\*', uppercase_blue, text)
-    
-    # Then handle ***text*** (RED BOLD ALL CAPS)
-    def uppercase_red(match):
-        content = match.group(1).strip().upper()  # Strip spaces and uppercase
-        return f'<font color="#D32F2F"><b>{content}</b></font>'
-    
-    text = re.sub(r'\*\*\*([^*]+?)\*\*\*', uppercase_red, text)
-    
-    # Finally handle *text* (DARK BLACK BOLD, no caps - keep original case)
-    def bold_black_no_caps(match):
-        content = match.group(1).strip()  # Strip spaces but keep original case
+    ^^^^^^url^^^^^^   →  🔵 Clickable Blue Hyperlink
+    ^^^^^TEXT^^^^^   →  ⚫ BLACK · BOLD · CAPS
+    ^^^^TEXT^^^^     →  🔵 BLUE · BOLD · CAPS
+    ^^^TEXT^^^       →  🔴 RED · BOLD · CAPS
+    ^TEXT^           →  ⚫ Bold Black (normal case)
+    """
+    # HIGHEST PRIORITY: Handle ^^^^^^url^^^^^^  (CLICKABLE LINKS)
+    def create_clickable_link(match):
+        url = match.group(1).strip()
+        return f'<a href="{url}" color="#1565C0"><u>{url}</u></a>'
+
+    text = re.sub(r'\^{6}([^^]+?)\^{6}', create_clickable_link, text)
+
+    # ^^^^^TEXT^^^^^  — DARK BLACK BOLD ALL CAPS
+    def uppercase_black_5caret(match):
+        content = match.group(1).strip().upper()
         return f'<font color="#000000"><b>{content}</b></font>'
-    
-    text = re.sub(r'\*([^*]+?)\*', bold_black_no_caps, text)
-    
+
+    text = re.sub(r'\^{5}([^^]+?)\^{5}', uppercase_black_5caret, text)
+
+    # ^^^^TEXT^^^^  — BLUE BOLD ALL CAPS
+    def uppercase_blue(match):
+        content = match.group(1).strip().upper()
+        return f'<font color="#1565C0"><b>{content}</b></font>'
+
+    text = re.sub(r'\^{4}([^^]+?)\^{4}', uppercase_blue, text)
+
+    # ^^^TEXT^^^  — RED BOLD ALL CAPS
+    def uppercase_red(match):
+        content = match.group(1).strip().upper()
+        return f'<font color="#D32F2F"><b>{content}</b></font>'
+
+    text = re.sub(r'\^{3}([^^]+?)\^{3}', uppercase_red, text)
+
+    # ^TEXT^  — DARK BLACK BOLD, normal case
+    def bold_black_no_caps(match):
+        content = match.group(1).strip()
+        return f'<font color="#000000"><b>{content}</b></font>'
+
+    text = re.sub(r'\^([^^]+?)\^', bold_black_no_caps, text)
+
+    return text
+
+
+def _normalize_input_text(text: str) -> str:
+    """
+    Normalise text that was copy-pasted from ChatGPT on mobile.
+    Mobile apps often produce different whitespace, invisible Unicode, or
+    spaced-out asterisk groups compared to the laptop browser.
+    """
+    # 1. Unified line endings
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    # 2. Strip invisible / nuisance Unicode characters
+    #    Zero-width space / joiner / non-joiner, soft-hyphen, BOM
+    for ch in ('\u200b', '\u200c', '\u200d', '\u00ad', '\ufeff'):
+        text = text.replace(ch, '')
+
+    # 3. Non-breaking space and figure space → regular space
+    for ch in ('\u00a0', '\u202f', '\u2009', '\u2007', '\u2060'):
+        text = text.replace(ch, ' ')
+
+    # 4. Fullwidth asterisk (mobile IME) → regular asterisk
+    text = text.replace('\uff0a', '*')
+
+    # 5. Collapse caret groups that have spaces/tabs between them (but NOT newlines)
+    #    e.g.  "^ ^ ^ TEXT ^ ^ ^"  →  "^^^TEXT^^^"
+    #    IMPORTANT: use [^\S\n]* not \s* — \s* would eat newlines between sections,
+    #    merging e.g. "^^^^\n\n\n^^^" (title + blank lines + section) into "^^^^^^^"
+    for carets in range(6, 0, -1):
+        spaced = r'\^' + (r'[^\S\n]*\^' * (carets - 1))
+        clean  = '^' * carets
+        text   = re.sub(spaced, clean, text)
+
+    # 6. Fix extra spaces just inside caret markers
+    text = re.sub(r'\^{1,6} {2,}', lambda m: m.group(0).rstrip(), text)
+    text = re.sub(r' {2,}\^{1,6}', lambda m: m.group(0).lstrip(), text)
+
+    # 7. Excessive blank lines → max 2 consecutive newlines
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
+
+    # 8. Trailing whitespace on each line
+    text = '\n'.join(line.rstrip() for line in text.split('\n'))
+
     return text
 
 
 def create_goldmine_pdf(text, filename):
-    """Creates PDF in S19 professional format"""
-    
-    # Clean text - remove non-ASCII characters
+    """Creates PDF in S19 professional format with full Unicode support (₹, €, £, etc.)"""
+
+    # ── Step 0: Normalise mobile / cross-platform copy-paste artefacts ────────
+    text = _normalize_input_text(text)
+
+    # ── Symbol handling ─────────────────────────────────────────────────────
+    # Strategy: replace each currency symbol with a safe ASCII placeholder FIRST,
+    # run the non-ASCII strip, then restore placeholders.
+
+    # This is needed because the strip would otherwise remove ₹ even from inside
+    # a <font> tag since ₹ itself is non-ASCII.
+    _PLACEHOLDERS = {
+        # ── Currency ──────────────────────────────────
+        '\u20b9': '__RUPEE__',    # ₹
+        '\u20ac': '__EURO__',     # €
+        '\u00a3': '__POUND__',    # £
+        '\u00a5': '__YEN__',      # ¥
+        '\u20bd': '__RUBLE__',    # ₽
+        '\u20bf': '__BITCOIN__',  # ₿
+        '\u00a2': '__CENT__',     # ¢
+        # ── Bullets & Shapes ──────────────────────────
+        '\u2022': '__BULLET__',   # •
+        '\u25cf': '__CIRCLE__',   # ●
+        '\u25cb': '__OCIRCLE__',  # ○
+        '\u25aa': '__SQSMALL__',  # ▪
+        '\u25a0': '__SQUARE__',   # ■
+        '\u25a1': '__OSQUARE__',  # □
+        '\u25b6': '__RTRI__',     # ▶
+        '\u25b8': '__RTRISM__',   # ▸
+        '\u25c6': '__DIAMOND__',  # ◆
+        '\u25c7': '__ODIAMOND__', # ◇
+        # ── Checkmarks & Crosses ──────────────────────
+        '\u2713': '__CHECK__',    # ✓
+        '\u2714': '__CHECKH__',   # ✔
+        '\u2717': '__CROSS__',    # ✗
+        '\u2718': '__CROSSH__',   # ✘
+        # ── Arrows ────────────────────────────────────
+        '\u2192': '__RARROW__',   # →
+        '\u2190': '__LARROW__',   # ←
+        '\u2191': '__UARROW__',   # ↑
+        '\u2193': '__DARROW__',   # ↓
+        '\u2194': '__HARROW__',   # ↔
+        '\u21d2': '__DARROW2__',  # ⇒
+        '\u21d0': '__DLARROW__',  # ⇐
+        '\u21d4': '__DDARROW__',  # ⇔
+        # ── Stars ─────────────────────────────────────
+        '\u2605': '__STAR__',     # ★
+        '\u2606': '__OSTAR__',    # ☆
+        # ── Math ──────────────────────────────────────
+        '\u2248': '__APPROX__',   # ≈
+        '\u2260': '__NEQUAL__',   # ≠
+        '\u2264': '__LTEQ__',     # ≤
+        '\u2265': '__GTEQ__',     # ≥
+        '\u221a': '__SQRT__',     # √
+        '\u2211': '__SUM__',      # ∑
+        '\u03c0': '__PI__',       # π
+        '\u03b1': '__ALPHA__',    # α
+        '\u03b2': '__BETA__',     # β
+        '\u03b4': '__DELTA__',    # δ
+        '\u03bc': '__MU__',       # μ
+        '\u00b5': '__MICRO__',    # µ
+        '\u00b2': '__SUP2__',     # ²
+        '\u00b3': '__SUP3__',     # ³
+        '\u00b9': '__SUP1__',     # ¹
+        # ── Typography & Symbols ──────────────────────
+        '\u00a7': '__SECTION__',  # §
+        '\u2116': '__NUMERO__',   # №
+        '\u2020': '__DAGGER__',   # †
+        '\u2021': '__DDAGGER__',  # ‡
+        '\u00b6': '__PILCROW__',  # ¶
+        '\u00a9': '__COPY__',     # ©
+        '\u00ae': '__REG__',      # ®
+        '\u2122': '__TM__',       # ™
+    }
+    _ASCII_FALLBACK = {
+        # Punctuation / quotes (replace with clean ASCII)
+        '\u2026': '...', '\u2013': '-',  '\u2014': '--',
+        '\u2018': "'",   '\u2019': "'",  '\u201c': '"', '\u201d': '"',
+        # Math operators already covered by placeholders above
+        '\u00d7': 'x',   '\u00f7': '/',
+        '\u00bd': '1/2', '\u00bc': '1/4', '\u00be': '3/4',
+        '\u00b0': 'deg', '\u00b1': '+/-', '\u221e': 'inf',
+    }
+
+    # Step 1 — swap currency symbols with ASCII placeholders (survives strip)
+    for sym, placeholder in _PLACEHOLDERS.items():
+        text = text.replace(sym, placeholder)
+
+    # Step 2 — convert other common non-ASCII to readable ASCII
+    for sym, asc in _ASCII_FALLBACK.items():
+        if sym not in _PLACEHOLDERS:
+            text = text.replace(sym, asc)
+
+    # Step 3 — strip any remaining non-ASCII characters
     text = re.compile(r'[^\x00-\x7F]+').sub('', text)
+
+    # Step 4 — restore placeholders: real symbol inside font tag, or ASCII fallback
+    def _U(c): return f'<font name="UniBody">{c}</font>'
+    _PLACEHOLDER_RESTORE_UNICODE = {
+        # Currency
+        '__RUPEE__':   _U('\u20b9'), '__EURO__':    _U('\u20ac'),
+        '__POUND__':   _U('\u00a3'), '__YEN__':     _U('\u00a5'),
+        '__RUBLE__':   _U('\u20bd'), '__BITCOIN__': _U('\u20bf'),
+        '__CENT__':    _U('\u00a2'),
+        # Bullets & Shapes
+        '__BULLET__':  _U('\u2022'), '__CIRCLE__':  _U('\u25cf'),
+        '__OCIRCLE__': _U('\u25cb'), '__SQSMALL__': _U('\u25aa'),
+        '__SQUARE__':  _U('\u25a0'), '__OSQUARE__': _U('\u25a1'),
+        '__RTRI__':    _U('\u25b6'), '__RTRISM__':  _U('\u25b8'),
+        '__DIAMOND__': _U('\u25c6'), '__ODIAMOND__':_U('\u25c7'),
+        # Checkmarks & Crosses
+        '__CHECK__':   _U('\u2713'), '__CHECKH__':  _U('\u2714'),
+        '__CROSS__':   _U('\u2717'), '__CROSSH__':  _U('\u2718'),
+        # Arrows
+        '__RARROW__':  _U('\u2192'), '__LARROW__':  _U('\u2190'),
+        '__UARROW__':  _U('\u2191'), '__DARROW__':  _U('\u2193'),
+        '__HARROW__':  _U('\u2194'), '__DARROW2__': _U('\u21d2'),
+        '__DLARROW__': _U('\u21d0'), '__DDARROW__': _U('\u21d4'),
+        # Stars
+        '__STAR__':    _U('\u2605'), '__OSTAR__':   _U('\u2606'),
+        # Math
+        '__APPROX__':  _U('\u2248'), '__NEQUAL__':  _U('\u2260'),
+        '__LTEQ__':    _U('\u2264'), '__GTEQ__':    _U('\u2265'),
+        '__SQRT__':    _U('\u221a'), '__SUM__':     _U('\u2211'),
+        '__PI__':      _U('\u03c0'), '__ALPHA__':   _U('\u03b1'),
+        '__BETA__':    _U('\u03b2'), '__DELTA__':   _U('\u03b4'),
+        '__MU__':      _U('\u03bc'), '__MICRO__':   _U('\u00b5'),
+        '__SUP2__':    _U('\u00b2'), '__SUP3__':    _U('\u00b3'),
+        '__SUP1__':    _U('\u00b9'),
+        # Typography
+        '__SECTION__': _U('\u00a7'), '__NUMERO__':  _U('\u2116'),
+        '__DAGGER__':  _U('\u2020'), '__DDAGGER__': _U('\u2021'),
+        '__PILCROW__': _U('\u00b6'), '__COPY__':    _U('\u00a9'),
+        '__REG__':     _U('\u00ae'), '__TM__':      _U('\u2122'),
+        # Punctuation / Quotes
+        '__ELLIPSIS__': _U('\u2026'), '__ENDASH__': _U('\u2013'),
+        '__EMDASH__': _U('\u2014'),   '__LSQUOTE__': _U('\u2018'),
+        '__RSQUOTE__': _U('\u2019'),  '__LDQUOTE__': _U('\u201c'),
+        '__RDQUOTE__': _U('\u201d'),
+        # Math Operators
+        '__MULTIPLY__': _U('\u00d7'), '__DIVIDE__': _U('\u00f7'),
+        '__HALF__': _U('\u00bd'),     '__QUARTER__': _U('\u00bc'),
+        '__THREEQUARTERS__': _U('\u00be'),
+        '__DEGREE__': _U('\u00b0'),   '__PLUSMINUS__': _U('\u00b1'),
+        '__INFINITY__': _U('\u221e'),
+    }
+    _PLACEHOLDER_RESTORE_ASCII = {
+        # Currency
+        '__RUPEE__': 'Rs.',   '__EURO__': 'EUR',   '__POUND__': 'GBP',
+        '__YEN__': 'JPY',     '__RUBLE__': 'RUB',  '__BITCOIN__': 'BTC',
+        '__CENT__': 'c',
+        # Bullets & Shapes
+        '__BULLET__': '-',    '__CIRCLE__': 'o',   '__OCIRCLE__': 'o',
+        '__SQSMALL__': '-',   '__SQUARE__': '#',   '__OSQUARE__': '#',
+        '__RTRI__': '>',      '__RTRISM__': '>',
+        '__DIAMOND__': '<>',  '__ODIAMOND__': '<>',
+        # Checkmarks & Crosses
+        '__CHECK__': '(ok)',  '__CHECKH__': '(ok)',
+        '__CROSS__': '(x)',   '__CROSSH__': '(x)',
+        # Arrows
+        '__RARROW__': '->',   '__LARROW__': '<-',
+        '__UARROW__': '^',    '__DARROW__': 'v',
+        '__HARROW__': '<->',  '__DARROW2__': '=>',
+        '__DLARROW__': '<=',  '__DDARROW__': '<=>',
+        # Stars
+        '__STAR__': '*',      '__OSTAR__': '*',
+        # Math
+        '__APPROX__': '~=',   '__NEQUAL__': '!=',
+        '__LTEQ__': '<=',     '__GTEQ__': '>=',
+        '__SQRT__': 'sqrt',   '__SUM__': 'sum',
+        '__PI__': 'pi',       '__ALPHA__': 'alpha',
+        '__BETA__': 'beta',   '__DELTA__': 'delta',
+        '__MU__': 'mu',       '__MICRO__': 'u',
+        '__SUP2__': '^2',     '__SUP3__': '^3',    '__SUP1__': '^1',
+        # Typography
+        '__SECTION__': 'S.',  '__NUMERO__': 'No.',
+        '__DAGGER__': '+',    '__DDAGGER__': '++',
+        '__PILCROW__': 'P',   '__COPY__': '(c)',
+        '__REG__': '(R)',     '__TM__': '(TM)',
+        # Punctuation / Quotes
+        '__ELLIPSIS__': '...', '__ENDASH__': '-', '__EMDASH__': '--',
+        '__LSQUOTE__': "'",    '__RSQUOTE__': "'", '__LDQUOTE__': '"',
+        '__RDQUOTE__': '"',
+        # Math Operators
+        '__MULTIPLY__': 'x',   '__DIVIDE__': '/',
+        '__HALF__': '1/2',     '__QUARTER__': '1/4',
+        '__THREEQUARTERS__': '3/4',
+        '__DEGREE__': 'deg',   '__PLUSMINUS__': '+/-',
+        '__INFINITY__': 'inf',
+    }
+    restore_map = _PLACEHOLDER_RESTORE_UNICODE if _UNICODE_FONT_REGISTERED else _PLACEHOLDER_RESTORE_ASCII
+    for placeholder, display in restore_map.items():
+        text = text.replace(placeholder, display)
     
-    # Remove line separator graphics (______________ style lines)
+    # ── Remove line separator graphics and clean whitespace ─────────────────
     text = re.sub(r'_{20,}', '', text)
-    
-    # Clean up excessive newlines but keep intentional breaks
     text = re.sub(r'\n{4,}', '\n\n', text)
-    
-    # CRITICAL FIX: Merge Roman numerals with their titles if split across lines
-    # This fixes "I.\n THE OPPORTUNITY" -> "I. THE OPPORTUNITY"
     text = re.sub(r'(^|\n)(I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII)\.\s*\n\s*', r'\1\2. ', text, flags=re.MULTILINE)
-    
+
     # Setup document
     doc = SimpleDocTemplate(
-        filename, 
+        filename,
         pagesize=letter,
         leftMargin=0.75*inch,
         rightMargin=0.75*inch,
         topMargin=0.75*inch,
         bottomMargin=0.75*inch
     )
-    
-    # Define styles matching S19.pdf
+    # ── Enhancement 4: PDF Metadata ──────────────────────────
+    _code_from_file = os.path.splitext(os.path.basename(filename))[0]
+    doc.title   = f'MSANode Blueprint — {_code_from_file}'
+    doc.author  = 'MSA NODE SYSTEMS'
+    doc.subject = 'Digital Asset Blueprint'
+    doc.creator = 'MSA NODE Bot 4'
+
+    # ── Enhancement 2: Font-aware locals (DejaVu when registered, Helvetica fallback)
+    _BDYF  = _UNICODE_FONT_NAME   # e.g. 'DejaVuSans' or 'Helvetica'
+    _BDYFB = _UNICODE_FONT_BOLD   # e.g. 'DejaVuSans-Bold' or 'Helvetica-Bold'
+
+    # Header style — white text for navy band
     styles = getSampleStyleSheet()
-    
-    # Header style (MSANODE VAULT BLUEPRINT) - Dark Black and Underlined
     styles.add(ParagraphStyle(
         name='MSAHeader',
         parent=styles['Normal'],
-        fontName='Helvetica-Bold',
-        fontSize=16,
+        fontName=_BDYFB,
+        fontSize=15,
         leading=20,
-        textColor=HexColor('#000000'),  # Dark black color
+        textColor=HexColor('#FFFFFF'),
         alignment=TA_CENTER,
-        spaceAfter=6,
-        underlineWidth=1,
-        underlineColor=HexColor('#000000')
+        spaceAfter=0,
     ))
-    
-    # Main Title style (for the very first line)
+
+    # Main Title style (for the very first line of input)
     styles.add(ParagraphStyle(
         name='MainTitle',
         parent=styles['Normal'],
-        fontName='Helvetica-Bold',
+        fontName=_BDYFB,
         fontSize=11,
-        leading=14,
+        leading=15,
         textColor=black,
         alignment=TA_LEFT,
         spaceAfter=12
     ))
-    
-    # Section Header (I, II, III, etc.) - Keep Roman numeral with title on SAME line - RED COLOR
+
+    # Section Header — deep red, bold
     styles.add(ParagraphStyle(
         name='SectionHeader',
         parent=styles['Normal'],
-        fontName='Helvetica-Bold',
+        fontName=_BDYFB,
         fontSize=12,
         leading=16,
-        textColor=HexColor('#D32F2F'),  # Vibrant red for Roman numerals
+        textColor=HexColor('#C62828'),
         alignment=TA_LEFT,
-        spaceAfter=10,
-        spaceBefore=14
+        spaceAfter=4,
+        spaceBefore=16
     ))
-    
-    # Subsection with parentheses - Medium gray
+
+    # Subsection with parentheses
     styles.add(ParagraphStyle(
         name='ParenSubsection',
         parent=styles['Normal'],
-        fontName='Helvetica-Bold',
+        fontName=_BDYFB,
         fontSize=10,
         leading=13,
-        textColor=HexColor('#404040'),  # Medium gray for subsections
+        textColor=HexColor('#404040'),
         alignment=TA_LEFT,
         spaceAfter=6,
         spaceBefore=6
     ))
-    
-    # Subsection (The, Core, etc.) - Medium gray
+
+    # Subsection (The, Core, etc.)
     styles.add(ParagraphStyle(
         name='Subsection',
         parent=styles['Normal'],
-        fontName='Helvetica-Bold',
+        fontName=_BDYFB,
         fontSize=10,
         leading=13,
-        textColor=HexColor('#404040'),  # Medium gray for subsections
+        textColor=HexColor('#404040'),
         alignment=TA_LEFT,
         spaceAfter=6,
         spaceBefore=8
     ))
-    
-    # Body text - LIGHT GRAY - JUSTIFIED
+
+    # Body text — justified, DejaVu when available
     styles.add(ParagraphStyle(
         name='Body',
         parent=styles['Normal'],
-        fontName='Helvetica',
+        fontName=_BDYF,
         fontSize=10,
-        leading=14,
-        textColor=HexColor('#333333'),  # Light gray for body text
+        leading=15,
+        textColor=HexColor('#2C2C2C'),
         alignment=TA_JUSTIFY,
         spaceAfter=8
     ))
-    
+
     # Code/Formula Box style
     styles.add(ParagraphStyle(
         name='CodeBox',
@@ -1732,51 +2118,132 @@ def create_goldmine_pdf(text, filename):
         leftIndent=6,
         rightIndent=6
     ))
-    
-    # All-caps header style - DARK BLACK
+
+    # All-caps header style — dark black, bold
     styles.add(ParagraphStyle(
         name='AllCapsHeader',
         parent=styles['Normal'],
-        fontName='Helvetica-Bold',
+        fontName=_BDYFB,
         fontSize=11,
         leading=14,
-        textColor=HexColor('#000000'),  # Dark black for all-caps
+        textColor=HexColor('#000000'),
         alignment=TA_LEFT,
         spaceAfter=10,
         spaceBefore=10
     ))
-    
+
+    # Bullet point style — indented, dark bullet symbol, DejaVu aware
+    styles.add(ParagraphStyle(
+        name='BulletBody',
+        parent=styles['Normal'],
+        fontName=_BDYF,
+        fontSize=10,
+        leading=14,
+        textColor=HexColor('#2C2C2C'),
+        alignment=TA_LEFT,
+        spaceAfter=3,
+        spaceBefore=1,
+        leftIndent=12,
+        firstLineIndent=-12,
+    ))
+
+    # ── Bullet-line helpers ─────────────────────────────────────────────────
+    # Raw bullet chars (before or after restoration in ASCII mode)
+    _BULLET_CHARS = (
+        '\u2022', '\u25cf', '\u25cb', '\u25aa', '\u25a0', '\u25a1',
+        '\u25b6', '\u25b8', '\u25c6', '\u25c7', '\u2713', '\u2714',
+        '\u2717', '\u2718', '\u2192', '\u2190', '\u2191', '\u2193',
+        '\u2605', '\u2606', '-',
+    )
+    # Regex: matches a leading <font ...>CHAR</font> block OR a raw bullet char
+    _BULLET_RE = re.compile(
+        r'^(?:<font[^>]*>[^<]+</font>|[' +
+        re.escape(''.join(_BULLET_CHARS)) +
+        r'])'
+    )
+
+    def _is_bullet_line(ln):
+        """Return True if the line starts with any bullet/shape/dash symbol."""
+        return bool(_BULLET_RE.match(ln))
+
+    def _darken_bullet(ln):
+        """Wrap leading bullet symbol (raw or font-tagged) in bold dark black."""
+        # Case 1: line starts with a <font ...>SYM</font> tag
+        font_match = re.match(r'^(<font[^>]*>[^<]+</font>)(.*)', ln, re.DOTALL)
+        if font_match:
+            sym_tag, rest = font_match.group(1), font_match.group(2)
+            return f'<font color="#000000"><b>{sym_tag}</b></font>{rest}'
+        # Case 2: line starts with a raw bullet char
+        return f'<font color="#000000"><b>{ln[0]}</b></font>{ln[1:]}'
+
     # Build story
     story = []
     
     # Add header (MSANODE VAULT BLUEPRINT) - Underlined
-    story.append(Paragraph("<u>MSANODE VAULT BLUEPRINT</u>", styles['MSAHeader']))
-    story.append(Spacer(1, 0.1*inch))
+    # ── Enhancement 1: Navy header band ─────────────────────────────
+    _hdr_para = Paragraph('MSANODE VAULT BLUEPRINT', styles['MSAHeader'])
+    _hdr_table = Table([[_hdr_para]], colWidths=[doc.width])
+    _hdr_table.setStyle(TableStyle([
+        ('BACKGROUND',  (0, 0), (-1, -1), HexColor('#0D1B2A')),  # deep navy
+        ('TOPPADDING',  (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING',(0, 0), (-1, -1), 12),
+        ('LEFTPADDING', (0, 0), (-1, -1), 14),
+        ('RIGHTPADDING',(0, 0), (-1, -1), 14),
+        ('ALIGN',       (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN',      (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    story.append(_hdr_table)
+    story.append(Spacer(1, 0.12*inch))
     
     # Parse and format content
     lines = text.split('\n')
-    
+
     # Track if we've added the main title
     main_title_added = False
-    
+
+    # Helper: strip leading/trailing caret markers to get inner text for detection
+    def _bare(ln):
+        return re.sub(r'^\^{1,6}\s*|\s*\^{1,6}$', '', ln).strip()
+
+    _ROMAN_RE = re.compile(
+        r'^(I{1,3}|IV|VI{0,3}|IX|XI{0,3}|XII)\.\s+', re.IGNORECASE
+    )
+
+    _blank_count = 0   # blank-line counter (kept for future use)
+
     for line in lines:
         line = line.strip()
+
+        # Blank lines are skipped — section spacing handled by spaceBefore (auto-suppressed
+        # at page top by ReportLab, so no extra gap when sections start a new page)
         if not line:
+            _blank_count += 1
             continue
-        
+
+        _blank_count = 0
+
+        bare = _bare(line)  # inner text with caret markers removed
+
         # First substantive line is the main title
-        if not main_title_added and len(line) > 20:
+        if not main_title_added and len(bare) > 20:
             story.append(Paragraph(process_inline_formatting(line), styles['MainTitle']))
+            story.append(Spacer(1, 0.08*inch))  # balanced gap after title
             main_title_added = True
             continue
-        
-        # CRITICAL FIX: Roman numerals sections - keep numeral AND title together
-        # Matches "I. THE OPPORTUNITY" or "VII. FINAL WORD" etc.
-        # Display in BOLD, ALL CAPS, RED
-        if re.match(r'^(I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII)\.\s+', line):
-            story.append(Spacer(1, 0.08*inch))
-            # Convert to uppercase and bold for premium red appearance
-            story.append(Paragraph(process_inline_formatting(f"<b>{line.upper()}</b>"), styles['SectionHeader']))
+
+        # Section headers: Roman numeral OR any ^^^TEXT^^^ (3-caret) wrapped line
+        # ^^^..^^^ = red bold caps (process_inline_formatting) + HR rule underneath
+        _is_3caret = bool(re.match(r'^\^{3}(?!\^)', line))
+        if _ROMAN_RE.match(bare) or _is_3caret:
+            # Use bare text (carets stripped) so no carets appear in the output
+            story.append(Paragraph(
+                process_inline_formatting(f'<b>{bare.upper()}</b>'),
+                styles['SectionHeader']
+            ))
+            story.append(HRFlowable(
+                width='100%', thickness=0.75,
+                color=HexColor('#C62828'), spaceAfter=6, spaceBefore=0
+            ))
             continue
         
         # Parentheses subsections like (The Managerial Mindset) or (Precision Engineering)
@@ -1804,14 +2271,15 @@ def create_goldmine_pdf(text, filename):
             story.append(Paragraph(process_inline_formatting(f"<b>{line}</b>"), styles['Subsection']))
             continue
         
-        # All caps section dividers (but not too long to avoid body text in caps) - DARK BLACK
-        if line.isupper() and 5 < len(line) < 100:
+        # All caps section dividers — check BARE text (strip carets first)
+        # so ^WORD^ or ^^^^CAPS^^^^ lines don't get caught here instead of Body
+        if bare.isupper() and 5 < len(bare) < 100:
             story.append(Paragraph(process_inline_formatting(f"<b>{line}</b>"), styles['AllCapsHeader']))
             continue
         
-        # Bullet points or dashes
-        if line.startswith('-') or line.startswith('•'):
-            story.append(Paragraph(process_inline_formatting(line), styles['Body']))
+        # Bullet points or dashes — auto-darken the leading symbol
+        if _is_bullet_line(line):
+            story.append(Paragraph(_darken_bullet(process_inline_formatting(line)), styles['BulletBody']))
             continue
         
         # Regular body text - split into chunks if extremely long
@@ -1842,10 +2310,16 @@ def get_drive_service():
                 CREDENTIALS_FILE,
                 ['https://www.googleapis.com/auth/drive.file']
             )
-            creds = flow.run_local_server(port=8080)
+            # Use a random free port — port 8080 is taken by the health server on Render
+            import socket as _socket
+            with _socket.socket() as _s:
+                _s.bind(('', 0))
+                _free_port = _s.getsockname()[1]
+            creds = flow.run_local_server(port=_free_port, open_browser=True)
         with open(TOKEN_FILE, 'wb') as t:
             pickle.dump(creds, t)
-    return build('drive', 'v3', credentials=creds)
+    # cache_discovery=False silences: "file_cache is only supported with oauth2client<4.0.0"
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 
 def _ensure_drive_folder(service, folder_name, parent_id=None):
@@ -4326,11 +4800,11 @@ _ELITE_GUIDE_PAGES = [
         "  ⑤ Bot renders the PDF using ReportLab + Google Drive\n"
         "  ⑥ Drive link saved to MongoDB, bound to your code ✅\n\n"
         "<b>📐 FORMATTING SYNTAX CODES:</b>\n"
-        "  <code>******url******</code>  →  🔵 Clickable Blue Hyperlink\n"
-        "  <code>*****TEXT*****</code>  →  ⚫ BLACK · BOLD · CAPS\n"
-        "  <code>****TEXT****</code>   →  🔵 BLUE · BOLD · CAPS\n"
-        "  <code>***TEXT***</code>    →  🔴 RED · BOLD · CAPS\n"
-        "  <code>*TEXT*</code>        →  ⚫ Bold Black (normal case)\n"
+        "  <code>^^^^^^url^^^^^^</code>  →  🔵 Clickable Blue Hyperlink\n"
+        "  <code>^^^^^TEXT^^^^^</code>  →  ⚫ BLACK · BOLD · CAPS\n"
+        "  <code>^^^^TEXT^^^^</code>   →  🔵 BLUE · BOLD · CAPS\n"
+        "  <code>^^^TEXT^^^</code>    →  🔴 RED · BOLD · CAPS\n"
+        "  <code>^TEXT^</code>        →  ⚫ Bold Black (normal case)\n"
         "  <code>I. Title</code>      →  🔴 Auto Red Section Header\n"
         "  <code>II. Title</code>     →  🔴 Auto Red Section Header\n\n"
         "<b>⚠️ Rules & Notes:</b>\n"
@@ -5089,3 +5563,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Bot 4 Shutdown.")
+ 
