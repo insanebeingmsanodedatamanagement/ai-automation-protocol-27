@@ -9,6 +9,7 @@ import re
 import threading
 import traceback
 from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 import shutil
 import base64
 import json
@@ -56,6 +57,8 @@ if sys.platform == 'win32':
 # Redirect Streams
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
+
+# Load environment variables from bot4.env
 
 # Timezone support
 try:
@@ -273,17 +276,35 @@ OWNER_TRANSFER_PW = os.getenv("OWNER_TRANSFER_PW", "")  # Set OWNER_TRANSFER_PW 
 
 ADMIN_PAGE_SIZE = 10  # Admins per page in paginated lists
 
+# ==========================================
+# 🌐 WEBHOOK CONFIGURATION
+# ==========================================
+_WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+_WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+_WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
+
 async def handle_health(request):
     return web.Response(text="CORE 4 (PDF INFRASTRUCTURE) IS ACTIVE")
 
-def run_health_server():
-    try:
-        app = web.Application()
-        app.router.add_get('/', handle_health)
-        port = int(os.environ.get("PORT", 10004))
-        web.run_app(app, host='0.0.0.0', port=port, handle_signals=False)
-    except Exception as e:
-        print(f"📡 Health Server Note: {e}")
+async def start_web_server(dp_ref, bot_ref):
+    """Start aiohttp server with health check + optional webhook route."""
+    app = web.Application()
+    app.router.add_get('/', handle_health)
+    app.router.add_get('/health', handle_health)
+
+    if _WEBHOOK_URL:
+        # Register Telegram webhook route
+        SimpleRequestHandler(dispatcher=dp_ref, bot=bot_ref).register(app, path=_WEBHOOK_PATH)
+        setup_application(app, dp_ref, bot=bot_ref)
+        print(f"✅ Webhook route registered: {_WEBHOOK_PATH}")
+
+    port = int(os.environ.get("PORT", 10004))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Web server running on port {port}")
+    return runner
 
 def connect_db():
     global col_pdfs, col_trash, col_locked, col_trash_locked, col_admins, col_banned, col_bot4_state, db_client
@@ -5544,20 +5565,34 @@ async def main():
             logging.warning(f"Online notify attempt {_attempt + 1} failed: {_e}")
             await asyncio.sleep(2)
 
-    # ── 5. Polling loop (auto-restarts on transient network errors) ──────────
+    # ── 5. Start web server + webhook or polling ─────────────────────────────
+    web_runner = None
     try:
-        while True:
-            try:
-                await dp.start_polling(bot, skip_updates=True)
-                print("⚠️ Polling loop returned. Restarting in 5s...")
-                await asyncio.sleep(5)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logging.error(f"Polling Network Error: {e}. Retrying in 5s...")
-                await asyncio.sleep(5)
-
+        if _WEBHOOK_URL:
+            # ── WEBHOOK MODE (production) ────────────────────────────────────
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.set_webhook(_WEBHOOK_URL)
+            print(f"✅ Webhook set: {_WEBHOOK_URL}")
+            web_runner = await start_web_server(dp, bot)
+            # Stay alive — aiohttp handles incoming Telegram updates
+            await asyncio.Event().wait()
+        else:
+            # ── POLLING MODE (local dev fallback) ────────────────────────────
+            print("ℹ️ No RENDER_EXTERNAL_URL — using polling (local dev mode)")
+            web_runner = await start_web_server(dp, bot)
+            while True:
+                try:
+                    await dp.start_polling(bot, skip_updates=True)
+                    print("⚠️ Polling loop returned. Restarting in 5s...")
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.error(f"Polling Network Error: {e}. Retrying in 5s...")
+                    await asyncio.sleep(5)
     finally:
+        if web_runner:
+            await web_runner.cleanup()
         # ── 6. OFFLINE notification (awaited in finally — fires before loop closes) ──
         _off_time = now_local().strftime('%I:%M %p · %b %d, %Y')
         _offline_msg = (
