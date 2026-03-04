@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 from aiohttp import web
 import html as _html
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
@@ -45,6 +46,13 @@ OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
 # Global variable for health server cleanup
 health_server_runner = None
+
+# ==========================================
+# 🌐 WEBHOOK CONFIGURATION
+# ==========================================
+_WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+_WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+_WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
 
 # Database Configuration
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "MSANodeDB")
@@ -8314,25 +8322,31 @@ async def debug_catch_all(message: types.Message):
     await message.answer(f"⚠️ Unhandled command: {message.text}\nPlease run /start to update your menu.")
 
 async def start_health_server():
-    """Start health check web server for Render/Railway/Fly.io"""
+    """Start health check web server for Render/Railway + optional webhook"""
     global health_server_runner
     try:
         app = web.Application()
         app.router.add_get('/health', health_check_endpoint)
         app.router.add_get('/', health_check_endpoint)  # Root also works
-        
+
+        if _WEBHOOK_URL:
+            # Register Telegram webhook route onto the same aiohttp app
+            SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=_WEBHOOK_PATH)
+            setup_application(app, dp, bot=bot)
+            logger.info(f"✅ Webhook route registered: {_WEBHOOK_PATH}")
+
         runner = web.AppRunner(app)
         await runner.setup()
         health_server_runner = runner  # Store for cleanup
-        
+
         # Use PORT from environment (Render/Railway provide this)
         port = int(os.environ.get('PORT', 8080))
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        
-        logger.info(f"✅ Health check server started on port {port}")
+
+        logger.info(f"✅ Web server started on port {port}")
         print(f"  ✅ Health endpoint: http://0.0.0.0:{port}/health")
-        
+
     except Exception as e:
         logger.error(f"Failed to start health server: {e}")
         print(f"  ⚠️ Health server failed: {e}")
@@ -8451,9 +8465,20 @@ async def main():
     print("✅ BOT 9 IS NOW ONLINE AND READY!")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
     
-    # Start bot polling (THIS IS CRITICAL - without this, bot won't respond to messages)
+    # Start bot (webhook or polling)
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        if _WEBHOOK_URL:
+            # ── WEBHOOK MODE (production) ───────────────────────────────────
+            logger.info("🔄 Starting in WEBHOOK mode...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.set_webhook(_WEBHOOK_URL)
+            logger.info(f"✅ Webhook set: {_WEBHOOK_URL}")
+            # Health server (with webhook route) started above via create_task
+            await asyncio.Event().wait()
+        else:
+            # ── POLLING MODE (local dev fallback) ──────────────────────────
+            logger.info("ℹ️ No RENDER_EXTERNAL_URL — using polling (local dev mode)")
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         # Cleanup on shutdown
         await cleanup_on_shutdown()
