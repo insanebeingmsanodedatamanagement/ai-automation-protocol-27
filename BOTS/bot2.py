@@ -16,6 +16,7 @@ from bson.objectid import ObjectId
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
 from aiogram.exceptions import TelegramNetworkError, TelegramServerError
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # Fix Windows console encoding for emojis
 if sys.platform == 'win32':
@@ -68,7 +69,6 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     # If we get here, all retries failed
     raise last_exception
 
-# Load environment variables
 BOT_TOKEN = os.getenv("BOT_10_TOKEN")
 BOT_8_TOKEN = os.getenv("BOT_8_TOKEN")  # Bot 8 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -82,6 +82,13 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "MSANodeDB")  # MongoDB database name
 REVIEW_LOG_CHANNEL = int(os.getenv("REVIEW_LOG_CHANNEL", 0))  # Support ticket channel
 # Render web-service health check port (Render sets PORT automatically)
 PORT = int(os.getenv("PORT", 8090))
+
+# ==========================================
+# 🌐 WEBHOOK CONFIGURATION
+# ==========================================
+_WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+_WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+_WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
 
 # Validate critical config at startup
 if not BOT_TOKEN:
@@ -11787,23 +11794,25 @@ async def _health_handler_bot10(request: aiohttp_web.Request) -> aiohttp_web.Res
 
 
 async def start_health_server_bot10():
-    """Start the lightweight aiohttp web server for Render health checks.
-
-    Only starts when PORT is explicitly set in the environment (i.e. running on
-    Render).  On local dev the env var is absent so we skip binding entirely,
-    avoiding WinError 10048 / EADDRINUSE clashes.
-    """
+    """Start the lightweight aiohttp web server for Render health checks + webhook."""
     if "PORT" not in os.environ:
         print("🌐 Health server skipped (PORT not set — local dev mode)")
         return None
     app = aiohttp_web.Application()
     app.router.add_get("/health", _health_handler_bot10)
     app.router.add_get("/", _health_handler_bot10)  # Render also checks root
+
+    if _WEBHOOK_URL:
+        # Register Telegram webhook route onto the same aiohttp app
+        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=_WEBHOOK_PATH)
+        setup_application(app, dp, bot=bot)
+        print(f"✅ Webhook route registered: {_WEBHOOK_PATH}")
+
     runner = aiohttp_web.AppRunner(app)
     await runner.setup()
     site = aiohttp_web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"🌐 Health check server listening on port {PORT}")
+    print(f"🌐 Web server running on port {PORT}")
     return runner
 
 
@@ -11907,9 +11916,20 @@ async def main():
         except Exception as e:
             print(f"⚠️ Broadcast reindex on startup failed: {e}")
 
-        # ── 7. Start polling ──
-        print("\n✅ All systems started — beginning polling...\n")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        # ── 7. Start webhook or polling ──────────────────────────────────────────
+        print("\n✅ All systems started...\n")
+        if _WEBHOOK_URL:
+            # ── WEBHOOK MODE (production) ───────────────────────────────────
+            print("🔄 Starting in WEBHOOK mode...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.set_webhook(_WEBHOOK_URL)
+            print(f"✅ Webhook set: {_WEBHOOK_URL}")
+            # Webhook handler registered in start_health_server_bot10()
+            await asyncio.Event().wait()
+        else:
+            # ── POLLING MODE (local dev fallback) ───────────────────────────
+            print("ℹ️ No RENDER_EXTERNAL_URL — using polling (local dev mode)")
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
     except Exception as e:
         print(f"❌ FATAL ERROR during startup: {e}")
