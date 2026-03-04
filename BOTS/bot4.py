@@ -57,8 +57,6 @@ if sys.platform == 'win32':
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
-# Load environment variables from bot4.env
-
 # Timezone support
 try:
     import pytz as _pytz
@@ -601,6 +599,14 @@ def generate_progress_bar(percentage):
     filled_length = int(percentage // 10)
     bar = "▓" * filled_length + "░" * (10 - filled_length)
     return f"|{bar}| {percentage:.1f}%"
+
+
+def _natural_sort_key(doc):
+    """Natural sort key: splits code into text/number parts so PF9 < PF10 < PF11."""
+    import re
+    code = doc.get('code', '') or ''
+    return [int(part) if part.isdigit() else part.upper()
+            for part in re.split(r'(\d+)', code)]
 
 
 def _get_unique_docs():
@@ -1287,10 +1293,21 @@ async def handle_library_logic(message: types.Message, state: FSMContext):
             await state.update_data(lib_mode="display", page=0)
             await render_library_page(message, state, page=0)
         elif text == "🔍 SEARCH":
-            docs = list(col_pdfs.find().sort("timestamp", 1))  # ascending: #1 = oldest
+            docs = sorted(list(col_pdfs.find()), key=_natural_sort_key)  # natural sort by code
             list_lines = get_formatted_file_list(docs, limit=30)
-            list_text = "\n".join(list_lines)
-            if len(list_text) > 3500: list_text = list_text[:3500] + "\n..."
+            # Truncate at whole-line boundaries to avoid cutting through HTML tags
+            safe_lines = []
+            char_count = 0
+            truncated = False
+            for ln in list_lines:
+                if char_count + len(ln) + 1 > 3400:
+                    truncated = True
+                    break
+                safe_lines.append(ln)
+                char_count += len(ln) + 1
+            list_text = "\n".join(safe_lines)
+            if truncated:
+                list_text += "\n..."
             await message.answer(
                 f"{list_text}\n\n🔍 <b>SEARCH</b>\nEnter a <b>Code</b> (e.g., <code>S19</code>) or <b>Index Number</b>.",
                 reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")], [KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True),
@@ -1313,7 +1330,7 @@ async def handle_library_logic(message: types.Message, state: FSMContext):
 
 async def render_library_page(message, state, page):
     limit = 20
-    docs = list(col_pdfs.find().sort("timestamp", 1))
+    docs = sorted(list(col_pdfs.find()), key=_natural_sort_key)
     total_docs = len(docs)
     max_page = max(0, (total_docs - 1) // limit)
     page = max(0, min(page, max_page))
@@ -1351,7 +1368,7 @@ async def handle_library_search(message: types.Message, state: FSMContext):
     if text == "⬅️ BACK":
         await show_library(message, state)
         return
-    all_docs = list(col_pdfs.find().sort("timestamp", 1))
+    all_docs = sorted(list(col_pdfs.find()), key=_natural_sort_key)  # natural sort = consistent index
     doc = None
     if text.isdigit():
         idx = int(text)
@@ -1610,9 +1627,19 @@ async def backup_history_btn(message: types.Message):
             lines.append("  <i>No manual backups found.</i>")
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"📊 Monthly: <code>{len(monthly)}</code> | Manual/Weekly: <code>{len(manual)}</code>")
-        msg_text = "\n".join(lines)
-        if len(msg_text) > 4000:
-            msg_text = msg_text[:4000] + "\n..."
+        # Truncate at whole-line boundaries to avoid cutting through HTML tags
+        safe_lines_bh = []
+        bh_chars = 0
+        bh_truncated = False
+        for ln in lines:
+            if bh_chars + len(ln) + 1 > 3900:
+                bh_truncated = True
+                break
+            safe_lines_bh.append(ln)
+            bh_chars += len(ln) + 1
+        msg_text = "\n".join(safe_lines_bh)
+        if bh_truncated:
+            msg_text += "\n..."
         await wait_msg.delete()
         await message.answer(msg_text, parse_mode="HTML")
     except Exception as e:
@@ -5563,4 +5590,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("◈ Bot 4 Shutdown.")
- 
