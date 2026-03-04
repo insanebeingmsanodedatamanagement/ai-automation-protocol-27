@@ -21,7 +21,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError
-
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
 # ==========================================
@@ -40,6 +40,13 @@ REVIEW_LOG_CHANNEL = int(os.getenv("REVIEW_LOG_CHANNEL", 0))   # Support ticket 
 BOT_FALLBACK_LINK = os.getenv("BOT_FALLBACK_LINK", "https://t.me/msanodebot")
 # Render web-service health check port (Render sets PORT automatically)
 PORT = int(os.getenv("PORT", 8088))
+
+# ==========================================
+# 🌐 WEBHOOK CONFIGURATION
+# ==========================================
+_WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+_WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+_WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
 
 # ==========================================
 # ⚠️ STARTUP VALIDATION - Fail fast
@@ -6409,23 +6416,25 @@ async def _health_handler(request: aiohttp_web.Request) -> aiohttp_web.Response:
 
 
 async def start_health_server():
-    """Start the lightweight aiohttp web server for Render health checks.
-
-    Only starts when PORT is explicitly set in the environment (i.e. running on
-    Render).  On local dev the env var is absent so we skip binding entirely,
-    avoiding WinError 10048 / EADDRINUSE clashes.
-    """
+    """Start the lightweight aiohttp web server for Render health checks + webhook."""
     if "PORT" not in os.environ:
         logger.info("🌐 Health server skipped (PORT not set — local dev mode)")
         return None
     app = aiohttp_web.Application()
     app.router.add_get("/health", _health_handler)
     app.router.add_get("/", _health_handler)  # Render also checks root
+
+    if _WEBHOOK_URL:
+        # Register Telegram webhook route onto the same aiohttp app
+        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=_WEBHOOK_PATH)
+        setup_application(app, dp, bot=bot)
+        logger.info(f"✅ Webhook route registered: {_WEBHOOK_PATH}")
+
     runner = aiohttp_web.AppRunner(app)
     await runner.setup()
     site = aiohttp_web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"🌐 Health check server listening on port {PORT}")
+    logger.info(f"🌐 Web server running on port {PORT}")
     return runner
 
 
@@ -6489,9 +6498,20 @@ async def main():
         except Exception as e:
             logger.warning(f"Could not send startup notification: {e}")
 
-        # ── Start polling ────────────────────────────────────────
-        logger.info("🔄 Starting polling...")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        # ── Start polling or webhook ──────────────────────────────────────
+        if _WEBHOOK_URL:
+            # ── WEBHOOK MODE (production) ───────────────────────────────────
+            logger.info("🔄 Starting in WEBHOOK mode...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.set_webhook(_WEBHOOK_URL)
+            logger.info(f"✅ Webhook set: {_WEBHOOK_URL}")
+            # Webhook handler is registered in start_health_server()
+            # Just keep alive — aiohttp serves incoming Telegram updates
+            await asyncio.Event().wait()
+        else:
+            # ── POLLING MODE (local dev fallback) ──────────────────────────
+            logger.info("ℹ️ No RENDER_EXTERNAL_URL — using polling (local dev mode)")
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
     except Exception as e:
         logger.critical(f"💥 Fatal startup error: {e}\n{traceback.format_exc()}")
