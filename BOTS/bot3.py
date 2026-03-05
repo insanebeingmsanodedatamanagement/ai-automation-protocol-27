@@ -33,6 +33,7 @@ from aiohttp import web
 import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -5888,8 +5889,10 @@ async def process_ig_affiliate_selection(message: types.Message, state: FSMConte
     raw_input = message.text.strip()
     queries = [q.strip() for q in raw_input.split(",")]
     
-    # Get all contents sorted by cc_number for sequential resolution
-    all_contents = list(col_ig_content.find().sort("cc_number", 1))
+    # ✅ FIX: Filter to ONLY items without affiliate_link — matching exactly what's displayed in list
+    all_contents = list(col_ig_content.find(
+        {"$or": [{"affiliate_link": {"$exists": False}}, {"affiliate_link": ""}, {"affiliate_link": None}]}
+    ).sort("cc_number", 1))
     
     found_contents = []
     seen_ids = set()
@@ -5900,12 +5903,12 @@ async def process_ig_affiliate_selection(message: types.Message, state: FSMConte
         
         content = None
         if q.isdigit():
-            # Sequential selection
+            # Sequential selection — matches displayed index
             idx = int(q) - 1
             if 0 <= idx < len(all_contents):
                 content = all_contents[idx]
         elif q.upper().startswith("CC"):
-            # CC Code match
+            # CC Code match (search all, not just filtered, for CC code entry)
             content = next((c for c in all_contents if c['cc_code'].upper() == q.upper()), None)
             
         if content:
@@ -5929,11 +5932,12 @@ async def process_ig_affiliate_selection(message: types.Message, state: FSMConte
     await state.update_data(affiliate_ids=affiliate_ids)
     await state.set_state(IGAffiliateStates.waiting_for_link)
     
-    msg = f"✅ <b>Selected {len(found_contents)} IG items for Affiliate Link:</b>\n\n"
+    # ✅ FIX: Show only CC code — never dump full content name
+    msg = f"✅ <b>Selected {len(found_contents)} IG item(s):</b>"
     for c in found_contents:
-        msg += f"• {c['cc_code']} - {c['name']}\n"
+        msg += f"\n• {c['cc_code']}"
     
-    msg += "\n🔗 <b>Enter Affiliate Link (applies to ALL above):</b>"
+    msg += "\n\n🔗 <b>Enter Affiliate Link (applies to all above):</b>"
     
     await message.answer(msg, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
