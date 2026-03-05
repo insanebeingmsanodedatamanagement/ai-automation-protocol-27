@@ -58,6 +58,7 @@ if sys.platform == 'win32':
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
+# Load environment variables from bot4.env
 
 # Timezone support
 try:
@@ -173,6 +174,14 @@ _register_unicode_font()
 # ⚡ CONFIGURATION (LOAD FROM DB)
 # ==========================================
 MONGO_URI = os.getenv("MONGO_URI")
+
+# ==========================================
+# 🌐 RENDER / WEBHOOK CONFIG
+# ==========================================
+_RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+_WEBHOOK_PATH = "/webhook/bot4"
+_WEBHOOK_URL  = f"{_RENDER_URL}{_WEBHOOK_PATH}" if _RENDER_URL else ""
+PORT = int(os.getenv("PORT", 10000))
 
 # ==========================================
 # ⚙️ DB CONFIGURATION
@@ -5517,6 +5526,60 @@ async def _migrate_permissions():
     except Exception as e:
         print(f"⚠️ Migration Error: {e}")
 
+# ==========================================
+# 🌐 WEB SERVER (Render health + webhook)
+# ==========================================
+async def start_web_server(dp: Dispatcher, bot: Bot):
+    """
+    Starts an aiohttp web server.
+    - In webhook mode: registers Telegram webhook handler at _WEBHOOK_PATH.
+    - Always exposes GET / and GET /health for Render's port scanner.
+    Returns the AppRunner so main() can call runner.cleanup() on shutdown.
+    """
+    app = web.Application()
+
+    async def health_handler(request):
+        return web.Response(text="OK", status=200)
+
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+
+    if _WEBHOOK_URL:
+        # Register aiogram's webhook request handler
+        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=_WEBHOOK_PATH)
+        setup_application(app, dp, bot=bot)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    print(f"✅ Web server listening on port {PORT}")
+    return runner
+
+
+def run_health_server():
+    """
+    Synchronous wrapper — runs a minimal health-check HTTP server in a
+    background thread so Render's port scanner sees an open port immediately,
+    even before the asyncio event loop starts.
+    """
+    import http.server
+    import socketserver
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, *args):
+            pass  # silence access logs
+
+    with socketserver.TCPServer(("", PORT), _Handler) as httpd:
+        print(f"🛡️ Health server (sync) on port {PORT}")
+        httpd.serve_forever()
+
+
 async def main():
     # ── 1. Network startup (retry until Telegram responds) ──────────────────
     while True:
@@ -5619,7 +5682,8 @@ async def main():
 
 if __name__ == "__main__":
     print("🚀 STARTING INDIVIDUAL CORE TEST: BOT 4")
-    threading.Thread(target=run_health_server, daemon=True).start()
+    # start_web_server() inside main() binds to PORT and serves /health,
+    # so no separate thread is needed — that would cause a port conflict.
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
