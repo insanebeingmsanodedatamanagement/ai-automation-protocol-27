@@ -58,7 +58,6 @@ if sys.platform == 'win32':
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
-# Load environment variables from bot4.env
 
 # Timezone support
 try:
