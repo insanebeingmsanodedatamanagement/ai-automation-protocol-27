@@ -23,7 +23,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -2594,9 +2593,22 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
             # ---------------------------------------------------------
             # 1️⃣ MESSAGE 1: CONTENT DELIVERY
+            # Safe delivery: handles long text (>4096 chars) and Markdown parse errors
             # ---------------------------------------------------------
-            await message.answer(f"{ig_content['name']}", parse_mode="Markdown")
-            
+            _MAX_TG = 4096
+            _raw_content = ig_content.get("name", "")
+            # Split into chunks so we never exceed Telegram's limit
+            _chunks = [_raw_content[i:i+_MAX_TG] for i in range(0, max(len(_raw_content), 1), _MAX_TG)]
+            for _chunk in _chunks:
+                try:
+                    await message.answer(_chunk, parse_mode="Markdown")
+                except Exception:
+                    # Markdown parse failed (e.g. # headers, unmatched * etc) — send as plain text
+                    try:
+                        await message.answer(_chunk)
+                    except Exception as _e:
+                        logger.error(f"IGCC content delivery failed for {cc_code}: {_e}")
+
             # ⏳ DOT ANIMATION 1
             wait_msg = await message.answer("▪️")
             await asyncio.sleep(ANIM_MEDIUM)
