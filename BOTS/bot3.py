@@ -34,6 +34,7 @@ import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
+
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -1082,6 +1083,27 @@ async def reindex_all_pdfs():
         logger.error(f"Error re-indexing PDFs: {e}")
         return 0
 
+async def reindex_all_ig_cc():
+    """
+    Re-number all IG CC entries sequentially (CC1, CC2, CC3…) with no gaps.
+    Sorted by existing cc_number so the relative order is preserved.
+    Called automatically after every deletion.
+    """
+    try:
+        all_ig = list(col_ig_content.find().sort("cc_number", 1))
+        for new_num, item in enumerate(all_ig, start=1):
+            new_code = f"CC{new_num}"
+            if item.get("cc_number") != new_num or item.get("cc_code") != new_code:
+                col_ig_content.update_one(
+                    {"_id": item["_id"]},
+                    {"$set": {"cc_number": new_num, "cc_code": new_code}}
+                )
+        logger.info(f"Reindexed {len(all_ig)} IG CC entries successfully")
+        return len(all_ig)
+    except Exception as e:
+        logger.error(f"Error reindexing IG CC: {e}")
+        return 0
+
 async def get_next_pdf_index():
     latest = col_pdfs.find_one(sort=[("index", -1)])
     return (latest["index"] + 1) if latest else 1
@@ -1216,15 +1238,18 @@ async def send_ig_list_view(message: types.Message, page=0, mode="list"):
         
         text += "\n"
     
-    # Pagination
+    # Pagination — each mode gets its OWN prefix so NEXT/PREV buttons
+    # never collide with the pdf_pagination_handler (which catches bare NEXT/PREV).
+    _IG_PREFIX_MAP = {
+        "list":               "_IG",
+        "delete":             "_IGDEL",
+        "edit":               "_IGEDIT",
+        "ig_affiliate_select": "_IGAFFS",
+        "ig_affiliate_edit":   "_IGAFFE",
+        "ig_affiliate_delete": "_IGAFFD",
+    }
+    nav_prefix = _IG_PREFIX_MAP.get(mode, "_IG")
     buttons = []
-    nav_prefix = "_IG" if mode == "list" else ""
-    # Use appropriate prefix for other modes if needed, but 'list' is main one using state?
-    # Actually ig_pagination_handler looks for "_IG" if mode="list".
-    # For other modes (interactive), we might need logic?
-    # Current code handles pagination via buttons?
-    # Let's check logic for prev/next buttons.
-    
     if page > 0: buttons.append(KeyboardButton(text=f"⬅️ PREV{nav_prefix} {page}"))
     if (skip + limit) < total: buttons.append(KeyboardButton(text=f"➡️ NEXT{nav_prefix} {page+2}"))
     
@@ -3747,7 +3772,7 @@ async def process_ig_edit_select(message: types.Message, state: FSMContext):
         return await message.answer("❌ Cancelled.", reply_markup=get_ig_menu())
     
     # Handle Pagination
-    if message.text.startswith("⬅️ PREV") or message.text.startswith("➡️ NEXT"):
+    if message.text.startswith("⬅️ PREV_IGEDIT") or message.text.startswith("➡️ NEXT_IGEDIT"):
         try:
             page = int(message.text.split()[-1]) - 1
             await send_ig_list_view(message, page=page, mode="edit")
@@ -3838,7 +3863,7 @@ async def process_ig_delete_select(message: types.Message, state: FSMContext):
         return await message.answer("❌ Cancelled.", reply_markup=get_ig_menu())
     
     # Handle Pagination
-    if message.text.startswith("⬅️ PREV") or message.text.startswith("➡️ NEXT"):
+    if message.text.startswith("⬅️ PREV_IGDEL") or message.text.startswith("➡️ NEXT_IGDEL"):
         try:
             page = int(message.text.split()[-1]) - 1
             await send_ig_list_view(message, page=page, mode="delete")
@@ -3846,7 +3871,6 @@ async def process_ig_delete_select(message: types.Message, state: FSMContext):
         except: pass
     
     raw_input = message.text.strip()
-    queries = [q.strip() for q in raw_input.split(",")]
     
     # Get all contents sorted by cc_number for sequential resolution
     all_contents = list(col_ig_content.find().sort("cc_number", 1))
@@ -3855,26 +3879,47 @@ async def process_ig_delete_select(message: types.Message, state: FSMContext):
     seen_ids = set()
     not_found = []
     
-    for q in queries:
-        if not q: continue
+    # ── Token parser: supports ranges (1-5), singles (3), CC codes (CC2), any comma-separated mix ──
+    tokens = [t.strip() for t in raw_input.split(",") if t.strip()]
+    
+    for token in tokens:
+        # Range like "1-5"
+        if "-" in token and not token.upper().startswith("CC"):
+            parts = token.split("-", 1)
+            if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+                start = int(parts[0].strip())
+                end   = int(parts[1].strip())
+                if start > end:
+                    start, end = end, start  # swap if reversed (e.g. 5-1)
+                for n in range(start, end + 1):
+                    idx = n - 1
+                    if 0 <= idx < len(all_contents):
+                        c = all_contents[idx]
+                        cid = str(c["_id"])
+                        if cid not in seen_ids:
+                            seen_ids.add(cid)
+                            found_contents.append(c)
+                    else:
+                        not_found.append(str(n))
+                continue
         
-        content = None
-        if q.isdigit():
-            # Sequential selection
-            idx = int(q) - 1
-            if 0 <= idx < len(all_contents):
-                content = all_contents[idx]
-        elif q.upper().startswith("CC"):
-            # CC Code match
-            content = next((c for c in all_contents if c['cc_code'].upper() == q.upper()), None)
-            
+        # CC code like "CC5"
+        if token.upper().startswith("CC"):
+            content = next((c for c in all_contents if c['cc_code'].upper() == token.upper()), None)
+        # Single index number
+        elif token.isdigit():
+            idx = int(token) - 1
+            content = all_contents[idx] if 0 <= idx < len(all_contents) else None
+        else:
+            content = None
+        
         if content:
             cid = str(content["_id"])
             if cid not in seen_ids:
                 seen_ids.add(cid)
                 found_contents.append(content)
         else:
-            not_found.append(q)
+            not_found.append(token)
             
     if not found_contents:
         msg = "❌ <b>No Content Found</b>"
@@ -3885,18 +3930,33 @@ async def process_ig_delete_select(message: types.Message, state: FSMContext):
         
     # Store IDs
     delete_ids = [str(c["_id"]) for c in found_contents]
-    
     await state.update_data(delete_ids=delete_ids)
     
-    # Confirmation Message
-    msg = f"⚠️ <b>CONFIRM BULK DELETION ({len(found_contents)})</b> ⚠️\n\n"
-    for c in found_contents:
-        msg += f"• <b>{c['cc_code']}</b> - {c['name']}\n"
-        
+    # Confirmation Message — safe length-capped to avoid Telegram 4096-char limit
+    count = len(found_contents)
+    msg = f"⚠️ <b>CONFIRM DELETION ({count} item{'s' if count > 1 else ''})</b> ⚠️\n\n"
+    lines = [
+        f"• <b>{c['cc_code']}</b> - {c['name'][:40]}{'\u2026' if len(c['name']) > 40 else ''}"
+        for c in found_contents
+    ]
+    MAX_BODY = 3600
+    list_text = "\n".join(lines)
+    if len(list_text) > MAX_BODY:
+        trimmed = []
+        running = 0
+        for line in lines:
+            if running + len(line) + 1 > MAX_BODY - 60:
+                trimmed.append(f"  \u2026 and {len(lines) - len(trimmed)} more")
+                break
+            trimmed.append(line)
+            running += len(line) + 1
+        list_text = "\n".join(trimmed)
+    msg += list_text
+    
     if not_found:
-        msg += f"\n⚠️ Skipped: {', '.join(not_found)}\n"
-        
-    msg += "\n<b>Are you sure?</b>"
+        msg += f"\n\n⚠️ Skipped (not found): {', '.join(not_found)}"
+    
+    msg += "\n\n<b>Are you sure?</b>"
     
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="✅ CONFIRM DELETE"), KeyboardButton(text="❌ CANCEL")]
@@ -3916,9 +3976,13 @@ async def process_ig_delete_confirm(message: types.Message, state: FSMContext):
             result = col_ig_content.delete_many({"_id": {"$in": object_ids}})
             count = result.deleted_count
             
+            # ── Auto-reindex: renumber all remaining CC codes with no gaps ──
+            remaining = await reindex_all_ig_cc()
+            
             await state.clear()
             await message.answer(
-                f"🗑️ <b>Deleted {count} IG Content(s)!</b>",
+                f"🗑️ <b>Deleted {count} IG Content(s)!</b>\n"
+                f"🔄 CC codes auto-renumbered — {remaining} items now CC1–CC{remaining}",
                 reply_markup=get_ig_menu(),
                 parse_mode="HTML"
             )
@@ -5879,7 +5943,7 @@ async def process_ig_affiliate_selection(message: types.Message, state: FSMConte
         return await message.answer("❌ Cancelled.", reply_markup=get_ig_affiliate_menu())
     
     # Handle Pagination
-    if message.text.startswith("⬅️ PREV") or message.text.startswith("➡️ NEXT"):
+    if message.text.startswith("⬅️ PREV_IGAFFS") or message.text.startswith("➡️ NEXT_IGAFFS"):
         try:
             page = int(message.text.split()[-1]) - 1
             await send_ig_list_view(message, page=page, mode="ig_affiliate_select")
@@ -6007,7 +6071,7 @@ async def process_ig_affiliate_edit_selection(message: types.Message, state: FSM
         return await message.answer("❌ Cancelled.", reply_markup=get_ig_affiliate_menu())
     
     # Handle Pagination
-    if message.text.startswith("⬅️ PREV") or message.text.startswith("➡️ NEXT"):
+    if message.text.startswith("⬅️ PREV_IGAFFE") or message.text.startswith("➡️ NEXT_IGAFFE"):
         try:
             page = int(message.text.split()[-1]) - 1
             await send_ig_list_view(message, page=page, mode="ig_affiliate_edit")
@@ -6118,7 +6182,7 @@ async def process_ig_affiliate_delete_selection(message: types.Message, state: F
         return await message.answer("❌ Cancelled.", reply_markup=get_ig_affiliate_menu())
     
     # Handle Pagination
-    if message.text.startswith("⬅️ PREV") or message.text.startswith("➡️ NEXT"):
+    if message.text.startswith("⬅️ PREV_IGAFFD") or message.text.startswith("➡️ NEXT_IGAFFD"):
         try:
             page = int(message.text.split()[-1]) - 1
             await send_ig_list_view(message, page=page, mode="ig_affiliate_delete")
@@ -8440,6 +8504,11 @@ async def main():
     # Check if current month's backup exists (persistence check)
     print("\n💾 Checking backup status...")
     await check_and_create_missed_backup()
+    
+    # ── Auto-heal IG CC codes on every startup (fill gaps from past deletions) ──
+    print("\n🔄 Reindexing IG CC codes...")
+    ig_count = await reindex_all_ig_cc()
+    print(f"  ✅ IG CC codes reindexed: {ig_count} items now CC1–CC{ig_count}")
     
     # Send startup notification
     if MASTER_ADMIN_ID and MASTER_ADMIN_ID != 0:
