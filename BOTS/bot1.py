@@ -23,6 +23,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -242,6 +243,12 @@ try:
         db["bot8_state_persistence"].create_index("key", unique=True)
         col_bot8_backups.create_index([("backup_date", -1)])
         col_bot8_backups.create_index([("backup_type", 1)])
+        # ── Unique dedup index: prevents duplicate click-tracking rows even under concurrent load
+        db["bot9_user_activity"].create_index(
+            [("user_id", 1), ("item_id", 1), ("click_type", 1)],
+            unique=True,
+            name="unique_user_item_click"
+        )
         logger.info("✅ Database indexes created/verified")
     except Exception as idx_error:
         logger.warning(f"⚠️ Index creation warning: {idx_error}")
@@ -313,22 +320,29 @@ def log_to_terminal(action_type: str, user_id: int, details: str = ""):
 
 def _is_new_unique_click(user_id: int, item_id, click_type: str) -> bool:
     """
-    Per-user click deduplication.
-    Returns True (and records the click) if this is the FIRST time user clicked
-    this item+type. Returns False if already counted — caller should skip $inc.
-    Uses bot9_user_activity for storage so bot9 analytics stay in sync.
+    Per-user click deduplication — race-condition-proof.
+    Uses upsert + unique index instead of find_one+insert_one so concurrent
+    clicks can never produce a duplicate row, even under high load.
+    Returns True on the FIRST click, False on every subsequent click.
     """
     try:
+        from pymongo.errors import DuplicateKeyError
         col_dedup = db["bot9_user_activity"]
         key = {"user_id": user_id, "item_id": str(item_id), "click_type": click_type}
-        existing = col_dedup.find_one(key, {"_id": 1})
-        if existing:
-            return False  # Already counted — no increment
-        col_dedup.insert_one({**key, "first_click_at": now_local()})
-        return True  # New unique click
+        result = col_dedup.update_one(
+            key,
+            {"$setOnInsert": {**key, "first_click_at": now_local()}},
+            upsert=True
+        )
+        # upserted_id is set ONLY when a new doc was inserted (first click)
+        return result.upserted_id is not None
     except Exception as e:
+        # DuplicateKeyError = race lost = already exists = not a new click
+        from pymongo.errors import DuplicateKeyError
+        if isinstance(e, DuplicateKeyError):
+            return False
         logger.warning(f"Dedup check failed ({click_type}): {e}; allowing increment")
-        return True  # On error, allow increment (fail-open)
+        return True  # On any other error, fail-open (never block a user)
 
 def track_user_source(user_id: int, source: str, username: str, first_name: str, msa_id: str):
     """
@@ -2390,7 +2404,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
             _locked_ans = await message.answer("🔒 Menu locked until you join the Vault.", reply_markup=ReplyKeyboardRemove())
             col_user_verification.update_one(
                 {"user_id": user_id},
-                {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]}},
+                {"$set": {
+                    "pending_payload": payload,
+                    "pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]
+                }},
                 upsert=True
             )
             return
@@ -2862,50 +2879,8 @@ _Select a service from the menu ⬇️_
         parse_mode=ParseMode.MARKDOWN
     )
     
-    # --- 🚀 NEW FEATURE: AUTO-DELIVER PENDING PAYLOAD ---
-    pending_payload = user_data.get("pending_payload") if user_data else None
-    if pending_payload:
-        logger.info(f"⚡ Delivering pending payload '{pending_payload}' to returning user {user_id} on /start")
-        # Clear pending payload
-        col_user_verification.update_one({"user_id": user_id}, {"$unset": {"pending_payload": ""}})
-        
-        # Mock Message for Delivery
-        class MockChat:
-            def __init__(self, chat_id):
-                self.id = chat_id
-            
-        class MockMessageForDelivery:
-            def __init__(self, m_user_id, m_first_name, m_username, payload_text):
-                self.from_user = type('MockUser', (), {'id': m_user_id, 'first_name': m_first_name, 'username': m_username})()
-                self.text = f"/start {payload_text}"
-                self.chat = MockChat(m_user_id)
-                self.message_id = int(time.time())
-                
-            async def answer(self, text, **kwargs):
-                return await bot.send_message(self.from_user.id, text, **kwargs)
-                
-            async def edit_text(self, text, **kwargs):
-                pass
-        
-        mock_msg = MockMessageForDelivery(user_id, user_name, _uname_track, pending_payload)
-        
-        # Manual FSM Resolving
-        key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
-        fsm_state = FSMContext(storage=dp.storage, key=key)
-        
-        # Process Payload directly via cmd_start
-        async def _deliver_payload():
-            try:
-                user_last_command.pop(user_id, None)  # Clear rate limit for pending delivery
-                clear_user_processing(user_id)
-                await cmd_start(mock_msg, fsm_state)
-                logger.info("✅ Auto-delivery via cmd_start completed successfully.")
-            except Exception as e:
-                import traceback
-                logger.error(f"❌ Auto-delivery failed inside cmd_start: {e}")
-                logger.error(traceback.format_exc())
-                
-        asyncio.create_task(_deliver_payload()) 
+    # NOTE: Pending deep-link payloads are delivered by handle_vault_join when the user joins the
+    # vault channel. We do NOT re-deliver here to avoid duplicates.
     # ── 🎬 STARTER TUTORIAL — Only on plain empty /start (no referral payload) ──
     # Looks up the universal tutorial link stored via bot9 TUTORIAL manager.
     # Delivered as a premium framed message with an inline watch button.
@@ -3096,50 +3071,51 @@ async def handle_vault_join(event: ChatMemberUpdated):
             
             logger.info(f"Auto-welcomed user {user_id} after vault join")
             
-            # --- 🚀 NEW FEATURE: AUTO-DELIVER PENDING PAYLOAD ---
-            pending_payload = user_data.get("pending_payload") if user_data else None
+            # --- 🚀 AUTO-DELIVER PENDING PAYLOAD (Atomic — no duplicates) ---
+            # Use find_one_and_update to atomically claim and clear the pending payload.
+            # This guarantees the content is delivered exactly once even if multiple events fire.
+            claimed = col_user_verification.find_one_and_update(
+                {"user_id": user_id, "pending_payload": {"$exists": True, "$ne": None}},
+                {"$unset": {"pending_payload": ""}},
+                return_document=False  # Get the document BEFORE the update (has pending_payload)
+            )
+            pending_payload = claimed.get("pending_payload") if claimed else None
             if pending_payload:
-                logger.info(f"⚡ Delivering pending payload '{pending_payload}' to user {user_id} after verification")
-                # Clear pending payload
-                col_user_verification.update_one({"user_id": user_id}, {"$unset": {"pending_payload": ""}})
+                logger.info(f"⚡ Delivering pending payload '{pending_payload}' to user {user_id} after vault join")
                 
-                # Mock Message for Delivery
-                class MockChat:
-                    def __init__(self, chat_id):
-                        self.id = chat_id
-                    
-                class MockMessageForDelivery:
-                    def __init__(self, m_user_id, m_first_name, m_username, payload_text):
-                        self.from_user = type('MockUser', (), {'id': m_user_id, 'first_name': m_first_name, 'username': m_username})()
+                # Build a minimal mock message so we can re-use the cmd_start delivery logic
+                class _MockChat:
+                    def __init__(self, chat_id): self.id = chat_id
+                
+                class _MockMessage:
+                    """Duck-typed Message that routes .answer() to bot.send_message."""
+                    def __init__(self, uid, fname, uname, payload_text):
+                        self.from_user = type('U', (), {'id': uid, 'first_name': fname, 'username': uname})()
                         self.text = f"/start {payload_text}"
-                        self.chat = MockChat(m_user_id)
+                        self.chat = _MockChat(uid)
                         self.message_id = int(time.time())
-                        
                     async def answer(self, text, **kwargs):
                         return await bot.send_message(self.from_user.id, text, **kwargs)
-                        
-                    async def edit_text(self, text, **kwargs):
-                        pass
+                    async def delete(self): pass
                 
-                mock_msg = MockMessageForDelivery(user_id, user_name, username, pending_payload)
+                _mock = _MockMessage(user_id, user_name, username, pending_payload)
+                _key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+                _fsm = FSMContext(storage=dp.storage, key=_key)
                 
-                # Manual FSM Resolving
-                key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
-                state = FSMContext(storage=dp.storage, key=key)
+                # Capture local copies for the closure
+                _uid = user_id
+                _pp  = pending_payload
                 
-                # Process Payload directly via cmd_start
-                async def _deliver_payload():
+                async def _deliver_pending():
                     try:
-                        user_last_command.pop(user_id, None)  # Clear rate limit for pending delivery
-                        clear_user_processing(user_id)
-                        await cmd_start(mock_msg, state)
-                        logger.info("✅ Auto-delivery via cmd_start completed successfully.")
-                    except Exception as e:
-                        import traceback
-                        logger.error(f"❌ Auto-delivery failed inside cmd_start: {e}")
-                        logger.error(traceback.format_exc())
-                        
-                asyncio.create_task(_deliver_payload())
+                        user_last_command.pop(_uid, None)   # clear rate-limit
+                        clear_user_processing(_uid)          # clear anti-spam lock
+                        await cmd_start(_mock, _fsm)
+                        logger.info(f"✅ Pending payload '{_pp}' delivered to {_uid}")
+                    except Exception as _e:
+                        logger.error(f"❌ Pending delivery failed for {_uid}: {_e}\n{traceback.format_exc()}")
+                
+                asyncio.create_task(_deliver_pending())
                 
 
         except Exception as e:
