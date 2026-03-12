@@ -33,8 +33,6 @@ from aiohttp import web
 import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-
-
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -57,7 +55,7 @@ _WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 _WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
 
 # Database Configuration
-MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "MSANodeDB")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "MSANodeDB")  # Single database — all bots use MSANodeDB
 MONGO_MAX_POOL_SIZE = int(os.environ.get("MONGO_MAX_POOL_SIZE", 100))
 MONGO_MIN_POOL_SIZE = int(os.environ.get("MONGO_MIN_POOL_SIZE", 10))
 MONGO_CONNECT_TIMEOUT_MS = int(os.environ.get("MONGO_CONNECT_TIMEOUT_MS", 10000))
@@ -86,13 +84,13 @@ DAILY_REPORT_TIMEZONE = os.environ.get("DAILY_REPORT_TIMEZONE", "Asia/Kolkata")
 
 # ---- Local timezone helper ----
 try:
-    _BOT9_TZ = ZoneInfo(DAILY_REPORT_TIMEZONE)
+    _BOT3_TZ = ZoneInfo(DAILY_REPORT_TIMEZONE)
 except Exception:
-    _BOT9_TZ = ZoneInfo("Asia/Kolkata")
+    _BOT3_TZ = ZoneInfo("Asia/Kolkata")
 
 def now_local() -> datetime:
     """Return current time as a naive datetime in the configured local timezone."""
-    return datetime.now(_BOT9_TZ).replace(tzinfo=None)
+    return datetime.now(_BOT3_TZ).replace(tzinfo=None)
 # --------------------------------
 
 # State Persistence Configuration
@@ -116,7 +114,7 @@ os.makedirs("logs", exist_ok=True)
 
 # Main log handler with rotation
 main_handler = RotatingFileHandler(
-    "logs/bot9.log",
+    "logs/bot3.log",
     maxBytes=10*1024*1024,  # 10MB
     backupCount=5,
     encoding='utf-8'
@@ -125,7 +123,7 @@ main_handler.setLevel(logging.INFO)
 
 # Error log handler (separate file for errors)
 error_handler = RotatingFileHandler(
-    "logs/bot9_errors.log",
+    "logs/bot3_errors.log",
     maxBytes=10*1024*1024,  # 10MB
     backupCount=5,
     encoding='utf-8'
@@ -264,14 +262,14 @@ class HealthMonitor:
             db = client[MONGO_DB_NAME]
             
             # Reinitialize collections
-            col_logs = db["bot9_logs"]
-            col_pdfs = db["bot9_pdfs"]
-            col_ig_content = db["bot9_ig_content"]
-            col_settings = db["bot9_settings"]
-            col_admins = db["bot9_admins"]
-            col_banned_users = db["bot9_banned_users"]
-            col_user_activity = db["bot9_user_activity"]
-            col_backups = db["bot9_backups"]
+            col_logs = db["bot3_logs"]
+            col_pdfs = db["bot3_pdfs"]
+            col_ig_content = db["bot3_ig_content"]
+            col_settings = db["bot3_settings"]
+            col_admins = db["bot3_admins"]
+            col_banned_users = db["bot3_banned_users"]
+            col_user_activity = db["bot3_user_activity"]
+            col_backups = db["bot3_backups"]
             
             # Test connection
             client.admin.command('ping')
@@ -323,11 +321,11 @@ class HealthMonitor:
             emoji = emoji_map.get(level, "📢")
             timestamp = now_local().strftime("%Y-%m-%d %I:%M:%S %p")
             
-            alert_msg = f"{emoji} <b>BOT 9 HEALTH ALERT</b>\n\n"
+            alert_msg = f"{emoji} <b>BOT 3 HEALTH ALERT</b>\n\n"
             alert_msg += f"<b>Level:</b> {level}\n"
             alert_msg += f"<b>Time:</b> {timestamp}\n\n"
             alert_msg += f"<b>Message:</b>\n{message}\n\n"
-            alert_msg += f"🤖 <b>Source:</b> Bot 9 Auto-Healer"
+            alert_msg += f"🤖 <b>Source:</b> Bot 3 Auto-Healer"
             
             await bot.send_message(MASTER_ADMIN_ID, alert_msg, parse_mode="HTML")
             
@@ -352,7 +350,7 @@ class HealthMonitor:
             
             timestamp = now.strftime("%Y-%m-%d %I:%M:%S %p")
             
-            error_msg = f"🚨 <b>BOT 9 ERROR ALERT</b>\n\n"
+            error_msg = f"🚨 <b>BOT 3 ERROR ALERT</b>\n\n"
             error_msg += f"<b>Error #{self.error_count}</b>\n"
             error_msg += f"<b>Time:</b> {timestamp}\n\n"
             error_msg += f"<b>Title:</b> {error_title}\n\n"
@@ -396,7 +394,7 @@ class StatePersistence:
     """Persistent state management for bot recovery"""
     
     def __init__(self):
-        self.state_file = os.path.join(STATE_BACKUP_LOCATION, "bot9_state.pkl")
+        self.state_file = os.path.join(STATE_BACKUP_LOCATION, "bot3_state.pkl")
         os.makedirs(STATE_BACKUP_LOCATION, exist_ok=True)
         logger.info("✅ State Persistence initialized")
     
@@ -413,6 +411,7 @@ class StatePersistence:
                 "last_backup": now_local().isoformat()
             }
             
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
             with open(self.state_file, 'wb') as f:
                 pickle.dump(state_data, f)
             
@@ -501,7 +500,7 @@ ROLES = {
 }
 
 def is_admin(user_id: int) -> bool:
-    """Check if user is MASTER_ADMIN or in bot9_admins collection"""
+    """Check if user is MASTER_ADMIN or in bot3_admins collection"""
     global MASTER_ADMIN_ID # Allow global update
     if user_id == MASTER_ADMIN_ID:
         return True
@@ -819,21 +818,37 @@ try:
     db = client[MONGO_DB_NAME]
     
     # Bot9 Management Collections
-    col_logs = db["bot9_logs"]
-    col_pdfs = db["bot9_pdfs"]
-    col_ig_content = db["bot9_ig_content"]
-    col_settings = db["bot9_settings"]
-    col_admins = db["bot9_admins"]
-    col_banned_users = db["bot9_banned_users"]
-    col_user_activity = db["bot9_user_activity"]
-    col_backups = db["bot9_backups"]  # Backup history collection
+    col_logs = db["bot3_logs"]
+    col_pdfs = db["bot3_pdfs"]
+    col_ig_content = db["bot3_ig_content"]
+    col_settings = db["bot3_settings"]
+    col_admins = db["bot3_admins"]
+    col_banned_users = db["bot3_banned_users"]
+    col_user_activity = db["bot3_user_activity"]
+    col_backups = db["bot3_backups"]  # Backup history collection
     
     # Test connection
     client.admin.command('ping')
     print("✅ Connected to MongoDB")
     print(f"   Database: {MONGO_DB_NAME}")
     print(f"   Connection Pool: {MONGO_MIN_POOL_SIZE}-{MONGO_MAX_POOL_SIZE}")
-    
+
+    # ── STARTUP DB NAME GUARD ─────────────────────────────────────────────────
+    # Identical guard used in bot1.py and bot2.py.
+    # If the environment points to the wrong database (e.g. MSANODEDATA instead
+    # of MSANodeDB), the bot exits immediately with a clear error so the problem
+    # is obvious in Render logs rather than silently storing data to the wrong DB.
+    if db.name != "MSANodeDB":
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"CRITICAL: Connected to wrong database '{db.name}'")
+        print("Expected: MSANodeDB")
+        print("Fix: Set MONGO_DB_NAME=MSANodeDB in Render environment")
+        print("     OR verify MONGO_URI contains /MSANodeDB")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        sys.exit(1)
+    print("   ✅ Database name verified: MSANodeDB")
+    # ── END DB GUARD ─────────────────────────────────────────────────────────
+
     # Create indexes for better performance (idempotent - skips if exists)
     def create_index_safe(collection, keys, **kwargs):
         """Helper to create index safely, ignoring if already exists"""
@@ -879,11 +894,54 @@ try:
         
         # Admin collection indexes
         create_index_safe(col_admins, "user_id", unique=True, name="admin_user_id_unique")
+
+        # Settings collection — key field is the natural primary key
+        create_index_safe(col_settings, "key", unique=True, name="settings_key_unique")
+
+        # PDF lookup by yt_start_code (used by bot1 on every user click)
+        create_index_safe(col_pdfs, "yt_start_code", sparse=True, name="pdf_yt_start_code")
         
         print("✅ Database indexes created (optimized for millions of records)")
     except Exception as idx_err:
         print(f"⚠️ Warning: Some indexes could not be created: {idx_err}")
         print("   Bot will continue, existing indexes will be used")
+
+    # ── TTL AUTO-EXPIRY INDEXES ────────────────────────────────────────────────
+    # Prevent unbounded growth of activity + log collections.
+    # Each block is independent — a failure in one never blocks the others or startup.
+    # Drop-before-create avoids "index already exists with different options" on re-deploy.
+
+    # bot3_user_activity — auto-delete rows after 7 days
+    try:
+        try:
+            col_user_activity.drop_index("activity_timestamp_ttl_7d")
+        except Exception:
+            pass
+        col_user_activity.create_index(
+            [("timestamp", 1)],
+            expireAfterSeconds=604_800,   # 7 days
+            sparse=True,
+            name="activity_timestamp_ttl_7d"
+        )
+        print("✅ TTL index set: bot3_user_activity → 7-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (bot3_user_activity): {_ttl_err}")
+
+    # bot3_logs — auto-delete log rows after 7 days
+    try:
+        try:
+            col_logs.drop_index("log_timestamp_ttl_7d")
+        except Exception:
+            pass
+        col_logs.create_index(
+            [("timestamp", 1)],
+            expireAfterSeconds=604_800,   # 7 days
+            sparse=True,
+            name="log_timestamp_ttl_7d"
+        )
+        print("✅ TTL index set: bot3_logs → 7-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (bot3_logs): {_ttl_err}")
     
     # Initialize click tracking fields for existing documents (migration)
     try:
@@ -1025,13 +1083,15 @@ class PDFActionStates(StatesGroup):
 class ResetStates(StatesGroup):
     waiting_for_confirm_button = State()
     waiting_for_confirm_text = State()
+    waiting_for_final_wipe_code = State()
 
 class AnalyticsStates(StatesGroup):
     viewing_analytics = State()
     viewing_category = State()
 
 class BackupStates(StatesGroup):
-    viewing_backup_menu = State()
+    viewing_backup_menu    = State()
+    waiting_for_json_file  = State()  # JSON restore
 
 class AdminManagementStates(StatesGroup):
     waiting_for_new_admin_id = State()
@@ -1087,17 +1147,31 @@ async def reindex_all_ig_cc():
     """
     Re-number all IG CC entries sequentially (CC1, CC2, CC3…) with no gaps.
     Sorted by existing cc_number so the relative order is preserved.
-    Called automatically after every deletion.
+    Uses a two-phase approach to avoid unique-index conflicts:
+      Phase 1 — shift all existing cc_numbers to a safe high range (10000+)
+      Phase 2 — assign the final sequential numbers
+    This guarantees no duplicate key violation during reindexing.
     """
     try:
         all_ig = list(col_ig_content.find().sort("cc_number", 1))
+        if not all_ig:
+            return 0
+
+        # Phase 1: move every document to a guaranteed-unique temporary number
+        # (10000 + original position) so no two docs share a cc_number during the swap
+        for temp_idx, item in enumerate(all_ig, start=10001):
+            col_ig_content.update_one(
+                {"_id": item["_id"]},
+                {"$set": {"cc_number": temp_idx, "cc_code": f"CC{temp_idx}"}}
+            )
+
+        # Phase 2: assign the final sequential numbers CC1, CC2, CC3…
         for new_num, item in enumerate(all_ig, start=1):
-            new_code = f"CC{new_num}"
-            if item.get("cc_number") != new_num or item.get("cc_code") != new_code:
-                col_ig_content.update_one(
-                    {"_id": item["_id"]},
-                    {"$set": {"cc_number": new_num, "cc_code": new_code}}
-                )
+            col_ig_content.update_one(
+                {"_id": item["_id"]},
+                {"$set": {"cc_number": new_num, "cc_code": f"CC{new_num}"}}
+            )
+
         logger.info(f"Reindexed {len(all_ig)} IG CC entries successfully")
         return len(all_ig)
     except Exception as e:
@@ -1448,7 +1522,7 @@ async def send_pdf_list_view(message: types.Message, page=0, mode="list"):
 # ... (Existing Keyboards and Handlers) ...
 
 def get_main_menu(user_id: int):
-    """Bot 9 Main Menu Structure - Dynamically Filtered"""
+    """Bot 3 Main Menu Structure - Dynamically Filtered"""
     
     # 1. Master Admin sees EVERYTHING
     if user_id == MASTER_ADMIN_ID:
@@ -1617,6 +1691,7 @@ def get_backup_menu():
     keyboard = [
         [KeyboardButton(text="💾 FULL BACKUP")],
         [KeyboardButton(text="📋 VIEW AS JSON"), KeyboardButton(text="📊 BACKUP STATS")],
+        [KeyboardButton(text="📤 JSON RESTORE"), KeyboardButton(text="📜 BACKUP HISTORY")],
         [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -1742,7 +1817,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     log_user_action(message.from_user, "Started Bot")
     
     await message.answer(
-        "🤖 <b>BOT 9 ONLINE</b>\n"
+        "🤖 <b>BOT 3 ONLINE</b>\n"
         "System Authorized. Accessing Mainframe...",
         reply_markup=get_main_menu(message.from_user.id),
         parse_mode="HTML"
@@ -2056,7 +2131,7 @@ async def process_admin_removal(message: types.Message, state: FSMContext):
                 await message.answer(
                     f"✅ <b>Admin Removed</b>\n\n"
                     f"User ID `{target_id}` is no longer an admin.\n"
-                    f"They cannot access Bot 9 anymore.",
+                    f"They cannot access Bot 3 anymore.",
                     reply_markup=get_admin_config_menu(),
                     parse_mode="HTML"
                 )
@@ -3623,84 +3698,91 @@ async def ig_link_pagination(message: types.Message):
 async def all_pdf_links_handler(message: types.Message, page=0):
     if not await check_authorization(message, "All PDF Links", "can_list"):
         return
-    limit = 5
+    limit = 8
     skip = page * limit
-    
+
     total = col_pdfs.count_documents({})
-    # Check if any PDFs exist
     if total == 0:
         await message.answer("⚠️ No PDFs found.", reply_markup=get_links_menu())
         return
 
     pdfs = list(col_pdfs.find().sort("index", 1).skip(skip).limit(limit))
-    
-    # Handle page out of bounds
+
     if not pdfs and page > 0:
         await message.answer("⚠️ End of list.", reply_markup=get_links_menu())
         return
 
-    text = f"📑 <b>ALL PDF LINKS</b> (Page {page+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    username = "msanodebot"
-    
+    username = BOT_USERNAME
+
+    entries = []
     for pdf in pdfs:
-        # Check Completeness
-        missing = []
-        if not pdf.get('name'): missing.append("Name")
-        if not pdf.get('link'): missing.append("Link")
-        if not pdf.get('affiliate_link'): missing.append("Affiliate")
-        if not pdf.get('msa_code'): missing.append("MSA Code")
-        if not pdf.get('yt_title'): missing.append("YT Title")
-        if not pdf.get('yt_link'): missing.append("YT Link")
-        
-        text += f"🆔 `{pdf['index']}`. <b>{pdf.get('name', 'Unknown')}</b>\n"
-        
-        if missing:
-            text += f"⚠️ <b>Missing Details:</b> {', '.join(missing)}\n"
-            text += "🚫 Links not generated. Please fill all fields.\n"
-        else:
-            # Generate Links
-            pdf = await ensure_pdf_codes(pdf)
-            ig_code = pdf['ig_start_code']
-            yt_code = pdf['yt_start_code']
-            aff_code = pdf['aff_start_code']
-            orig_code = pdf['orig_start_code']
-            username = BOT_USERNAME  # Use environment variable for bot username
-            
-            # Sanitize Name (Alphanumeric + Underscore)
-            sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', pdf['name'])
-            sanitized_name = re.sub(r'_+', '_', sanitized_name).strip('_')
-            
-            ig_link = f"https://t.me/{username}?start={ig_code}_ig_{sanitized_name}"
-            yt_link = f"https://t.me/{username}?start={yt_code}_yt_{sanitized_name}"
-            aff_link = f"https://t.me/{username}?start={aff_code}_aff_{sanitized_name}"
-            orig_link = f"https://t.me/{username}?start={orig_code}_orig_{sanitized_name}"
-            
-            text += (
-                f"📸 <b>IG Link</b>: <code>{ig_link}</code>\n"
-                f"   └ 🎟️ Code: <code>{ig_code}</code>\n\n"
-                f"▶️ <b>YT Link</b>: <code>{yt_link}</code>\n"
-                f"   └ 🎟️ Code: <code>{yt_code}</code>\n\n"
-                f"🔐 <b>MSA Code</b>: <code>{pdf['msa_code']}</code>\n"
-            )
-        text += "────────────────────\n"
-    
-    # Pagination
+        # Always ensure start codes exist (generates if missing)
+        pdf = await ensure_pdf_codes(pdf)
+
+        idx      = pdf.get("index", "?")
+        name     = pdf.get("name") or "⚠️ Unnamed"
+        has_link = bool(pdf.get("link"))
+
+        sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', pdf.get("name", "unknown"))
+        sanitized_name = re.sub(r'_+', '_', sanitized_name).strip('_')
+
+        ig_code = pdf["ig_start_code"]
+        yt_code = pdf["yt_start_code"]
+
+        ig_link = f"https://t.me/{username}?start={ig_code}_ig_{sanitized_name}"
+        yt_link = f"https://t.me/{username}?start={yt_code}_yt_{sanitized_name}"
+
+        block = f"🆔 <b>{idx}.</b> <b>{name}</b>\n"
+
+        if not has_link:
+            block += "⚠️ <i>PDF file not uploaded — add via 📄 PDF menu</i>\n"
+
+        block += (
+            f"📸 <b>IG Link</b>: <code>{ig_link}</code>\n"
+            f"   └ 🎟️ <code>{ig_code}</code>\n"
+            f"▶️ <b>YT Link</b>: <code>{yt_link}</code>\n"
+            f"   └ 🎟️ <code>{yt_code}</code>\n"
+        )
+
+        block += "────────────────────\n"
+        entries.append(block)
+
+    header = f"📑 <b>ALL PDF LINKS</b> (Page {page+1} / {((total-1)//limit)+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # Pagination nav keyboard
     buttons = []
-    if page > 0: buttons.append(KeyboardButton(text=f"⬅️ PREV_PDFLINK {page}"))
-    if (skip + limit) < total: buttons.append(KeyboardButton(text=f"➡️ NEXT_PDFLINK {page+2}"))
-    
-    keyboard = []
-    if buttons: keyboard.append(buttons)
-    keyboard.append([KeyboardButton(text="⬅️ BACK TO LINKS MENU")])
-    
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML", disable_web_page_preview=True)
+    if page > 0:
+        buttons.append(KeyboardButton(text=f"⬅️ PREV_PDFLINK {page}"))
+    if (skip + limit) < total:
+        buttons.append(KeyboardButton(text=f"➡️ NEXT_PDFLINK {page+2}"))
+    nav_keyboard = []
+    if buttons:
+        nav_keyboard.append(buttons)
+    nav_keyboard.append([KeyboardButton(text="⬅️ BACK TO LINKS MENU")])
+    reply_kb = ReplyKeyboardMarkup(keyboard=nav_keyboard, resize_keyboard=True)
+
+    # Build pages — auto-split if a batch overflows Telegram's 4096-char limit
+    MAX_CHARS = 3800
+    pages_out = []
+    current_text = header
+    for entry in entries:
+        if len(current_text) + len(entry) > MAX_CHARS:
+            pages_out.append(current_text)
+            current_text = entry
+        else:
+            current_text += entry
+    pages_out.append(current_text)
+
+    for i, part in enumerate(pages_out):
+        kb = reply_kb if i == len(pages_out) - 1 else None
+        await message.answer(part, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.message(lambda m: m.text and (m.text.startswith("⬅️ PREV_PDFLINK") or m.text.startswith("➡️ NEXT_PDFLINK")))
 async def pdf_link_pagination(message: types.Message):
     try:
         page = int(message.text.split()[-1]) - 1
         await all_pdf_links_handler(message, page=page)
-    except:
+    except Exception:
         await message.answer("❌ Error navigating.")
 
 @dp.message(F.text == "📸 IG")
@@ -4610,10 +4692,10 @@ async def diagnosis_handler(message: types.Message):
     
     # --- 2. COLLECTION INTEGRITY CHECK ---
     collections_to_check = {
-        "bot9_pdfs": col_pdfs,
-        "bot9_ig_content": col_ig_content,
-        "bot9_logs": col_logs,
-        "bot9_settings": col_settings
+        "bot3_pdfs": col_pdfs,
+        "bot3_ig_content": col_ig_content,
+        "bot3_logs": col_logs,
+        "bot3_settings": col_settings
     }
     
     for coll_name, coll in collections_to_check.items():
@@ -4673,18 +4755,12 @@ async def diagnosis_handler(message: types.Message):
         indexes = col_pdfs.list_indexes()
         index_names = [idx['name'] for idx in indexes]
         
-        required_indexes = ['index_1', 'created_at_1', 'msa_code_1']
+        # These are the explicit named indexes created in init_db()
+        required_indexes = ['pdf_index_unique', 'pdf_created_at', 'pdf_msa_code']
         missing_indexes = [idx for idx in required_indexes if idx not in index_names]
         
         if missing_indexes:
-            # Auto-create missing indexes
-            for idx in missing_indexes:
-                field = idx.replace('_1', '')
-                try:
-                    col_pdfs.create_index([(field, 1)])
-                except:
-                    pass
-            warnings.append(f"ℹ️ Auto-rebuilt missing indexes: {', '.join(missing_indexes)}")
+            warnings.append(f"⚠️ Named indexes missing (will be created on restart): {', '.join(missing_indexes)}")
             checks_passed += 1
         else:
             checks_passed += 1
@@ -4712,7 +4788,7 @@ async def diagnosis_handler(message: types.Message):
     # --- 7. FILE SYSTEM CHECK ---
     total_checks += 1
     try:
-        log_file = "bot9.log"
+        log_file = "logs/bot3.log"
         if os.path.exists(log_file):
             log_size = os.path.getsize(log_file) / (1024 * 1024)  # MB
             if log_size > 100:
@@ -4933,7 +5009,7 @@ async def diagnosis_handler(message: types.Message):
         tracking_col = db["bot10_user_tracking"]
         tracked_total = tracking_col.count_documents({})
         with_source = tracking_col.count_documents({"source": {"$exists": True}})
-        dedup_col = db["bot9_user_activity"]
+        dedup_col = db["bot3_user_activity"]
         dedup_records = dedup_col.count_documents({})
 
         source_pipeline = [
@@ -5046,8 +5122,8 @@ async def diagnosis_handler(message: types.Message):
 
 def get_recent_logs(lines_count=30):
     """Refactored log reader"""
-    # Logs are written to logs/bot9.log by the RotatingFileHandler
-    log_file = "logs/bot9.log"
+    # Logs are written to logs/bot3.log by the RotatingFileHandler
+    log_file = "logs/bot3.log"
     if not os.path.exists(log_file):
         # Fallback: try Render's stdout capture via /proc/1/fd/1 is not readable,
         # so we read from the rotating log file only.
@@ -5095,14 +5171,14 @@ async def refresh_terminal_callback(callback: types.CallbackQuery):
 GUIDE_PAGES = [
     # ── PAGE 1 ── Overview + Main Menu buttons
     (
-        "📚 <b>BOT 9 — COMPLETE GUIDE</b>\n"
+        "📚 <b>BOT 3 — COMPLETE GUIDE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📄 *Page 1 / 4 — Overview & Main Menu*\n\n"
 
-        "🤖 <b>WHAT IS BOT 9?</b>\n"
-        "Bot 9 is the <b>content management & analytics hub</b>.\n"
+        "🤖 <b>WHAT IS BOT 3?</b>\n"
+        "Bot 3 is the <b>content management & analytics hub</b>.\n"
         "It stores PDFs, IG content, affiliate links, YT links, and\n"
-        "generates unique tracking links for Bot 8 users.\n\n"
+        "generates unique tracking links for Bot 1 users.\n\n"
 
         "🏠 <b>MAIN MENU BUTTONS</b>\n"
         "┌─────────────────────────────\n"
@@ -5129,13 +5205,13 @@ GUIDE_PAGES = [
 
     # ── PAGE 2 ── ADD / LIST / SEARCH / LINKS
     (
-        "📚 <b>BOT 9 — COMPLETE GUIDE</b>\n"
+        "📚 <b>BOT 3 — COMPLETE GUIDE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📄 *Page 2 / 4 — Content Management*\n\n"
 
         "➕ <b>ADD MENU</b> *(Add new content)*\n"
         "├ 📄 <b>PDF</b> — Add / Edit / Delete / List PDFs\n"
-        "│   └ Each PDF gets a unique link for Bot 8 users\n"
+        "│   └ Each PDF gets a unique link for Bot 1 users\n"
         "│   └ Supports: name, link, MSA code, IG code, YT link\n"
         "├ 💸 <b>AFFILIATE</b> — Manage affiliate links per PDF\n"
         "│   └ Add / Edit / Delete / List affiliate links\n"
@@ -5163,12 +5239,12 @@ GUIDE_PAGES = [
         "├ 🏠 HOME YT   — YT homepage tracking link\n"
         "├ 📑 ALL PDF   — Direct PDF tracking links\n"
         "├ 📸 IG CC     — IG CC tracking links\n"
-        "└ All links auto-route users through Bot 8"
+        "└ All links auto-route users through Bot 1"
     ),
 
     # ── PAGE 3 ── Analytics / Diagnosis / Backup / Terminal
     (
-        "📚 <b>BOT 9 — COMPLETE GUIDE</b>\n"
+        "📚 <b>BOT 3 — COMPLETE GUIDE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📄 *Page 3 / 4 — Analytics, Diagnosis & Tools*\n\n"
 
@@ -5206,7 +5282,7 @@ GUIDE_PAGES = [
 
     # ── PAGE 4 ── Admins / Permissions / Ban / Roles
     (
-        "📚 <b>BOT 9 — COMPLETE GUIDE</b>\n"
+        "📚 <b>BOT 3 — COMPLETE GUIDE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📄 *Page 4 / 4 — Admin & Permission System*\n\n"
 
@@ -5217,7 +5293,7 @@ GUIDE_PAGES = [
         "├ 🔐 PERMISSIONS   — Set per-admin permissions\n"
         "├ 👔 ROLES         — Assign role presets\n"
         "├ 🔒 LOCK/UNLOCK   — Temporarily disable an admin\n"
-        "└ 🚫 BAN CONFIG    — Ban/unban users from Bot 8\n\n"
+        "└ 🚫 BAN CONFIG    — Ban/unban users from Bot 1\n\n"
 
         "🔐 <b>PERMISSION FLAGS</b> *(Per-admin access control)*\n"
         "├ can_list         — View content lists\n"
@@ -5232,7 +5308,7 @@ GUIDE_PAGES = [
         "└ can_reset        — Reset bot data (⚠️ dangerous)\n\n"
 
         "🚫 <b>BAN SYSTEM</b>\n"
-        "├ 🚫 BAN USER    — Block a user from Bot 8\n"
+        "├ 🚫 BAN USER    — Block a user from Bot 1\n"
         "├ ✅ UNBAN USER  — Remove a ban\n"
         "└ 📋 LIST BANNED — See all currently banned users\n\n"
 
@@ -5242,7 +5318,7 @@ GUIDE_PAGES = [
         "💡 <b>TIPS</b>\n"
         "• All actions are logged to console\n"
         "• Unauthorized access is auto-blocked & logged\n"
-        "• Bot 9 feeds content to Bot 8 in real-time\n"
+        "• Bot 3 feeds content to Bot 1 in real-time\n"
         "• Back buttons always available to navigate safely"
     ),
 ]
@@ -5318,7 +5394,7 @@ async def analytics_overview_handler(message: types.Message):
     """Show comprehensive analytics overview"""
     
     # Gather all stats efficiently using aggregation
-    total_pdfs = col_pdfs.count_documents({"link": {"$exists": True}})
+    total_pdfs = col_pdfs.count_documents({})
     total_ig_content = col_ig_content.count_documents({"cc_code": {"$exists": True}})
     
     # Use aggregation pipeline for efficient click totals (single query)
@@ -5739,8 +5815,8 @@ async def msa_id_pool_handler(message: types.Message):
     if not await check_authorization(message, "MSA ID Pool", "can_view_analytics"):
         return
     try:
-        # MSA IDs live in MSANODEDATA db (shared with bot8/bot10)
-        msa_col = client["MSANODEDATA"]["msa_ids"]
+        # MSA IDs live in MSANodeDB (shared with bot8/bot10)
+        msa_col = client[MONGO_DB_NAME]["msa_ids"]
         total_allocated = msa_col.count_documents({})
         total_retired = msa_col.count_documents({"retired": True})
         active_members = total_allocated - total_retired
@@ -5768,8 +5844,8 @@ async def msa_id_pool_handler(message: types.Message):
             f"🗄️ <b>Retired IDs (reserved):</b> {total_retired:,}\n"
             f"🔢 <b>Total Used (active+retired):</b> {total_allocated:,}\n"
             f"🟢 <b>Available:</b> {available:,}\n\n"
-            f"📈 <b>Usage Bar:</b>\n`[{bar}]`\n"
-            f"`{pct_used:.6f}%` used \u2014 {risk}\n\n"
+            f"📈 <b>Usage Bar:</b>\n<code>[{bar}]</code>\n"
+            f"<code>{pct_used:.6f}%</code> used \u2014 {risk}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🕒 {now_local().strftime('%B %d, %Y  %I:%M:%S %p')}"
         )
@@ -5784,13 +5860,13 @@ async def msa_id_pool_handler(message: types.Message):
 # --- DATA RESET HANDLER ---
 @dp.message(F.text == "⚠️ RESET BOT DATA")
 async def start_reset_data(message: types.Message, state: FSMContext):
-    # Security Check — Master Admin only
+    # Security Check — Master Admin only (NEVER allow sub-admins to reset)
     if message.from_user.id != MASTER_ADMIN_ID:
         await message.answer("⛔ <b>ACCESS DENIED.</b> Only the Master Admin can perform this action.", parse_mode="HTML")
         return
 
     await state.set_state(ResetStates.waiting_for_confirm_button)
-    
+
     keyboard = [
         [KeyboardButton(text="🔴 CONFIRM RESET")],
         [KeyboardButton(text="❌ CANCEL")]
@@ -5807,102 +5883,137 @@ async def start_reset_data(message: types.Message, state: FSMContext):
         "• All User Activity & Click Dedup Records\n"
         "• All Backup Records\n\n"
         "🔴 <b>THIS ACTION CANNOT BE UNDONE.</b>\n\n"
-        "<b>STEP 1 OF 2 — Click the button to proceed:</b>",
+        "<b>STEP 1 OF 3 — Click the button to proceed:</b>",
         reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
         parse_mode="HTML"
     )
 
 @dp.message(ResetStates.waiting_for_confirm_button)
 async def process_reset_step1(message: types.Message, state: FSMContext):
-    if message.text == "❌ CANCEL":
+    # Any message other than the exact button cancels the reset
+    if message.text != "🔴 CONFIRM RESET":
         await state.clear()
         return await message.answer("✅ Reset Cancelled.", reply_markup=get_main_menu(message.from_user.id))
-    
-    if message.text == "🔴 CONFIRM RESET":
-        await state.set_state(ResetStates.waiting_for_confirm_text)
-        
-        keyboard = [[KeyboardButton(text="❌ CANCEL")]]
-        
-        await message.answer(
-            "🛑 <b>STEP 2 OF 2 — FINAL CONFIRMATION</b> 🛑\n\n"
-            "To execute the <b>COMPLETE SYSTEM WIPE</b>, type the word below exactly:\n\n"
-            "```\nCONFIRM\n```\n\n"
-            "Any other input (or ❌ CANCEL) will abort the operation.",
-            reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer("⚠️ Please select an option.")
+
+    # Generate a one-time random PIN — must be typed exactly to proceed
+    reset_pin = "".join(str(random.randint(0, 9)) for _ in range(8))
+    await state.update_data(reset_pin=reset_pin)
+    await state.set_state(ResetStates.waiting_for_confirm_text)
+
+    keyboard = [[KeyboardButton(text="❌ CANCEL")]]
+    await message.answer(
+        "🛑 <b>STEP 2 OF 3 — ENTER THE SECURITY PIN</b> 🛑\n\n"
+        "This is a <b>one-time security PIN</b> that proves you are intentionally erasing all data.\n\n"
+        f"Type this PIN exactly (no spaces):\n\n"
+        f"<code>{reset_pin}</code>\n\n"
+        "⚠️ This PIN is valid for this session only.\n"
+        "Any other input or ❌ CANCEL will abort the operation.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
+        parse_mode="HTML"
+    )
 
 @dp.message(ResetStates.waiting_for_confirm_text)
 async def process_reset_final(message: types.Message, state: FSMContext):
-    if message.text == "❌ CANCEL":
+    # Retrieve stored PIN from FSM state
+    data = await state.get_data()
+    expected_pin = data.get("reset_pin", "")
+
+    # Any message that does not exactly match the PIN cancels the process
+    if message.text.strip() != expected_pin:
         await state.clear()
-        return await message.answer("✅ Reset Cancelled.", reply_markup=get_main_menu(message.from_user.id))
-        
-    if message.text.upper() == "CONFIRM":
-        msg = await message.answer("🧨 <b>INITIATING COMPLETE SYSTEM WIPE...</b>", reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
-        
-        try:
-            # 1. Drop ALL bot9 collections
-            collections_to_wipe = [
-                "bot9_pdfs",
-                "bot9_ig_content",
-                "bot9_logs",
-                "bot9_settings",
-                "bot9_backups",
-                "bot9_admins",
-                "bot9_banned_users",
-                "bot9_user_activity",
-                "bot9_state",
-            ]
-            wiped = []
-            for coll_name in collections_to_wipe:
-                db.drop_collection(coll_name)
-                wiped.append(coll_name)
+        return await message.answer(
+            "✅ Reset Cancelled. PIN did not match — no data was erased.",
+            reply_markup=get_main_menu(message.from_user.id)
+        )
 
-            # 2. Truncate log file if exists
-            for log_file in ["bot9.log", "logs/bot9.log"]:
-                if os.path.exists(log_file):
-                    with open(log_file, "w"):
-                        pass
+    # PIN matched — ask for the final typed word as a last safeguard
+    new_pin = "".join(str(random.randint(0, 9)) for _ in range(6))
+    await state.update_data(reset_final_word=new_pin)
 
-            # 3. Delete local backup files
-            backup_dir = "backups"
-            if os.path.exists(backup_dir):
-                import shutil
-                shutil.rmtree(backup_dir)
+    keyboard = [[KeyboardButton(text="❌ CANCEL")]]
+    await message.answer(
+        "🚨 <b>STEP 3 OF 3 — ABSOLUTE FINAL CONFIRMATION</b> 🚨\n\n"
+        "You are about to permanently wipe <b>ALL data</b>.\n\n"
+        f"Type this final code to execute the wipe:\n\n"
+        f"<code>WIPE-{new_pin}</code>\n\n"
+        "❌ Anything else cancels immediately.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
+        parse_mode="HTML"
+    )
+    await state.set_state(ResetStates.waiting_for_final_wipe_code)
 
-            # 4. Re-seed master admin so the bot stays usable
-            try:
-                col_admins.insert_one({
-                    "user_id": MASTER_ADMIN_ID,
-                    "is_owner": True,
-                    "is_locked": False,
-                    "permissions": list(PERMISSIONS.keys()),
-                    "full_name": "Master Admin",
-                    "username": "owner",
-                    "added_at": now_local(),
-                })
-            except Exception:
-                pass  # Already exists is fine
+@dp.message(ResetStates.waiting_for_final_wipe_code)
+async def process_reset_execute(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    expected_word = f"WIPE-{data.get('reset_final_word', '')}"
 
-            wiped_str = "\n".join([f"• `{c}`" for c in wiped])
-            await message.answer(
-                f"✅ <b>SYSTEM RESET COMPLETE</b>\n\n"
-                f"🗑 <b>Wiped collections:</b>\n{wiped_str}\n\n"
-                f"🔄 Master Admin account re-seeded.\n"
-                f"🤖 System is clean and ready.",
-                reply_markup=get_main_menu(message.from_user.id),
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await message.answer(f"❌ <b>RESET FAILED:</b> `{e}`", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
-            
+    if message.text.strip() != expected_word:
         await state.clear()
-    else:
-        await state.clear()
-        await message.answer("✅ Reset Cancelled. Input did not match 'CONFIRM'.", reply_markup=get_main_menu(message.from_user.id))
+        return await message.answer(
+            "✅ Reset Cancelled. Code did not match — no data was erased.",
+            reply_markup=get_main_menu(message.from_user.id)
+        )
+
+    # All 3 confirmations passed — execute the wipe
+    await state.clear()
+    await message.answer("🧨 <b>INITIATING COMPLETE SYSTEM WIPE...</b>", reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
+
+    try:
+        collections_to_wipe = [
+            "bot3_pdfs",
+            "bot3_ig_content",
+            "bot3_logs",
+            "bot3_settings",
+            "bot3_backups",
+            "bot3_admins",
+            "bot3_banned_users",
+            "bot3_user_activity",
+            "bot3_state",
+        ]
+        wiped = []
+        for coll_name in collections_to_wipe:
+            db.drop_collection(coll_name)
+            wiped.append(coll_name)
+
+        # Truncate log file if exists
+        for log_file in ["bot3.log", "logs/bot3.log"]:
+            if os.path.exists(log_file):
+                with open(log_file, "w"):
+                    pass
+
+        # Delete local backup files
+        backup_dir = "backups"
+        if os.path.exists(backup_dir):
+            import shutil
+            shutil.rmtree(backup_dir)
+
+        # Re-seed master admin so the bot stays usable after wipe
+        col_admins.update_one(
+            {"user_id": MASTER_ADMIN_ID},
+            {"$set": {
+                "user_id": MASTER_ADMIN_ID,
+                "is_owner": True,
+                "is_locked": False,
+                "permissions": list(PERMISSIONS.keys()),
+                "full_name": message.from_user.full_name or "Master Admin",
+                "username": message.from_user.username or "owner",
+                "added_at": now_local(),
+            }},
+            upsert=True
+        )
+
+        wiped_str = "\n".join([f"• <code>{c}</code>" for c in wiped])
+        await message.answer(
+            f"✅ <b>SYSTEM RESET COMPLETE</b>\n\n"
+            f"🗑 <b>Wiped collections:</b>\n{wiped_str}\n\n"
+            f"🔄 Master Admin account re-seeded.\n"
+            f"🤖 System is clean and ready.",
+            reply_markup=get_main_menu(message.from_user.id),
+            parse_mode="HTML"
+        )
+        logger.warning(f"⚠️ FULL SYSTEM RESET executed by MASTER_ADMIN {message.from_user.id}")
+    except Exception as e:
+        await message.answer(f"❌ <b>RESET FAILED:</b> <code>{e}</code>", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
 
 # 5. IG AFFILIATE MANAGEMENT HANDLERS
 # ==========================================
@@ -6334,7 +6445,7 @@ async def not_implemented_handler(message: types.Message):
 # ==========================================
 
 # Backup collection for metadata
-col_backups = db["bot9_backups"]
+col_backups = db["bot3_backups"]
 
 def get_month_year_name():
     """Get current month and year in format: 2026_February"""
@@ -6345,144 +6456,174 @@ def get_month_year_name():
 
 async def create_backup_file(auto=False):
     """
-    Create compressed backup file with all data.
+    Create a ZIP backup containing one JSON file per collection.
     Returns: (success: bool, filepath: str, metadata: dict)
     """
     import zipfile
     import json
     import tempfile
-    
+
+    def _serialize(docs):
+        """Convert ObjectId / datetime fields to JSON-safe strings (12-h time)."""
+        result = []
+        for doc in docs:
+            d = dict(doc)
+            if '_id' in d:
+                d['_id'] = str(d['_id'])
+            for k, v in d.items():
+                if isinstance(v, datetime):
+                    d[k] = v.strftime("%Y-%m-%d %I:%M:%S %p")
+            result.append(d)
+        return result
+
     try:
-        # Create backups directory
         backup_dir = "backups"
         os.makedirs(backup_dir, exist_ok=True)
-        
-        # Get month/year naming
-        month_year = get_month_year_name()
-        filename = f"Backup_{month_year}.zip"
-        filepath = os.path.join(backup_dir, filename)
-        
-        # Check if backup already exists for this month
-        if os.path.exists(filepath) and auto:
-            logger.info(f"Backup for {month_year} already exists, skipping auto-backup")
-            return True, filepath, None
-        
-        # Collect all data
-        all_pdfs = list(col_pdfs.find({}))
-        all_ig_content = list(col_ig_content.find({}))
-        
-        # Convert ObjectId and datetime to string for JSON serialization
-        for pdf in all_pdfs:
-            if '_id' in pdf:
-                pdf['_id'] = str(pdf['_id'])
-            for field in ['created_at', 'last_clicked_at', 'last_affiliate_click', 'last_ig_click', 'last_yt_click', 'last_yt_code_click']:
-                if field in pdf and isinstance(pdf[field], datetime):
-                    pdf[field] = pdf[field].strftime("%Y-%m-%d %I:%M:%S %p")
-        
-        for ig in all_ig_content:
-            if '_id' in ig:
-                ig['_id'] = str(ig['_id'])
-            for field in ['created_at', 'last_ig_cc_click']:
-                if field in ig and isinstance(ig[field], datetime):
-                    ig[field] = ig[field].strftime("%Y-%m-%d %I:%M:%S %p")
-        
-        # Calculate statistics
-        total_clicks = sum(p.get('clicks', 0) for p in all_pdfs)
-        total_ig_clicks = sum(p.get('ig_start_clicks', 0) for p in all_pdfs)
-        total_yt_clicks = sum(p.get('yt_start_clicks', 0) for p in all_pdfs)
-        total_ig_cc_clicks = sum(ig.get('ig_cc_clicks', 0) for ig in all_ig_content)
-        
-        # Create metadata
-        now_ts = now_local()
-        metadata = {
-            "backup_type": "auto" if auto else "manual",
-            "created_at": now_ts,
-            "month": now_ts.strftime("%B"),
-            "month_num": now_ts.month,            # numeric for sorting (1-12)
-            "year": now_ts.year,
-            "backup_key": f"{now_ts.year}/{now_ts.month:02d}",   # e.g. "2026/01"
-            "filename": filename,
-            "pdfs_count": len(all_pdfs),
-            "ig_count": len(all_ig_content),
-            "total_clicks": total_clicks,
-            "total_ig_clicks": total_ig_clicks,
-            "total_yt_clicks": total_yt_clicks,
-            "total_ig_cc_clicks": total_ig_cc_clicks
+
+        now_ts      = now_local()
+        month_year  = get_month_year_name()                          # e.g. "March_2026"
+        ts_label    = now_ts.strftime("%Y-%m-%d_%I-%M-%S_%p")       # e.g. "2026-03-12_02-00-00_AM"
+        filename    = f"Backup_{month_year}_{ts_label}.zip"
+        filepath    = os.path.join(backup_dir, filename)
+
+        # ── Collect all collections ──────────────────────────────────────────
+        collections_data = {
+            "bot3_pdfs":         _serialize(list(col_pdfs.find({}))),
+            "bot3_ig_content":   _serialize(list(col_ig_content.find({}))),
+            "bot3_admins":       _serialize(list(col_admins.find({}))),
+            "bot3_settings":     _serialize(list(col_settings.find({}))),
+            "bot3_banned_users": _serialize(list(col_banned_users.find({}))),
+            "bot3_logs":         _serialize(list(col_logs.find({}).sort("created_at", -1).limit(500))),
         }
-        
-        # Create temporary JSON files
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_pdfs:
-            json.dump(all_pdfs, temp_pdfs, indent=2, default=str)
-            temp_pdfs_path = temp_pdfs.name
-        
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_ig:
-            json.dump(all_ig_content, temp_ig, indent=2, default=str)
-            temp_ig_path = temp_ig.name
-        
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_meta:
-            meta_for_file = metadata.copy()
-            meta_for_file['created_at'] = meta_for_file['created_at'].strftime("%Y-%m-%d %I:%M:%S %p")
-            json.dump(meta_for_file, temp_meta, indent=2)
-            temp_meta_path = temp_meta.name
-        
-        # Create ZIP file with compression
-        with zipfile.ZipFile(filepath, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(temp_pdfs_path, "pdfs.json")
-            zipf.write(temp_ig_path, "ig_content.json")
-            zipf.write(temp_meta_path, "metadata.json")
-        
-        # Clean up temp files
-        os.remove(temp_pdfs_path)
-        os.remove(temp_ig_path)
-        os.remove(temp_meta_path)
-        
-        # Get file size
+
+        # ── Click totals for metadata ────────────────────────────────────────
+        pdfs_list = collections_data["bot3_pdfs"]
+        ig_list   = collections_data["bot3_ig_content"]
+        total_clicks     = sum(p.get('clicks', 0) for p in pdfs_list)
+        total_ig_clicks  = sum(p.get('ig_start_clicks', 0) for p in pdfs_list)
+        total_yt_clicks  = sum(p.get('yt_start_clicks', 0) for p in pdfs_list)
+        total_igcc_clicks= sum(p.get('ig_cc_clicks', 0) for p in ig_list)
+        total_ytcode_clicks = sum(p.get('yt_code_clicks', 0) for p in pdfs_list)
+
+        metadata = {
+            "backup_type":        "auto" if auto else "manual",
+            "created_at":         now_ts,
+            "created_at_str":     now_ts.strftime("%Y-%m-%d %I:%M:%S %p"),
+            "month":              now_ts.strftime("%B"),
+            "month_num":          now_ts.month,
+            "year":               now_ts.year,
+            "backup_key":         f"{now_ts.year}/{now_ts.month:02d}",
+            "filename":           filename,
+            "pdfs_count":         len(pdfs_list),
+            "ig_count":           len(ig_list),
+            "admins_count":       len(collections_data["bot3_admins"]),
+            "banned_count":       len(collections_data["bot3_banned_users"]),
+            "total_clicks":       total_clicks,
+            "total_ig_clicks":    total_ig_clicks,
+            "total_yt_clicks":    total_yt_clicks,
+            "total_igcc_clicks":  total_igcc_clicks,
+            "total_ytcode_clicks":total_ytcode_clicks,
+        }
+
+        # ── Build ZIP: one JSON per collection + metadata.json ───────────────
+        temp_files = {}
+        try:
+            for col_name, docs in collections_data.items():
+                tf = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                                 delete=False, suffix='.json')
+                json.dump(docs, tf, indent=2, default=str, ensure_ascii=False)
+                tf.close()
+                temp_files[col_name] = tf.name
+
+            meta_tf = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                                  delete=False, suffix='.json')
+            meta_copy = dict(metadata)
+            meta_copy['created_at'] = meta_copy['created_at_str']
+            json.dump(meta_copy, meta_tf, indent=2, ensure_ascii=False)
+            meta_tf.close()
+
+            with zipfile.ZipFile(filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for col_name, tmp_path in temp_files.items():
+                    zf.write(tmp_path, f"{col_name}.json")
+                zf.write(meta_tf.name, "metadata.json")
+        finally:
+            for tmp_path in temp_files.values():
+                try: os.remove(tmp_path)
+                except: pass
+            try: os.remove(meta_tf.name)
+            except: pass
+
         file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
         metadata['file_size_mb'] = round(file_size_mb, 2)
-        
-        # Save metadata to database
-        col_backups.insert_one(metadata)
-        
-        logger.info(f"✅ Backup created: {filename} ({file_size_mb:.2f} MB)")
-        
+
+        # ── Upsert into backup history (keyed by filename for idempotency) ───
+        meta_db = dict(metadata)
+        meta_db.pop('created_at', None)   # keep only the str version for clean storage
+        col_backups.update_one(
+            {"filename": filename},
+            {"$set": meta_db},
+            upsert=True
+        )
+
+        logger.info(f"✅ Backup created: {filename} ({file_size_mb:.2f} MB, "
+                    f"{len(pdfs_list)} PDFs, {len(ig_list)} IG)")
         return True, filepath, metadata
-        
+
     except Exception as e:
         logger.error(f"❌ Backup creation failed: {e}")
         return False, None, None
 
-# NOTE: Auto-cleanup removed - all backups are kept permanently for data integrity
-# This follows industry best practices where critical data is archived indefinitely
+# NOTE: All backups are kept permanently — never auto-deleted for data integrity.
 
 async def auto_backup_task():
-    """Background task that creates monthly backups automatically"""
+    """Background task — creates + delivers monthly backup on the 1st at 2 AM."""
     while True:
         try:
             now = now_local()
-            
-            # Run on 1st of month at 2 AM
+
             if now.day == 1 and now.hour == 2:
-                logger.info("🔄 Starting auto-backup...")
+                logger.info("🔄 Starting scheduled monthly auto-backup...")
                 success, filepath, metadata = await create_backup_file(auto=True)
-                
+
                 if success and metadata:
                     logger.info(f"✅ Auto-backup completed: {metadata['filename']}")
-                    
-                    # Notify master admin of successful backup
+                    caption = (
+                        f"✅ <b>MONTHLY AUTO-BACKUP</b>\n\n"
+                        f"📦 <b>File:</b> <code>{metadata['filename']}</code>\n"
+                        f"💾 <b>Size:</b> {metadata['file_size_mb']:.2f} MB\n"
+                        f"🕐 <b>Created:</b> {metadata['created_at_str']}\n\n"
+                        f"<b>📊 Contents:</b>\n"
+                        f"├ 📄 pdfs.json — {metadata['pdfs_count']} records\n"
+                        f"├ 📸 ig_content.json — {metadata['ig_count']} records\n"
+                        f"├ 👤 admins.json — {metadata['admins_count']} records\n"
+                        f"├ 🚫 banned_users.json — {metadata['banned_count']} records\n"
+                        f"├ ⚙️ settings.json\n"
+                        f"├ 📝 logs.json (last 500)\n"
+                        f"└ 📋 metadata.json\n\n"
+                        f"<b>🎯 Click Stats:</b>\n"
+                        f"├ 📸 IG: {metadata['total_ig_clicks']:,}\n"
+                        f"├ ▶️ YT: {metadata['total_yt_clicks']:,}\n"
+                        f"├ 📸 IGCC: {metadata['total_igcc_clicks']:,}\n"
+                        f"└ 🔑 YT Code: {metadata['total_ytcode_clicks']:,}\n\n"
+                        f"🔄 Auto-backup — delivered on schedule."
+                    )
                     try:
-                        await bot.send_message(
+                        await bot.send_document(
                             MASTER_ADMIN_ID,
-                            f"✅ <b>AUTO-BACKUP SUCCESSFUL</b>\n\n"
-                            f"📦 File: `{metadata['filename']}`\n"
-                            f"💾 Size: {metadata['file_size_mb']:.2f} MB\n"
-                            f"📊 PDFs: {metadata['pdfs_count']} | IG: {metadata['ig_count']}\n"
-                            f"🕐 Time: {now.strftime('%I:%M %p')}",
+                            types.FSInputFile(filepath),
+                            caption=caption,
                             parse_mode="HTML"
                         )
-                    except:
-                        pass
+                    except Exception as send_err:
+                        logger.error(f"❌ Could not send auto-backup file: {send_err}")
+                        await bot.send_message(
+                            MASTER_ADMIN_ID,
+                            f"✅ <b>Auto-backup created</b> but file could not be sent to Telegram.\n"
+                            f"📦 File: <code>{metadata['filename']}</code>\n"
+                            f"❌ Error: <code>{send_err}</code>",
+                            parse_mode="HTML"
+                        )
                 else:
-                    # CRITICAL: Notify admin of backup failure
                     try:
                         await bot.send_message(
                             MASTER_ADMIN_ID,
@@ -6495,30 +6636,27 @@ async def auto_backup_task():
                         )
                     except:
                         logger.error("Could not notify admin of backup failure!")
-                
-                # Sleep for 2 hours to avoid re-triggering
+
+                # Sleep 2 hours to avoid re-triggering on the same day
                 await asyncio.sleep(7200)
             else:
                 # Check every hour
                 await asyncio.sleep(3600)
-                
+
         except Exception as e:
             logger.error(f"❌ Auto-backup task error: {e}")
-            
-            # CRITICAL: Notify admin of system error
             try:
                 await bot.send_message(
                     MASTER_ADMIN_ID,
                     f"🚨 <b>BACKUP SYSTEM ERROR!</b>\n\n"
-                    f"❌ Error: `{str(e)}`\n"
+                    f"❌ Error: <code>{str(e)}</code>\n"
                     f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
                     f"The auto-backup system encountered an error.",
                     parse_mode="HTML"
                 )
             except:
                 logger.error("Could not notify admin of backup system error!")
-            
-            await asyncio.sleep(3600)  # Wait an hour before retrying
+            await asyncio.sleep(3600)
 
 @dp.message(F.text == "💾 BACKUP DATA", StateFilter(None))
 async def backup_menu_handler(message: types.Message, state: FSMContext):
@@ -6529,10 +6667,10 @@ async def backup_menu_handler(message: types.Message, state: FSMContext):
     await message.answer(
         "💾 <b>BACKUP & EXPORT</b>\n\n"
         "Choose a backup option:\n\n"
-        "💾 <b>FULL BACKUP</b> - Export all data with timestamps\n"
-        "📋 <b>VIEW AS JSON</b> - See backup in JSON format\n"
-        "📊 <b>BACKUP STATS</b> - View database statistics\n"
-        "📜 <b>BACKUP HISTORY</b> - View all monthly backup reports\n\n"
+        "💾 <b>FULL BACKUP</b> — Create ZIP with all collections + receive file\n"
+        "📋 <b>VIEW AS JSON</b> — Send each collection as a separate JSON file\n"
+        "📊 <b>BACKUP STATS</b> — View database collection statistics\n"
+        "📜 <b>BACKUP HISTORY</b> — View all monthly backup records\n\n"
         "Select an option:",
         reply_markup=get_backup_menu(),
         parse_mode="HTML"
@@ -6542,21 +6680,16 @@ async def backup_menu_handler(message: types.Message, state: FSMContext):
 async def full_backup_handler(message: types.Message):
     if not await check_authorization(message, "Full Backup", "can_manage_admins"):
         return
-    """Create full backup of all data"""
+    """Create full backup ZIP and send it"""
     try:
-        # Show processing message
-        processing_msg = await message.answer("⏳ Creating compressed backup file...")
-        
-        # Create backup file
+        processing_msg = await message.answer("⏳ Creating backup — packaging all collections...")
+
         success, filepath, metadata = await create_backup_file(auto=False)
-        
-        # Delete processing message
+
         await processing_msg.delete()
-        
+
         if not success:
             await message.answer("❌ Backup failed. Please try again later.")
-            
-            # CRITICAL: Notify master admin of manual backup failure
             try:
                 await bot.send_message(
                     MASTER_ADMIN_ID,
@@ -6568,49 +6701,51 @@ async def full_backup_handler(message: types.Message):
                     parse_mode="HTML"
                 )
             except:
-                logger.error("Could not notify admin of manual backup failure!")
-            
+                pass
             return
-        
-        # Get timestamp
-        now = now_local()
-        timestamp_12h = now.strftime("%Y-%m-%d %I:%M:%S %p")
-        
-        # Build backup summary
-        backup_text = f"✅ <b>BACKUP CREATED SUCCESSFULLY!</b>\n"
-        backup_text += f"═══════════════════════════\n\n"
-        backup_text += f"📦 <b>File:</b> `{metadata['filename']}`\n"
-        backup_text += f"💾 <b>Size:</b> {metadata['file_size_mb']:.2f} MB\n"
-        backup_text += f"🕐 <b>Created:</b> {timestamp_12h}\n\n"
-        
-        backup_text += f"📊 <b>DATA SUMMARY:</b>\n"
-        backup_text += f"├ 📄 PDFs: {metadata['pdfs_count']}\n"
-        backup_text += f"└ 📸 IG Content: {metadata['ig_count']}\n\n"
-        
-        backup_text += f"🎯 <b>CLICK STATISTICS:</b>\n"
-        backup_text += f"├ Total Clicks: {metadata['total_clicks']:,}\n"
-        backup_text += f"├ YT Clicks: {metadata['total_yt_clicks']:,}\n"
-        backup_text += f"└ IGCC Clicks: {metadata['total_ig_cc_clicks']:,}\n\n"
-        
-        backup_text += f"═══════════════════════════\n"
-        backup_text += f"💡 <b>Backup Location:</b>\n`backups/{metadata['filename']}`\n\n"
-        backup_text += f"🔒 Data is compressed and saved securely!"
-        
-        await message.answer(backup_text, parse_mode="HTML")
-        
-        # Log the backup action
-        log_user_action(message.from_user, "FULL_BACKUP", f"Created {metadata['filename']} ({metadata['file_size_mb']:.2f} MB)")
-        
+
+        now_str = now_local().strftime("%Y-%m-%d %I:%M:%S %p")
+
+        caption = (
+            f"✅ <b>FULL BACKUP CREATED</b>\n"
+            f"═══════════════════════\n\n"
+            f"📦 <b>File:</b> <code>{metadata['filename']}</code>\n"
+            f"💾 <b>Size:</b> {metadata['file_size_mb']:.2f} MB\n"
+            f"🕐 <b>Created:</b> {now_str}\n\n"
+            f"<b>📊 Collections inside ZIP:</b>\n"
+            f"├ 📄 pdfs.json — {metadata['pdfs_count']} records\n"
+            f"├ 📸 ig_content.json — {metadata['ig_count']} records\n"
+            f"├ 👤 admins.json — {metadata['admins_count']} records\n"
+            f"├ 🚫 banned_users.json — {metadata['banned_count']} records\n"
+            f"├ ⚙️ settings.json\n"
+            f"├ 📝 logs.json (last 500)\n"
+            f"└ 📋 metadata.json\n\n"
+            f"<b>🎯 Click Stats:</b>\n"
+            f"├ 📸 IG: {metadata['total_ig_clicks']:,}\n"
+            f"├ ▶️ YT: {metadata['total_yt_clicks']:,}\n"
+            f"├ 📸 IGCC: {metadata['total_igcc_clicks']:,}\n"
+            f"└ 🔑 YT Code: {metadata['total_ytcode_clicks']:,}\n\n"
+            f"═══════════════════════\n"
+            f"💡 File sent above — save it to your device!"
+        )
+
+        await message.answer_document(
+            types.FSInputFile(filepath),
+            caption=caption,
+            parse_mode="HTML"
+        )
+
+        log_user_action(message.from_user, "FULL_BACKUP",
+                        f"Created {metadata['filename']} ({metadata['file_size_mb']:.2f} MB)")
+
     except Exception as e:
         logger.error(f"Backup error: {e}")
         await message.answer("❌ Backup failed. Please try again later.")
-        
-        # CRITICAL: Notify master admin of backup exception
         try:
             await bot.send_message(
                 MASTER_ADMIN_ID,
                 f"🚨 <b>BACKUP EXCEPTION!</b>\n\n"
-                f"❌ Error: `{str(e)}`\n"
+                f"❌ Error: <code>{str(e)}</code>\n"
                 f"👤 User: {message.from_user.first_name or 'Unknown'} (ID: {message.from_user.id})\n"
                 f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
                 f"Check the backup system immediately!",
@@ -6625,139 +6760,165 @@ async def full_backup_handler(message: types.Message):
 async def view_json_backup_handler(message: types.Message):
     if not await check_authorization(message, "View JSON Backup", "can_manage_admins"):
         return
-    """Export backup as JSON format"""
+    """Export each collection as a separate JSON file and send them all"""
+    import json as _json
+    import tempfile as _tempfile
+
+    processing_msg = await message.answer("⏳ Generating JSON exports for all collections...")
+
     try:
-        # Show processing message
-        processing_msg = await message.answer("⏳ Generating JSON backup...")
-        
-        # Get current timestamp
-        now = now_local()
-        timestamp_12h = now.strftime("%Y-%m-%d %I:%M:%S %p")
-        filename_timestamp = now.strftime("%Y-%m-%d_%I-%M-%S_%p")
-        
-        # Collect all data
-        all_pdfs = list(col_pdfs.find({}))
-        all_ig_content = list(col_ig_content.find({}))
-        
-        # Convert ObjectId and datetime to strings
-        import json
-        for pdf in all_pdfs:
-            if '_id' in pdf:
-                pdf['_id'] = str(pdf['_id'])
-            for field in ['created_at', 'last_clicked_at', 'last_affiliate_click', 'last_ig_click', 'last_yt_click', 'last_yt_code_click']:
-                if field in pdf and isinstance(pdf[field], datetime):
-                    pdf[field] = pdf[field].strftime("%Y-%m-%d %I:%M:%S %p")
-        
-        for ig in all_ig_content:
-            if '_id' in ig:
-                ig['_id'] = str(ig['_id'])
-            for field in ['created_at', 'last_ig_cc_click']:
-                if field in ig and isinstance(ig[field], datetime):
-                    ig[field] = ig[field].strftime("%Y-%m-%d %I:%M:%S %p")
-        
-        # Create JSON structure
-        backup_data = {
-            "backup_timestamp": timestamp_12h,
-            "backup_timezone": "Local Time",
-            "total_pdfs": len(all_pdfs),
-            "total_ig_content": len(all_ig_content),
-            "pdfs": all_pdfs,
-            "ig_content": all_ig_content
+        now     = now_local()
+        ts_str  = now.strftime("%Y-%m-%d %I:%M:%S %p")
+        ts_file = now.strftime("%Y-%m-%d_%I-%M-%S_%p")
+
+        def _serialize(docs):
+            result = []
+            for doc in docs:
+                d = dict(doc)
+                if '_id' in d:
+                    d['_id'] = str(d['_id'])
+                for k, v in d.items():
+                    if isinstance(v, datetime):
+                        d[k] = v.strftime("%Y-%m-%d %I:%M:%S %p")
+                result.append(d)
+            return result
+
+        collections = {
+            f"bot3_pdfs_{ts_file}.json":          _serialize(list(col_pdfs.find({}))),
+            f"bot3_ig_content_{ts_file}.json":    _serialize(list(col_ig_content.find({}))),
+            f"bot3_admins_{ts_file}.json":         _serialize(list(col_admins.find({}))),
+            f"bot3_settings_{ts_file}.json":       _serialize(list(col_settings.find({}))),
+            f"bot3_banned_users_{ts_file}.json":   _serialize(list(col_banned_users.find({}))),
+            f"bot3_logs_{ts_file}.json":           _serialize(list(col_logs.find({}).sort("created_at", -1).limit(500))),
         }
-        
-        # Convert to JSON string with pretty formatting
-        json_output = json.dumps(backup_data, indent=2, ensure_ascii=False)
-        
-        # Save to file
-        os.makedirs('backups', exist_ok=True)
-        filename = f"backups/backup_{filename_timestamp}.json"
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(json_output)
-        
-        # Delete processing message
+
         await processing_msg.delete()
-        
-        # Send file to user
-        await message.answer_document(
-            types.FSInputFile(filename),
-            caption=f"📋 <b>JSON BACKUP</b>\n\n"
-                   f"🕐 Time: {timestamp_12h}\n"
-                   f"📊 PDFs: {len(all_pdfs)}\n"
-                   f"📸 IG Content: {len(all_ig_content)}\n\n"
-                   f"✅ Backup exported successfully!",
-            parse_mode="HTML"
-        )
-        
-        # Log the action
-        log_user_action(message.from_user, "JSON_BACKUP", f"Exported as {filename}")
-        
+
+        for filename, docs in collections.items():
+            tf = _tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                              delete=False, suffix='.json')
+            _json.dump(docs, tf, indent=2, default=str, ensure_ascii=False)
+            tf.close()
+            try:
+                col_label = filename.split('_')[0]
+                await message.answer_document(
+                    types.FSInputFile(tf.name, filename=filename),
+                    caption=(
+                        f"📋 <b>{col_label.upper()}</b>\n"
+                        f"🕐 {ts_str}\n"
+                        f"📊 {len(docs):,} records"
+                    ),
+                    parse_mode="HTML"
+                )
+            finally:
+                try: os.remove(tf.name)
+                except: pass
+
+        log_user_action(message.from_user, "JSON_BACKUP",
+                        f"Exported {len(collections)} collection files at {ts_str}")
+
     except Exception as e:
         logger.error(f"JSON backup error: {e}")
-        # Use plain text for error message to avoid markdown parsing issues
-        await message.answer("❌ JSON backup failed. Please try again later.")
+        try: await processing_msg.delete()
+        except: pass
+        await message.answer("❌ JSON export failed. Please try again later.")
 
 @dp.message(F.text == "📊 BACKUP STATS")
 async def backup_stats_handler(message: types.Message):
     if not await check_authorization(message, "Backup Stats", "can_manage_users"):
         return
-    """Show database statistics"""
+    """Show full database collection statistics"""
     try:
-        # Get collection stats
-        pdf_count = col_pdfs.count_documents({})
-        ig_count = col_ig_content.count_documents({})
-        
-        # Get database size (approximate)
-        db_stats = db.command("dbstats")
-        db_size_mb = db_stats.get("dataSize", 0) / (1024 * 1024)  # Convert to MB
-        
-        # Get collection details
-        pdf_stats = db.command("collStats", "bot9_pdfs")
-        ig_stats = db.command("collStats", "bot9_ig_content")
-        
-        pdf_size_mb = pdf_stats.get("size", 0) / (1024 * 1024)
-        ig_size_mb = ig_stats.get("size", 0) / (1024 * 1024)
-        
-        # Build stats message
-        stats_text = f"📊 <b>DATABASE STATISTICS</b>\n"
-        stats_text += f"═══════════════════════════\n\n"
-        
-        stats_text += f"💾 <b>STORAGE:</b>\n"
-        stats_text += f"├ Total DB Size: {db_size_mb:.2f} MB\n"
-        stats_text += f"├ PDFs Collection: {pdf_size_mb:.2f} MB\n"
-        stats_text += f"└ IG Collection: {ig_size_mb:.2f} MB\n\n"
-        
-        stats_text += f"📁 <b>COLLECTIONS:</b>\n"
-        stats_text += f"├ `bot9_pdfs`: {pdf_count:,} documents\n"
-        stats_text += f"└ `bot9_ig_content`: {ig_count:,} documents\n\n"
-        
-        # Index information
-        pdf_indexes = col_pdfs.list_indexes()
-        ig_indexes = col_ig_content.list_indexes()
-        
-        pdf_index_count = sum(1 for _ in pdf_indexes)
-        ig_index_count = sum(1 for _ in ig_indexes)
-        
-        stats_text += f"🔍 <b>INDEXES:</b>\n"
-        stats_text += f"├ PDFs: {pdf_index_count} indexes\n"
-        stats_text += f"└ IG Content: {ig_index_count} indexes\n\n"
-        
-        # Recent activity
-        recent_pdfs = col_pdfs.count_documents({"created_at": {"$gte": now_local().replace(hour=0, minute=0, second=0, microsecond=0)}})
-        recent_ig = col_ig_content.count_documents({"created_at": {"$gte": now_local().replace(hour=0, minute=0, second=0, microsecond=0)}})
-        
-        stats_text += f"📈 <b>TODAY'S ACTIVITY:</b>\n"
-        stats_text += f"├ New PDFs: {recent_pdfs}\n"
-        stats_text += f"└ New IG Content: {recent_ig}\n\n"
-        
-        stats_text += f"═══════════════════════════\n"
-        stats_text += f"🕐 <b>Updated:</b> {now_local().strftime('%I:%M:%S %p')}"
-        
-        await message.answer(stats_text, parse_mode="HTML")
-        
+        # Per-collection counts
+        pdf_count      = col_pdfs.count_documents({})
+        ig_count       = col_ig_content.count_documents({})
+        admin_count    = col_admins.count_documents({})
+        banned_count   = col_banned_users.count_documents({})
+        settings_count = col_settings.count_documents({})
+        log_count      = col_logs.count_documents({})
+        backup_count   = col_backups.count_documents({})
+
+        # Total DB size
+        db_stats    = db.command("dbstats")
+        db_size_mb  = db_stats.get("dataSize", 0) / (1024 * 1024)
+
+        # Per-collection storage sizes
+        def _col_size_mb(col_name):
+            try:
+                s = db.command("collStats", col_name)
+                return s.get("size", 0) / (1024 * 1024)
+            except:
+                return 0.0
+
+        pdf_size_mb    = _col_size_mb("bot3_pdfs")
+        ig_size_mb     = _col_size_mb("bot3_ig_content")
+        admin_size_mb  = _col_size_mb("bot3_admins")
+        banned_size_mb = _col_size_mb("bot3_banned_users")
+        log_size_mb    = _col_size_mb("bot3_logs")
+
+        # Click totals via aggregation
+        pdf_agg = list(col_pdfs.aggregate([{"$group": {
+            "_id": None,
+            "clicks":    {"$sum": {"$ifNull": ["$clicks", 0]}},
+            "ig":        {"$sum": {"$ifNull": ["$ig_start_clicks", 0]}},
+            "yt":        {"$sum": {"$ifNull": ["$yt_start_clicks", 0]}},
+            "ytcode":    {"$sum": {"$ifNull": ["$yt_code_clicks", 0]}},
+        }}]))
+        ig_agg = list(col_ig_content.aggregate([{"$group": {
+            "_id": None,
+            "igcc": {"$sum": {"$ifNull": ["$ig_cc_clicks", 0]}},
+        }}]))
+        total_clicks  = pdf_agg[0]["clicks"] if pdf_agg else 0
+        ig_clicks     = pdf_agg[0]["ig"]     if pdf_agg else 0
+        yt_clicks     = pdf_agg[0]["yt"]     if pdf_agg else 0
+        ytcode_clicks = pdf_agg[0]["ytcode"] if pdf_agg else 0
+        igcc_clicks   = ig_agg[0]["igcc"]    if ig_agg else 0
+
+        # Today's additions
+        today_start = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_pdfs  = col_pdfs.count_documents({"created_at": {"$gte": today_start}})
+        today_ig    = col_ig_content.count_documents({"created_at": {"$gte": today_start}})
+
+        text  = "📊 <b>DATABASE STATISTICS</b>\n"
+        text += "═══════════════════════════\n\n"
+
+        text += "<b>💾 STORAGE:</b>\n"
+        text += f"├ Total DB Size: {db_size_mb:.2f} MB\n"
+        text += f"├ bot3_pdfs: {pdf_size_mb:.3f} MB\n"
+        text += f"├ bot3_ig_content: {ig_size_mb:.3f} MB\n"
+        text += f"├ bot3_admins: {admin_size_mb:.3f} MB\n"
+        text += f"├ bot3_banned_users: {banned_size_mb:.3f} MB\n"
+        text += f"└ bot3_logs: {log_size_mb:.3f} MB\n\n"
+
+        text += "<b>📁 RECORDS PER COLLECTION:</b>\n"
+        text += f"├ 📄 bot3_pdfs: {pdf_count:,}\n"
+        text += f"├ 📸 bot3_ig_content: {ig_count:,}\n"
+        text += f"├ 👤 bot3_admins: {admin_count:,}\n"
+        text += f"├ 🚫 bot3_banned_users: {banned_count:,}\n"
+        text += f"├ ⚙️ bot3_settings: {settings_count:,}\n"
+        text += f"├ 📝 bot3_logs: {log_count:,}\n"
+        text += f"└ 💾 bot3_backups: {backup_count:,}\n\n"
+
+        text += "<b>🎯 TOTAL CLICKS:</b>\n"
+        text += f"├ All: {total_clicks:,}\n"
+        text += f"├ 📸 IG Start: {ig_clicks:,}\n"
+        text += f"├ ▶️ YT Start: {yt_clicks:,}\n"
+        text += f"├ 📸 IGCC: {igcc_clicks:,}\n"
+        text += f"└ 🔑 YT Code: {ytcode_clicks:,}\n\n"
+
+        text += "<b>📈 TODAY'S ACTIVITY:</b>\n"
+        text += f"├ New PDFs: {today_pdfs}\n"
+        text += f"└ New IG Content: {today_ig}\n\n"
+
+        text += "═══════════════════════════\n"
+        text += f"🕐 <b>Updated:</b> {now_local().strftime('%I:%M:%S %p')}"
+
+        await message.answer(text, parse_mode="HTML", reply_markup=get_backup_menu())
+
     except Exception as e:
         logger.error(f"Stats error: {e}")
-        # Use plain text for error message to avoid markdown parsing issues
-        await message.answer(f"❌ Failed to retrieve stats. Please try again later.")
+        await message.answer(f"❌ Failed to retrieve stats. Please try again later.",
+                             reply_markup=get_backup_menu())
 
 @dp.message(F.text == "📜 BACKUP HISTORY")
 async def backup_history_handler(message: types.Message):
@@ -6776,7 +6937,7 @@ async def backup_history_handler(message: types.Message):
                 "💡 Use <b>💾 FULL BACKUP</b> to create your first backup!\n\n"
                 f"📦 <b>Storage Location:</b>\n"
                 f"Database: `{MONGO_DB_NAME}`\n"
-                f"Collection: `bot9_backups`\n"
+                f"Collection: `bot3_backups`\n"
                 f"Key structure: `year / month_num / backup_key`",
                 parse_mode="HTML"
             )
@@ -6793,7 +6954,7 @@ async def backup_history_handler(message: types.Message):
         history = "📜 <b>BACKUP HISTORY</b>\n"
         history += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         history += f"📊 <b>Total Backups:</b> {len(all_backups)}\n"
-        history += f"📦 <b>Stored in:</b> `{MONGO_DB_NAME}` → collection `bot9_backups`\n\n"
+        history += f"📦 <b>Stored in:</b> `{MONGO_DB_NAME}` → collection `bot3_backups`\n\n"
 
         for year in sorted(by_year_month.keys(), reverse=True):
             history += f"╔═══════════════════\n"
@@ -6808,7 +6969,7 @@ async def backup_history_handler(message: types.Message):
                 backup_key = first.get("backup_key", f"{year}/{month_num:02d}")
 
                 history += f"\n  📁 <b>{month_name} {year}</b>\n"
-                history += f"  DB path: `{MONGO_DB_NAME}.bot9_backups`  key: `{backup_key}`\n"
+                history += f"  DB path: `{MONGO_DB_NAME}.bot3_backups`  key: `{backup_key}`\n"
                 history += "  " + "─" * 30 + "\n"
 
                 for backup in backups_in_month:
@@ -6850,6 +7011,210 @@ async def backup_history_handler(message: types.Message):
     except Exception as e:
         logger.error(f"Backup history error: {e}")
         await message.answer("❌ Failed to load backup history. Please try again later.")
+
+
+# ──────────────────────────────────────────
+# 📤 JSON RESTORE (Bot 3 collections only)
+# ──────────────────────────────────────────
+
+# Registry: collection name → unique upsert key
+_BOT3_RESTORE_COLLECTIONS = {
+    "bot3_pdfs":         "msa_code",
+    "bot3_ig_content":   "cc_number",   # unique index is on cc_number (int), not cc_code
+    "bot3_admins":       "user_id",
+    "bot3_banned_users": "user_id",
+    "bot3_settings":     "key",         # settings docs are keyed by {"key": "..."}
+    "bot3_logs":         "_id",
+    "bot3_backups":      "_id",
+    # short-name aliases (from older exports)
+    "pdfs":              "msa_code",
+    "ig_content":        "cc_number",
+    "admins":            "user_id",
+    "banned_users":      "user_id",
+    "settings":          "key",
+    "logs":              "_id",
+}
+
+@dp.message(F.text == "📤 JSON RESTORE", StateFilter(None, BackupStates.viewing_backup_menu))
+async def bot3_json_restore_start(message: types.Message, state: FSMContext):
+    """Prompt admin to upload a JSON file to restore Bot 3 data."""
+    if not await check_authorization(message, "JSON Restore", "can_manage_admins"):
+        return
+    await state.set_state(BackupStates.waiting_for_json_file)
+    known = "\n".join(f"  • <code>{c}</code>" for c in sorted(set(_BOT3_RESTORE_COLLECTIONS)) if not c in ("pdfs","ig_content","admins","banned_users","settings","logs"))
+    await message.answer(
+        "📤 <b>JSON RESTORE — Bot 3</b>\n\n"
+        "Send a <b>.json</b> file to restore Bot 3 data.\n\n"
+        "<b>Accepted formats:</b>\n"
+        "• Multi-collection — <code>{\"bot3_pdfs\": [{...}], ...}</code>\n"
+        "• Single-collection array — <code>[{...}, ...]</code> (filename used as key)\n\n"
+        "<b>Known collections:</b>\n"
+        + known + "\n\n"
+        "⚠️ All inserts use <b>upsert</b> — no duplicates.\n"
+        "Press <b>❌ CANCEL</b> to abort.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+
+
+@dp.message(BackupStates.waiting_for_json_file)
+async def bot3_json_restore_receive(message: types.Message, state: FSMContext):
+    """Receive JSON file and upsert records into Bot 3 collections."""
+    if not await check_authorization(message, "JSON Restore Receive", "can_manage_admins"):
+        await state.clear()
+        return
+
+    # Cancel
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear()
+        await message.answer("✅ JSON restore cancelled.",
+                             reply_markup=get_backup_menu(), parse_mode="HTML")
+        return
+
+    if not message.document:
+        await message.answer("❌ Please send a <b>.json</b> file or press ❌ CANCEL.",
+                             parse_mode="HTML")
+        return
+
+    doc = message.document
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".json"):
+        await message.answer("❌ Only <b>.json</b> files are accepted for Bot 3 restore.",
+                             parse_mode="HTML")
+        return
+
+    await state.clear()
+    status_msg = await message.answer("⏳ <b>Downloading file...</b>", parse_mode="HTML")
+
+    import io as _io
+    import json as _json
+    import re as _re
+    from bson import ObjectId as _ObjId
+
+    try:
+        file_info = await bot.get_file(doc.file_id)
+        buf = _io.BytesIO()
+        await bot.download_file(file_info.file_path, buf)
+        payload = _json.loads(buf.getvalue().decode("utf-8"))
+    except Exception as parse_err:
+        await status_msg.edit_text(
+            f"❌ <b>Failed to read file</b>\n\n<code>{str(parse_err)[:300]}</code>",
+            parse_mode="HTML"
+        )
+        await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
+        return
+
+    # Normalise payload → {col_name: [docs]}
+    if isinstance(payload, dict):
+        # Silently drop non-list metadata fields, resolve aliases
+        col_map = {}
+        for k, v in payload.items():
+            if not isinstance(v, list):
+                continue
+            # strip timestamp suffix from key if present (e.g. "bot3_pdfs_2026-03-12...")
+            resolved = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', k)
+            col_map[resolved] = v
+    elif isinstance(payload, list):
+        stem = doc.file_name or "unknown"
+        for ext in (".json.gz", ".json"):
+            if stem.lower().endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+        stem = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', stem)
+        col_map = {stem: payload}
+    else:
+        await status_msg.edit_text(
+            "❌ <b>Invalid JSON structure.</b>\n\nExpected <code>{collection: [...]}</code> or <code>[...]</code>.",
+            parse_mode="HTML"
+        )
+        await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
+        return
+
+    await status_msg.edit_text("⏳ <b>Processing collections...</b>", parse_mode="HTML")
+
+    results = {}
+    skipped = []
+    total_upserted = 0
+
+    def _coerce_id(d):
+        raw = d.get("_id")
+        if isinstance(raw, str) and len(raw) == 24:
+            try:
+                d["_id"] = _ObjId(raw)
+            except Exception:
+                pass
+        return d
+
+    for col_name, docs in col_map.items():
+        if col_name not in _BOT3_RESTORE_COLLECTIONS:
+            skipped.append(col_name)
+            continue
+
+        unique_key = _BOT3_RESTORE_COLLECTIONS[col_name]
+        # Resolve alias to real collection name
+        real_col_name = col_name if col_name.startswith("bot3_") else f"bot3_{col_name}" if col_name not in ("pdfs","ig_content","admins","banned_users","settings","logs") else {
+            "pdfs": "bot3_pdfs", "ig_content": "bot3_ig_content",
+            "admins": "bot3_admins", "banned_users": "bot3_banned_users",
+            "settings": "bot3_settings", "logs": "bot3_logs"
+        }[col_name]
+        collection = db[real_col_name]
+        upserted = 0
+        errors = 0
+
+        for raw_doc in docs:
+            if not isinstance(raw_doc, dict):
+                errors += 1
+                continue
+            try:
+                d = _coerce_id(dict(raw_doc))
+                if unique_key == "_id":
+                    if "_id" in d:
+                        collection.replace_one({"_id": d["_id"]}, d, upsert=True)
+                    else:
+                        collection.insert_one(d)
+                else:
+                    key_val = d.get(unique_key)
+                    if key_val is None:
+                        if "_id" in d:
+                            collection.replace_one({"_id": d["_id"]}, d, upsert=True)
+                        else:
+                            collection.insert_one(d)
+                    else:
+                        collection.update_one(
+                            {unique_key: key_val},
+                            {"$set": d},
+                            upsert=True
+                        )
+                upserted += 1
+            except Exception:
+                errors += 1
+
+        results[real_col_name] = {"upserted": upserted, "errors": errors}
+        total_upserted += upserted
+
+    # Build result message
+    lines = ["✅ <b>JSON RESTORE COMPLETE (Bot 3)</b>\n"]
+    for cn, r in results.items():
+        emoji = "✅" if r["errors"] == 0 else "⚠️"
+        lines.append(
+            f"{emoji} <code>{cn}</code>: +{r['upserted']:,} upserted"
+            + (f", {r['errors']} errors" if r["errors"] else "")
+        )
+    if skipped:
+        lines.append("\n⚠️ <b>Skipped (not Bot 3 collections):</b>")
+        for s in skipped:
+            lines.append(f"  • {s}")
+    lines.append(f"\n📊 <b>Total upserted: {total_upserted:,}</b>")
+    lines.append("\nAll inserts used upsert — zero duplicates created.")
+
+    await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+    await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
+
+    log_user_action(message.from_user, "JSON_RESTORE_BOT3",
+                    f"Restored {total_upserted} records from {doc.file_name}")
 
 
 # ==========================================
@@ -7807,25 +8172,49 @@ async def check_and_create_missed_backup():
         existing_backup = col_backups.find_one({"filename": filename})
         
         if not existing_backup:
+            # Safety guard: never create a backup when BOTH collections are empty.
+            # Empty data means either a fresh install or a data-loss event; creating
+            # a backup now would insert a 0-count record that masks the real loss.
+            _guard_pdf = col_pdfs.count_documents({})
+            _guard_ig  = col_ig_content.count_documents({})
+            if _guard_pdf == 0 and _guard_ig == 0:
+                logger.warning(
+                    "⚠️ Skipping startup backup — both collections are empty "
+                    "(fresh install or data-loss event — see integrity alert)"
+                )
+                return
             logger.info(f"⚠️ No backup found for {month_year}, creating now...")
             success, filepath, metadata = await create_backup_file(auto=True)
-            
+
             if success and metadata:
                 logger.info(f"✅ Startup backup created: {metadata['filename']}")
-                
-                # Notify master admin
                 try:
-                    await bot.send_message(
-                        MASTER_ADMIN_ID,
+                    caption = (
                         f"📦 <b>STARTUP BACKUP CREATED</b>\n\n"
-                        f"The bot detected no backup for {month_year}.\n"
-                        f"✅ Created: `{metadata['filename']}`\n"
-                        f"💾 Size: {metadata['file_size_mb']:.2f} MB\n\n"
-                        f"This ensures no monthly backup is missed!",
+                        f"No backup existed for {month_year}.\n"
+                        f"✅ Created: <code>{metadata['filename']}</code>\n"
+                        f"💾 Size: {metadata['file_size_mb']:.2f} MB\n"
+                        f"📄 PDFs: {metadata['pdfs_count']} | 📸 IG: {metadata['ig_count']}\n\n"
+                        f"This ensures no monthly backup is missed!"
+                    )
+                    await bot.send_document(
+                        MASTER_ADMIN_ID,
+                        types.FSInputFile(filepath),
+                        caption=caption,
                         parse_mode="HTML"
                     )
-                except:
-                    pass
+                except Exception as send_err:
+                    logger.warning(f"Could not send startup backup file: {send_err}")
+                    try:
+                        await bot.send_message(
+                            MASTER_ADMIN_ID,
+                            f"📦 <b>STARTUP BACKUP CREATED</b>\n\n"
+                            f"✅ Created: <code>{metadata['filename']}</code>\n"
+                            f"(File could not be delivered: {send_err})",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
             else:
                 logger.error(f"❌ Failed to create startup backup for {month_year}")
         else:
@@ -7893,7 +8282,7 @@ async def generate_daily_report():
         top_ig = list(col_ig_content.find({}).sort("ig_cc_clicks", -1).limit(5))
         
         # Build report
-        report = f"📊 <b>BOT 9 DAILY REPORT</b>\n"
+        report = f"📊 <b>BOT 3 DAILY REPORT</b>\n"
         report += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         report += f"📅 <b>Date:</b> {timestamp}\n"
         report += f"⏰ <b>Report Type:</b> {'Morning' if now.hour < 12 else 'Evening'} Report\n\n"
@@ -7943,7 +8332,7 @@ async def generate_daily_report():
         report += f"└ Status: {'✅ Healthy' if health_monitor.is_healthy else '⚠️ Degraded'}\n\n"
         
         report += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        report += f"🤖 <b>Bot 9 Enterprise Monitoring System</b>\n"
+        report += f"🤖 <b>Bot 3 Enterprise Monitoring System</b>\n"
         _next_lbl = "08:40 PM" if now.hour < 12 else "08:40 AM (tomorrow)"
         report += f"📌 Next report at {_next_lbl}"
         
@@ -8050,7 +8439,7 @@ async def health_check_endpoint(request):
         
         return web.json_response({
             "status": "healthy",
-            "bot": "Bot 9 Enterprise",
+            "bot": "Bot 3 Enterprise",
             "timestamp": now_local().isoformat(),
             "uptime_seconds": int(uptime.total_seconds()),
             "uptime_formatted": str(uptime),
@@ -8067,9 +8456,9 @@ async def health_check_endpoint(request):
         }, status=500)
 
 # ==========================================
-# 🎬 TUTORIAL PK — Universal tutorial link for ALL Bot8 users
-# Stored in db["bot9_tutorials"] with type="PK"
-# Delivered to Bot8 users on empty /start (no referral payload)
+# 🎬 TUTORIAL PK — Universal tutorial link for ALL Bot1 users
+# Stored in db["bot3_tutorials"] with type="PK"
+# Delivered to Bot1 users on empty /start (no referral payload)
 # ==========================================
 
 @dp.message(F.text == "🎬 TUTORIAL")
@@ -8080,7 +8469,7 @@ async def tutorial_pk_menu_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "🎬 <b>TUTORIAL</b>\n\n"
-        "Manage the <b>universal tutorial link</b> shown to every Bot8 member\n"
+        "Manage the <b>universal tutorial link</b> shown to every Bot1 member\n"
         "on their empty start and inside the Agent Guide.\n\n"
         "One link — one message — delivered to every member automatically.",
         reply_markup=get_tutorial_pk_menu(),
@@ -8093,7 +8482,7 @@ async def tutorial_pk_add(message: types.Message, state: FSMContext):
     """Start ADD flow — ask admin for the YouTube tutorial link."""
     if not await check_authorization(message, "Add Tutorial", "can_add"):
         return
-    existing = db["bot9_tutorials"].find_one({"type": "PK"})
+    existing = db["bot3_tutorials"].find_one({"type": "PK"})
     if existing and existing.get("link"):
         safe_link = _html.escape(existing["link"])
         await message.answer(
@@ -8107,7 +8496,7 @@ async def tutorial_pk_add(message: types.Message, state: FSMContext):
     await state.set_state(TutorialPKStates.waiting_for_link)
     await message.answer(
         "🔗 <b>SEND THE YOUTUBE TUTORIAL LINK</b>\n\n"
-        "This link will be delivered to <b>all Bot8 users</b> when they start\n"
+        "This link will be delivered to <b>all Bot1 users</b> when they start\n"
         "with no referral — as a premium tutorial message with an inline button.\n\n"
         "• Must be a valid URL starting with <code>https://</code>\n"
         "• Shown as a button — never as raw text\n\n"
@@ -8133,7 +8522,7 @@ async def tutorial_pk_save_link(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
         return
-    db["bot9_tutorials"].update_one(
+    db["bot3_tutorials"].update_one(
         {"type": "PK"},
         {"$set": {"type": "PK", "link": text, "updated_at": datetime.now()}},
         upsert=True
@@ -8143,7 +8532,7 @@ async def tutorial_pk_save_link(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ <b>TUTORIAL SAVED</b>\n\n"
         f"<b>Link:</b> <code>{safe_link}</code>\n\n"
-        "All Bot8 users will now see this tutorial on their next empty start and in the Agent Guide.",
+        "All Bot1 users will now see this tutorial on their next empty start and in the Agent Guide.",
         reply_markup=get_tutorial_pk_menu(),
         parse_mode="HTML"
     )
@@ -8154,7 +8543,7 @@ async def tutorial_pk_edit(message: types.Message, state: FSMContext):
     """Start EDIT flow — shows current link and asks for replacement."""
     if not await check_authorization(message, "Edit Tutorial", "can_add"):
         return
-    existing = db["bot9_tutorials"].find_one({"type": "PK"})
+    existing = db["bot3_tutorials"].find_one({"type": "PK"})
     if not existing or not existing.get("link"):
         await message.answer(
             "⚠️ <b>No Tutorial link set yet.</b>\n\nUse <b>➕ ADD TUTORIAL</b> to add one first.",
@@ -8189,7 +8578,7 @@ async def tutorial_pk_save_edit(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
         return
-    db["bot9_tutorials"].update_one(
+    db["bot3_tutorials"].update_one(
         {"type": "PK"},
         {"$set": {"link": text, "updated_at": datetime.now()}},
         upsert=True
@@ -8199,7 +8588,7 @@ async def tutorial_pk_save_edit(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ <b>TUTORIAL UPDATED</b>\n\n"
         f"<b>New link:</b> <code>{safe_link}</code>\n\n"
-        "All Bot8 users will now receive this updated tutorial on their next empty start and in the Agent Guide.",
+        "All Bot1 users will now receive this updated tutorial on their next empty start and in the Agent Guide.",
         reply_markup=get_tutorial_pk_menu(),
         parse_mode="HTML"
     )
@@ -8210,7 +8599,7 @@ async def tutorial_pk_delete(message: types.Message, state: FSMContext):
     """Ask for confirmation before deleting tutorial link."""
     if not await check_authorization(message, "Delete Tutorial", "can_add"):
         return
-    existing = db["bot9_tutorials"].find_one({"type": "PK"})
+    existing = db["bot3_tutorials"].find_one({"type": "PK"})
     if not existing or not existing.get("link"):
         await message.answer(
             "⚠️ <b>No Tutorial link to delete.</b>",
@@ -8236,11 +8625,11 @@ async def tutorial_pk_confirm_delete(message: types.Message, state: FSMContext):
         return
     text = message.text.strip().upper()
     if text == "CONFIRM":
-        db["bot9_tutorials"].delete_one({"type": "PK"})
+        db["bot3_tutorials"].delete_one({"type": "PK"})
         await state.clear()
         await message.answer(
             "✅ <b>TUTORIAL DELETED.</b>\n\n"
-            "Bot8 users will now see a professional 'coming soon' message "
+            "Bot1 users will now see a professional 'coming soon' message "
             "until a new link is added.",
             reply_markup=get_tutorial_pk_menu(),
             parse_mode="HTML"
@@ -8261,7 +8650,7 @@ async def tutorial_pk_list(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "List Tutorial", "can_add"):
         return
     await state.clear()
-    existing = db["bot9_tutorials"].find_one({"type": "PK"})
+    existing = db["bot3_tutorials"].find_one({"type": "PK"})
     if existing and existing.get("link"):
         safe_link = _html.escape(existing["link"])
         updated = existing.get("updated_at")
@@ -8269,7 +8658,7 @@ async def tutorial_pk_list(message: types.Message, state: FSMContext):
         await message.answer(
             f"📋 <b>TUTORIAL LINK</b>\n\n"
             f"<b>Status:</b> ✅ Active\n"
-            f"<b>Scope:</b> Universal — all Bot8 users (empty start + Agent Guide)\n"
+            f"<b>Scope:</b> Universal — all Bot1 users (empty start + Agent Guide)\n"
             f"<b>Last updated:</b> {updated_str}\n\n"
             f"<b>Link:</b>\n<code>{safe_link}</code>",
             reply_markup=get_tutorial_pk_menu(),
@@ -8280,7 +8669,7 @@ async def tutorial_pk_list(message: types.Message, state: FSMContext):
             "📋 <b>TUTORIAL STATUS</b>\n\n"
             "❌ <b>No link set yet.</b>\n\n"
             "Use <b>➕ ADD TUTORIAL</b> to add a link — it will be\n"
-            "sent to Bot8 users as a premium framed message with a watch button.",
+            "sent to Bot1 users as a premium framed message with a watch button.",
             reply_markup=get_tutorial_pk_menu(),
             parse_mode="HTML"
         )
@@ -8442,7 +8831,7 @@ async def cleanup_on_shutdown():
     try:
         # Save final state
         if STATE_BACKUP_ENABLED:
-            await state_persistence.save_state({})
+            await state_persistence.save_state()
             print("✅ Final state saved")
     except Exception as e:
         logger.error(f"Error saving final state: {e}")
@@ -8455,13 +8844,13 @@ async def cleanup_on_shutdown():
             m = int((uptime.total_seconds() % 3600) // 60)
             await bot.send_message(
                 MASTER_ADMIN_ID,
-                f"🔴 <b>BOT 9 — OFFLINE</b>\n\n"
+                f"🔴 <b>BOT 3 — OFFLINE</b>\n\n"
                 f"<b>Status:</b> Shutting down\n"
                 f"<b>Uptime:</b> {h}h {m}m\n"
                 f"<b>Errors:</b> {health_monitor.error_count}\n"
                 f"<b>Warnings:</b> {health_monitor.warning_count}\n\n"
                 f"<b>Time:</b> {now_local().strftime('%B %d, %Y — %I:%M:%S %p')}\n\n"
-                f"_Bot 9 has stopped. It will resume when restarted._",
+                f"_Bot 3 has stopped. It will resume when restarted._",
                 parse_mode="HTML"
             )
     except Exception as e:
@@ -8471,7 +8860,7 @@ async def cleanup_on_shutdown():
 
 async def main():
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("🚀 BOT 9 ENTERPRISE EDITION STARTING...")
+    print("🚀 BOT 3 ENTERPRISE EDITION STARTING...")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
     # Start health check server (for hosting platforms and UptimeRobot)
@@ -8501,20 +8890,87 @@ async def main():
     asyncio.create_task(state_persistence_task())
     print(f"  ✅ State persistence ({STATE_BACKUP_INTERVAL_MINUTES} min interval)")
     
-    # Check if current month's backup exists (persistence check)
-    print("\n💾 Checking backup status...")
-    await check_and_create_missed_backup()
+    # Startup backup check disabled — auto-backup runs on schedule (1st of month at 2 AM)
+    print("\n💾 Backup check skipped on startup (scheduled only)")
     
     # ── Auto-heal IG CC codes on every startup (fill gaps from past deletions) ──
     print("\n🔄 Reindexing IG CC codes...")
     ig_count = await reindex_all_ig_cc()
     print(f"  ✅ IG CC codes reindexed: {ig_count} items now CC1–CC{ig_count}")
+
+    # ── STARTUP DATA INTEGRITY CHECK ──────────────────────────────────────────
+    # Distinguishes FRESH INSTALL (no backup history → first run, expected empty)
+    # from REAL DATA LOSS (backup history exists → something wiped the data).
+    # Each case gets its own message. Never deletes or modifies any data.
+    try:
+        startup_pdf_count = col_pdfs.count_documents({})
+        startup_ig_count  = col_ig_content.count_documents({})
+        if startup_pdf_count == 0 and startup_ig_count == 0:
+            logger.warning("⚠️ STARTUP: Both PDF and IG collections are EMPTY.")
+            if MASTER_ADMIN_ID and MASTER_ADMIN_ID != 0:
+                try:
+                    # Extract cluster hostname for diagnostics (never exposes password)
+                    try:
+                        from urllib.parse import urlparse as _urlparse
+                        _cluster_host = _urlparse(MONGO_URI).hostname or "unknown"
+                    except Exception:
+                        _cluster_host = "unknown"
+
+                    # Check backup history to distinguish fresh install from data loss
+                    _last_backup = col_backups.find_one(sort=[("created_at", -1)])
+
+                    if _last_backup is None:
+                        # No backup records at all → brand-new deployment
+                        logger.info("ℹ️ STARTUP: No backup history found — fresh install.")
+                        await bot.send_message(
+                            MASTER_ADMIN_ID,
+                            "ℹ️ <b>FRESH INSTALL DETECTED</b>\n\n"
+                            "Both collections are empty and <b>no backup history exists</b> — "
+                            "this is a brand-new deployment.\n\n"
+                            "Start adding PDFs and IG content via the admin panel!\n\n"
+                            f"📡 Cluster: <code>{_cluster_host}</code>\n"
+                            f"🗄 Database: <code>{MONGO_DB_NAME}</code>",
+                            parse_mode="HTML"
+                        )
+                    else:
+                        # Backup history found → data existed before but is now gone
+                        _last_bk_filename = _last_backup.get("filename", "unknown")
+                        _last_bk_pdfs     = _last_backup.get("pdfs_count", "?")
+                        _last_bk_ig       = _last_backup.get("ig_count", "?")
+                        _last_bk_date     = _last_backup.get("created_at", "")
+                        if hasattr(_last_bk_date, "strftime"):
+                            _last_bk_date = _last_bk_date.strftime("%B %d, %Y")
+                        await bot.send_message(
+                            MASTER_ADMIN_ID,
+                            "🚨 <b>DATA INTEGRITY ALERT</b>\n\n"
+                            "⚠️ The bot started up and found <b>0 PDFs</b> and <b>0 IG items</b> "
+                            "in the database — but backup history exists, meaning data was here before!\n\n"
+                            "<b>Last known good backup:</b>\n"
+                            f"• File: <code>{_last_bk_filename}</code>\n"
+                            f"• PDFs: {_last_bk_pdfs}  |  IG items: {_last_bk_ig}\n"
+                            f"• Date: {_last_bk_date}\n\n"
+                            "<b>Possible causes:</b>\n"
+                            "• Accidental RESET command triggered\n"
+                            "• Wrong MongoDB connection string\n"
+                            "• Connected to a different Atlas cluster\n\n"
+                            f"📡 Cluster: <code>{_cluster_host}</code>\n"
+                            f"🗄 Database: <code>{MONGO_DB_NAME}</code>\n\n"
+                            "<b>No automatic actions taken.</b> Check your database immediately!",
+                            parse_mode="HTML"
+                        )
+                except Exception:
+                    pass
+        else:
+            logger.info(f"✅ Startup integrity check passed: {startup_pdf_count} PDFs, {startup_ig_count} IG items")
+    except Exception as _ic_err:
+        logger.error(f"Startup integrity check failed: {_ic_err}")
+    # ── END INTEGRITY CHECK ───────────────────────────────────────────────────
     
     # Send startup notification
     if MASTER_ADMIN_ID and MASTER_ADMIN_ID != 0:
         try:
             startup_msg = (
-                "🚀 <b>BOT 9 ENTERPRISE EDITION</b>\n\n"
+                "🚀 <b>BOT 3 ENTERPRISE EDITION</b>\n\n"
                 "✅ <b>Status:</b> ONLINE\n"
                 f"📅 <b>Started:</b> {now_local().strftime('%B %d, %Y %I:%M %p')}\n\n"
                 "🔧 <b>Active Systems:</b>\n"
@@ -8535,7 +8991,7 @@ async def main():
         print("   Get your ID from: @userinfobot on Telegram")
     
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("✅ BOT 9 IS NOW ONLINE AND READY!")
+    print("✅ BOT 3 IS NOW ONLINE AND READY!")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
     
     # Start bot (webhook or polling)
@@ -8588,5 +9044,5 @@ if __name__ == "__main__":
         print(f"Error: {e}")
         print(f"\nTraceback:")
         traceback.print_exc()
-        print("\n📝 Check bot9_errors.log for details")
+        print("\n📝 Check bot3_errors.log for details")
         sys.exit(1)
