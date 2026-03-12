@@ -760,7 +760,7 @@ def is_spam_or_gibberish(text: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # RATE LIMITING for support tickets — 24-hour cooldown, DB-backed (survives restarts)
 # ---------------------------------------------------------------------------
-TICKET_COOLDOWN_HOURS = 1 # User must wait 24 hours between ticket submissions
+TICKET_COOLDOWN_HOURS = 24 # User must wait 24 hours between ticket submissions
 
 def check_ticket_rate_limit(user_id: int, user_name: str = "You") -> tuple[bool, str]:
     """
@@ -7813,3 +7813,4 @@ if __name__ == "__main__":
             _restart_delay = min(_restart_delay * 2, 60)
             # Replace the entire process to get a clean event loop
             os.execv(sys.executable, [sys.executable] + sys.argv)
+
