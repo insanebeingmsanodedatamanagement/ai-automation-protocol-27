@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import json
+import html
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -15,18 +16,18 @@ from pymongo import MongoClient
 from bson.objectid import ObjectId
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
-from aiogram.exceptions import TelegramNetworkError, TelegramServerError
+from aiogram.exceptions import TelegramNetworkError, TelegramServerError, TelegramRetryAfter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # Fix Windows console encoding for emojis
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
-# ── Bot 10 logging: suppress noisy library output, keep our prints ──────────
+# ── Bot 2 logging: suppress noisy library output, keep our prints ──────────
 import logging as _logging
 _logging.basicConfig(
     level=_logging.WARNING,
-    format='[BOT10] %(asctime)s %(levelname)s %(name)s: %(message)s',
+    format='[BOT2] %(asctime)s %(levelname)s %(name)s: %(message)s',
     handlers=[_logging.StreamHandler(sys.stdout)],
     force=True
 )
@@ -37,11 +38,11 @@ for _noisy in ("pymongo", "pymongo.pool", "pymongo.topology",
 del _noisy
 
 # ==============================================
-# BOT 10 - BROADCAST MANAGEMENT SYSTEM
+# BOT 2 - BROADCAST MANAGEMENT SYSTEM
 # ==============================================
-# Bot 10: Admin interface for managing broadcasts
-# Bot 8:  Actual delivery bot that sends to users
-# This ensures broadcasts appear to come from Bot 8
+# Bot 2: Admin interface for managing broadcasts
+# Bot 1:  Actual delivery bot that sends to users
+# This ensures broadcasts appear to come from Bot 1
 # ==============================================
 
 # Helper function for retry logic with exponential backoff
@@ -70,7 +71,7 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     raise last_exception
 
 BOT_TOKEN = os.getenv("BOT_10_TOKEN")
-BOT_8_TOKEN = os.getenv("BOT_8_TOKEN")  # Bot 8 for delivery
+BOT_8_TOKEN = os.getenv("BOT_8_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
 OWNER_ID = MASTER_ADMIN_ID  # Alias for compatibility with auto-healer notifications
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")   # Set on Render; never hardcode here
@@ -104,38 +105,59 @@ if not MONGO_URI:
     print("❌ FATAL: MONGO_URI not set in .env")
     sys.exit(1)
 
-print(f"🔄 Initializing Bot 10 - Broadcast Management System")
-print(f"🤖 Bot 10 Token: {BOT_TOKEN[:20]}...")
-print(f"🤖 Bot 8 Token: {BOT_8_TOKEN[:20]}...")
+print(f"🔄 Initializing Bot 2 - Broadcast Management System")
+print(f"🤖 Bot 2 Token: {BOT_TOKEN[:20]}...")
+print(f"🤖 Bot 1 Token: {BOT_8_TOKEN[:20]}...")
 
-# MongoDB Connection
-client = MongoClient(MONGO_URI)
-db = client[MONGO_DB_NAME]
-# Shared content DB — bot9 writes PDFs/IG content here; bot10 reads from it (mirrors bot8.py)
-db_shared = client["MSANodeDB"]
-col_broadcasts = db["bot10_broadcasts"]
-col_user_tracking = db["bot10_user_tracking"]  # Track user sources
-col_support_tickets = db["support_tickets"]  # Bot 8 support tickets
-col_cleanup_backups = db["cleanup_backups"]  # Automated cleanup backups (cloud-safe)
-col_cleanup_logs = db["cleanup_logs"]  # Cleanup history logs
-col_banned_users = db["banned_users"]  # Banned users - blocks all bot 8 access
-col_suspended_features = db["suspended_features"]  # User-specific feature suspensions
-col_bot10_backups = db["bot10_backups"]  # Bot 10 manual backups (cloud-safe)
-col_admins = db["bot10_admins"]  # Bot 10 admin management
-col_access_attempts = db["bot10_access_attempts"]  # Track unauthorized access attempts
-col_bot8_settings = db["bot8_settings"]  # Bot 8 global settings (Maintenance Mode)
+# MongoDB Connection — Single database: MSANodeDB (shared by bot8, bot9, bot10)
+client = MongoClient(
+    MONGO_URI,
+    maxPoolSize=50,
+    minPoolSize=5,
+    maxIdleTimeMS=30000,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=10000,
+    socketTimeoutMS=30000,
+    retryWrites=True,
+    retryReads=True,
+    w="majority",
+)
+db = client[MONGO_DB_NAME]  # MSANodeDB on Render
+# Guard: refuse to start if pointed at the wrong database
+if db.name != "MSANodeDB":
+    print(f"❌ FATAL: MONGO_DB_NAME is '{db.name}' — must be 'MSANodeDB'. Fix your env vars and restart.")
+    sys.exit(1)
+print(f"✅ Database guard passed: writing to '{db.name}'")
 
-# Bot 8 Collections (for Terminal and Reset Data features)
-col_user_verification = db["user_verification"]  # Bot 8 user verification data
-col_msa_ids = db["msa_ids"]  # Bot 8 MSA+ ID tracking
-col_bot8_backups = db["bot8_backups"]  # Bot 8 auto-backups (separate)
+# ── Bot 2 private collections ──────────────────────────────────────────────
+col_broadcasts        = db["bot10_broadcasts"]
+col_bot10_backups     = db["bot10_backups"]       # Bot 2 manual backups
+col_admins            = db["bot10_admins"]         # Bot 2 admin management
+col_access_attempts   = db["bot10_access_attempts"]# Unauthorized access tracking
+col_cleanup_backups   = db["cleanup_backups"]      # Automated cleanup backups
+col_cleanup_logs      = db["cleanup_logs"]         # Cleanup history logs
+
+# ── Bot 1 user data collections ─────────────────────────────────────────────
+col_user_tracking     = db["bot10_user_tracking"]   # User source tracking (bot8 writes)
+col_support_tickets   = db["support_tickets"]       # Bot 1 support tickets
+col_banned_users      = db["banned_users"]          # Bot 1 bans
+col_suspended_features= db["suspended_features"]    # Feature suspensions
+col_bot8_settings     = db["bot8_settings"]         # Bot 1 global settings
+col_user_verification = db["user_verification"]     # Bot 1 user verification
+col_msa_ids           = db["msa_ids"]               # Bot 1 MSA+ ID registry
+col_bot8_backups      = db["bot8_backups"]          # Bot 1 auto-backups
 col_permanently_banned_msa = db["permanently_banned_msa"]  # Permanently banned MSA IDs
-col_bot9_pdfs = db_shared["bot9_pdfs"]  # ✅ Bot9 PDFs live in MSANodeDB — must use db_shared
-col_bot9_ig_content = db_shared["bot9_ig_content"]  # ✅ Bot9 IG content lives in MSANodeDB
+col_offline_log       = db["bot8_offline_log"]      # Bot 1 ON/OFF event log (dedicated)
+col_bot10_restore_data= db["bot10_restore_data"]    # Bot 2 latest full backup for restore
+col_bot8_restore_data = db["bot8_restore_data"]     # Bot 1 latest full backup for restore (single-doc, always-replaced)
 
-print(f"💾 Connected to MongoDB: MSANodeDB")
-print(f"📁 Bot 10 Collections: bot10_broadcasts, bot10_user_tracking, support_tickets, cleanup_backups, cleanup_logs, banned_users, suspended_features, bot10_backups")
-print(f"📁 Bot 8 Collections: user_verification, msa_ids, bot9_pdfs, bot9_ig_content")
+# ── Bot 9 content — same database (Bot 1 + Bot 2 + Bot 3 all share ONE database) ─
+col_bot3_pdfs         = db["bot3_pdfs"]             # Bot 9 PDFs
+col_bot3_ig_content   = db["bot3_ig_content"]       # Bot 9 IG content
+
+print(f"💾 Connected to MongoDB: {MONGO_DB_NAME} (single shared database for Bot 1 + Bot 2 + Bot 3)")
+print(f"📁 Collections: msa_ids, user_verification, banned_users, suspended_features, support_tickets,")
+print(f"               bot10_user_tracking, bot3_pdfs, bot3_ig_content, bot8_offline_log, bot3_tutorials")
 
 # Create unique indexes to prevent duplicates
 try:
@@ -154,18 +176,27 @@ try:
     col_cleanup_backups.create_index([("backup_date", -1)])  # Latest backup queries
     col_cleanup_logs.create_index([("cleanup_date", -1)])  # Latest log queries
     
-    # Bot 10 backups collection indexes
+    # Bot 2 backups collection indexes
     col_bot10_backups.create_index([("backup_date", -1)])  # Latest backup first
     col_bot10_backups.create_index([("backup_type", 1)])  # Filter by type
 
-    # Bot 8 backups collection indexes
+    # Bot 1 backups collection indexes
     col_bot8_backups.create_index([("backup_date", -1)])
     col_bot8_backups.create_index([("backup_type", 1)])
     col_bot8_backups.create_index([("bot", 1)])
 
+    # Bot 1 offline log index
+    col_offline_log.create_index([("triggered_at", -1)])   # Latest events first
+
     # Permanently banned MSA index
     col_permanently_banned_msa.create_index("user_id")
     col_permanently_banned_msa.create_index("msa_id")
+
+    # Banned users — enforce one record per user_id at DB level
+    col_banned_users.create_index("user_id", unique=True)
+
+    # Suspended features — matches upsert logic, one doc per user_id
+    col_suspended_features.create_index("user_id", unique=True)
     
     # Admin collection indexes
     col_admins.create_index("user_id", unique=True)  # One admin record per user
@@ -178,18 +209,107 @@ try:
     # Runtime state index (restart recovery)
     db["bot10_runtime_state"].create_index("state_key", unique=True)
     
+    # ── TTL AUTO-EXPIRY INDEXES ────────────────────────────────────────────────
+    # These prevent unbounded growth in log/attempt collections.
+    # Each is in its own try/except so a failure never blocks startup.
+    # Drop-before-create avoids the "already exists with different options" error on redeploy.
+
+    # bot10_access_attempts — auto-delete after 7 days
+    try:
+        try:
+            col_access_attempts.drop_index("attempted_at_ttl_7d")
+        except Exception:
+            pass
+        col_access_attempts.create_index(
+            [("attempted_at", 1)],
+            expireAfterSeconds=604_800,   # 7 days
+            sparse=True,
+            name="attempted_at_ttl_7d"
+        )
+        print("✅ TTL index set: bot10_access_attempts → 7-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (access_attempts): {_ttl_err}")
+
+    # cleanup_logs — auto-delete after 30 days
+    try:
+        try:
+            col_cleanup_logs.drop_index("cleanup_date_ttl_30d")
+        except Exception:
+            pass
+        col_cleanup_logs.create_index(
+            [("cleanup_date", 1)],
+            expireAfterSeconds=2_592_000,  # 30 days
+            sparse=True,
+            name="cleanup_date_ttl_30d"
+        )
+        print("✅ TTL index set: cleanup_logs → 30-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (cleanup_logs): {_ttl_err}")
+
+    # bot8_offline_log — auto-delete after 90 days (maintenance ON/OFF events)
+    try:
+        try:
+            col_offline_log.drop_index("triggered_at_ttl_90d")
+        except Exception:
+            pass
+        col_offline_log.create_index(
+            [("triggered_at", 1)],
+            expireAfterSeconds=7_776_000,  # 90 days
+            sparse=True,
+            name="triggered_at_ttl_90d"
+        )
+        print("✅ TTL index set: bot8_offline_log → 90-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (offline_log): {_ttl_err}")
+
+    # bot3_user_activity (click dedup) — auto-delete after 180 days
+    # Without this, every user×item click accumulates permanently → millions of records
+    try:
+        try:
+            db["bot3_user_activity"].drop_index("first_click_at_ttl_180d")
+        except Exception:
+            pass
+        db["bot3_user_activity"].create_index(
+            [("first_click_at", 1)],
+            expireAfterSeconds=15_552_000,  # 180 days
+            sparse=True,
+            name="first_click_at_ttl_180d"
+        )
+        print("✅ TTL index set: bot3_user_activity → 180-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (user_activity): {_ttl_err}")
+
+    # live_terminal_logs — auto-delete after 3 days
+    # Bot1 middleware logs EVERY message here; adding TTL prevents unbounded growth
+    # on top of the existing manual trim (belt and suspenders)
+    try:
+        _live_logs_col = db["live_terminal_logs"]  # col_live_logs defined later — use db[] directly here
+        try:
+            _live_logs_col.drop_index("created_at_ttl_3d")
+        except Exception:
+            pass
+        _live_logs_col.create_index(
+            [("created_at", 1)],
+            expireAfterSeconds=259_200,  # 3 days
+            sparse=True,
+            name="created_at_ttl_3d"
+        )
+        print("✅ TTL index set: live_terminal_logs → 3-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (live_terminal_logs): {_ttl_err}")
+
     print("✅ Database indexes created for optimal performance")
 except Exception as e:
     print(f"⚠️ Index creation warning: {str(e)}")  # May already exist
 
 # Initialize bot and dispatcher
-bot = Bot(token=BOT_TOKEN)  # Bot 10 - Admin interface
-bot_8 = Bot(token=BOT_8_TOKEN)  # Bot 8 - Message delivery
+bot = Bot(token=BOT_TOKEN)  # Bot 2 - Admin interface
+bot_8 = Bot(token=BOT_8_TOKEN)  # Bot 1 - Message delivery
 dp = Dispatcher(storage=MemoryStorage())
 
 print(f"⚙️ Bot instances initialized")
-print(f"📱 Bot 10: Admin interface ready")
-print(f"📤 Bot 8: Message delivery ready")
+print(f"📱 Bot 2: Admin interface ready")
+print(f"📤 Bot 1: Message delivery ready")
 
 # ==========================================
 # 🕐 TIMEZONE CONFIGURATION
@@ -257,6 +377,7 @@ class SupportStates(StatesGroup):
     waiting_for_user_search = State()
     waiting_for_priority_id = State()
     waiting_for_priority_level = State()
+    waiting_for_view_channel_id = State()
 
 class FindStates(StatesGroup):
     waiting_for_search = State()  # Waiting for MSA ID or User ID input
@@ -287,13 +408,18 @@ class BroadcastWithButtonsStates(StatesGroup):
 
 class BackupStates(StatesGroup):
     viewing_menu = State()
+    selecting_clear_target     = State()  # Choose Bot 1 or Bot 2
+    waiting_for_clear_confirm1 = State()  # First confirm — type CONFIRM
+    waiting_for_clear_confirm2 = State()  # Final confirm — type DELETE
+    confirming_restore         = State()  # Awaiting restore confirmation
+    waiting_for_json_file      = State()  # Awaiting JSON file upload for restore
 
 class ResetDataStates(StatesGroup):
-    selecting_reset_type = State()        # Choose: Bot8 / Bot10 / ALL
-    waiting_for_first_confirm = State()  # Bot8 first confirmation
-    waiting_for_final_confirm = State()  # Bot8 final confirmation
-    bot10_first_confirm = State()        # Bot10 first confirmation
-    bot10_final_confirm = State()        # Bot10 final confirmation
+    selecting_reset_type = State()        # Choose: Bot1 / Bot2 / ALL
+    waiting_for_first_confirm = State()  # Bot1 first confirmation
+    waiting_for_final_confirm = State()  # Bot1 final confirmation
+    bot10_first_confirm = State()        # Bot2 first confirmation
+    bot10_final_confirm = State()        # Bot2 final confirmation
     all_first_confirm = State()          # ALL first confirmation
     all_final_confirm = State()          # ALL final confirmation
 
@@ -324,18 +450,18 @@ class AdminStates(StatesGroup):
     waiting_for_admin_pw_1 = State()
     waiting_for_admin_pw_2 = State()
 
-class Bot8SettingsStates(StatesGroup):
+class Bot1SettingsStates(StatesGroup):
     viewing_menu    = State()
     choosing_method = State()   # Auto / Templates / Custom choice
     entering_custom = State()   # Typing custom broadcast message
 
 class GuideStates(StatesGroup):
     selecting         = State()   # user is on the guide selector screen
-    viewing_bot10     = State()   # paginated Bot 10 admin guide
-    viewing_bot8      = State()   # Bot 8 user guide (from inside bot10)
+    viewing_bot10     = State()   # paginated Bot 2 admin guide
+    viewing_bot8      = State()   # Bot 1 user guide (from inside bot10)
 
 # ==========================================
-# 🤖 BOT 8 SETTINGS — BROADCAST TEMPLATES
+# 🤖 BOT 1 SETTINGS — BROADCAST TEMPLATES
 # ==========================================
 
 _OFFLINE_TEMPLATES = [
@@ -352,9 +478,9 @@ _OFFLINE_TEMPLATES = [
 ]
 
 _ONLINE_TEMPLATES = [
-    {"title": "✅ Back Online",            "text": "✅ **MSA NODE AGENT — BACK ONLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🟢 Your MSA Node Agent has completed its upgrade and is now **fully operational**.\n\n**All features are now available:**\n• 📊 Dashboard\n• 🔍 Search Code\n• � Tutorial\n• �📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n• All start links are active\n\nThank you for your patience during the upgrade.\n\n_— MSA Node Systems_"},
-    {"title": "🔧 System Restored",        "text": "🔧 **SYSTEM FULLY RESTORED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n✅ The MSA NODE system has been fully restored after maintenance.\n\n**Your full access has been reinstated:**\n• 📊 Dashboard — Active\n• 🔍 Search Code — Active\n• � Tutorial — Active\n• �📜 Rules — Active\n• 📖 Agent Guide — Active\n• 📞 Support — Active\n\nWe appreciate your patience and look forward to serving you.\n\n_— MSA NODE Operations_"},
-    {"title": "🟢 All Systems Green",      "text": "🟢 **ALL SYSTEMS GREEN**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n**MSA NODE Agent status: FULLY OPERATIONAL**\n\nEvery system has been verified and cleared for full operation.\n\n🚦 **System Status:**\n• 📊 Dashboard .................. ✅ Online\n• 🔍 Search ..................... ✅ Online\n• � Tutorial ................... ✅ Online\n• �📜 Rules ...................... ✅ Online\n• 📖 Guide ...................... ✅ Online\n• 📞 Support .................... ✅ Online\n\nWelcome back!\n\n_— MSA NODE Systems_"},
+    {"title": "✅ Back Online",            "text": "✅ **MSA NODE AGENT — BACK ONLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🟢 Your MSA Node Agent has completed its upgrade and is now **fully operational**.\n\n**All features are now available:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📺 Tutorial\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n• All start links are active\n\nThank you for your patience during the upgrade.\n\n_— MSA Node Systems_"},
+    {"title": "🔧 System Restored",        "text": "🔧 **SYSTEM FULLY RESTORED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n✅ The MSA NODE system has been fully restored after maintenance.\n\n**Your full access has been reinstated:**\n• 📊 Dashboard — Active\n• 🔍 Search Code — Active\n• 📺 Tutorial — Active\n• 📜 Rules — Active\n• 📖 Agent Guide — Active\n• 📞 Support — Active\n\nWe appreciate your patience and look forward to serving you.\n\n_— MSA NODE Operations_"},
+    {"title": "🟢 All Systems Green",      "text": "🟢 **ALL SYSTEMS GREEN**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n**MSA NODE Agent status: FULLY OPERATIONAL**\n\nEvery system has been verified and cleared for full operation.\n\n🚦 **System Status:**\n• 📊 Dashboard .................. ✅ Online\n• 🔍 Search ..................... ✅ Online\n• 📺 Tutorial ................... ✅ Online\n• 📜 Rules ...................... ✅ Online\n• 📖 Guide ...................... ✅ Online\n• 📞 Support .................... ✅ Online\n\nWelcome back!\n\n_— MSA NODE Systems_"},
     {"title": "✨ Premium Upgrade Complete","text": "✨ **PREMIUM UPGRADE COMPLETE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThe premium upgrade to your MSA NODE Agent has been **successfully completed**.\n\nYour experience has been enhanced with improved speed, reliability, and features.\n\n**Everything you need is ready:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\nThank you for being a valued MSA NODE member.\n\n_— MSA NODE Development_"},
     {"title": "🆕 New Features Available", "text": "🆕 **NEW FEATURES AVAILABLE NOW**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎉 MSA NODE Agent is back online with **exciting new features and improvements!**\n\nWe've been working hard to make your experience better. Explore everything that's new and improved.\n\n**All services restored:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Development Team_"},
     {"title": "⚡ Agent Update Deployed",  "text": "⚡ **AGENT UPDATE SUCCESSFULLY DEPLOYED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour MSA NODE Agent update has been **deployed and verified**.\n\nThe agent is now running at peak performance with all enhancements active.\n\n**Resume your activities:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Engineering_"},
@@ -414,18 +540,81 @@ bot8_logs = [{
     "timestamp": start_time,
     "action": "SYSTEM",
     "user_id": 0,
-    "details": "Bot 8 log tracking initialized",
-    "full_text": f"[{start_time}] SYSTEM > Bot 8 log tracking initialized"
+    "details": "Bot 1 log tracking initialized",
+    "full_text": f"[{start_time}] SYSTEM > Bot 1 log tracking initialized"
 }]
 bot10_logs = [{
     "timestamp": start_time,
     "action": "SYSTEM",
     "user_id": 0,
-    "details": "Bot 10 log tracking initialized",
-    "full_text": f"[{start_time}] SYSTEM > Bot 10 log tracking initialized"
+    "details": "Bot 2 log tracking initialized",
+    "full_text": f"[{start_time}] SYSTEM > Bot 2 log tracking initialized"
 }]
 
-def log_action(action_type, user_id, details="", bot="bot10"):
+# ==========================================
+# 🗄️ MONGODB STORAGE STATS HELPER
+# ==========================================
+def get_mongo_storage_stats() -> dict:
+    """
+    Get MongoDB storage usage. Works on Atlas M0 (free 512MB) and paid tiers.
+    Returns a dict with all fields needed to display a storage bar + alert.
+    """
+    try:
+        stats      = db.command("dbStats")
+        data_mb    = stats.get("dataSize",    0) / 1_048_576
+        storage_mb = stats.get("storageSize", 0) / 1_048_576
+        index_mb   = stats.get("indexSize",   0) / 1_048_576
+        total_mb   = stats.get("totalSize",   0) / 1_048_576
+        fs_total   = stats.get("fsTotalSize", 0) / 1_048_576
+        fs_used    = stats.get("fsUsedSize",  0) / 1_048_576
+
+        if fs_total > 0:
+            # Dedicated/paid tier — use real filesystem values
+            used_mb   = fs_used
+            cap_mb    = fs_total
+            cap_label = f"{cap_mb:.0f}MB filesystem"
+        else:
+            # Atlas M0 free — cap is 512MB on dataSize+indexSize
+            used_mb   = total_mb
+            cap_mb    = 512.0
+            cap_label = "512MB Atlas M0 free tier"
+
+        pct    = min(used_mb / cap_mb * 100, 100) if cap_mb > 0 else 0.0
+        filled = round(pct / 5)
+        empty  = 20 - filled
+        bar    = "█" * filled + "░" * empty
+
+        if pct >= 90:
+            risk_icon  = "🔴"
+            risk_label = "CRITICAL — upgrade NOW"
+        elif pct >= 75:
+            risk_icon  = "🟠"
+            risk_label = "HIGH — plan upgrade soon"
+        elif pct >= 60:
+            risk_icon  = "🟡"
+            risk_label = "MODERATE — monitor"
+        else:
+            risk_icon  = "🟢"
+            risk_label = "HEALTHY"
+
+        return {
+            "ok":        True,
+            "used_mb":   used_mb,
+            "cap_mb":    cap_mb,
+            "pct":       pct,
+            "bar":       bar,
+            "risk_icon": risk_icon,
+            "risk_label": risk_label,
+            "cap_label": cap_label,
+            "data_mb":   data_mb,
+            "index_mb":  index_mb,
+            "storage_mb": storage_mb,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:100]}
+
+
+def log_action(action_type, user_id, details="", bot="bot2"):
     """Log actions to console, memory, AND MongoDB for live terminal display (works on Render)"""
     timestamp = now_local().strftime('%I:%M:%S %p')
 
@@ -453,7 +642,7 @@ def log_action(action_type, user_id, details="", bot="bot10"):
     }
 
     # Add to in-memory list
-    if bot == "bot8":
+    if bot == "bot1":
         bot8_logs.append(log_entry)
         if len(bot8_logs) > MAX_LOGS:
             bot8_logs.pop(0)
@@ -474,7 +663,7 @@ def log_action(action_type, user_id, details="", bot="bot10"):
     except Exception:
         pass  # Never let logging break the bot
 
-def get_terminal_logs(bot="bot10", limit=50):
+def get_terminal_logs(bot="bot2", limit=50):
     """Get raw terminal logs — reads from MongoDB first (Render-safe), falls back to memory"""
     try:
         # Read from MongoDB for cross-process / Render support
@@ -498,7 +687,7 @@ def get_terminal_logs(bot="bot10", limit=50):
         pass
 
     # Fallback to in-memory
-    logs = bot8_logs if bot == "bot8" else bot10_logs
+    logs = bot8_logs if bot == "bot1" else bot10_logs
     if not logs:
         return ">> SYSTEM INITIALIZED. WAITING FOR EVENTS..."
     recent_logs = logs[-limit:]
@@ -530,7 +719,7 @@ async def is_admin(user_id: int) -> bool:
     
     # Check if admin is locked (inactive)
     if admin.get('locked', False):
-        return False  # Locked admins cannot access Bot 10
+        return False  # Locked admins cannot access Bot 2
     
     return True  # Admin exists and is unlocked
 
@@ -586,7 +775,7 @@ async def get_main_menu(user_id: int = None):
             [KeyboardButton(text="📊 TRAFFIC"), KeyboardButton(text="🩺 DIAGNOSIS")],
             [KeyboardButton(text="📸 SHOOT"), KeyboardButton(text="💬 SUPPORT")],
             [KeyboardButton(text="💾 BACKUP"), KeyboardButton(text="🖥️ TERMINAL")],
-            [KeyboardButton(text="🤖 BOT 8 SETTINGS"), KeyboardButton(text="👥 ADMINS")],
+            [KeyboardButton(text="🤖 BOT 1 SETTINGS"), KeyboardButton(text="👥 ADMINS")],
             [KeyboardButton(text="⚠️ RESET DATA"), KeyboardButton(text="📖 GUIDE")]
         ]
         return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -612,7 +801,7 @@ async def get_main_menu(user_id: int = None):
         'backup': "💾 BACKUP",
         'terminal': "🖥️ TERMINAL",
         'admins': "👥 ADMINS",
-        'bot8': "🤖 BOT 8 SETTINGS"
+        'bot8': "🤖 BOT 1 SETTINGS"
     }
     
     # Build keyboard with only permitted features
@@ -634,11 +823,14 @@ async def get_main_menu(user_id: int = None):
 
 
 def get_backup_menu():
-    """Backup management submenu — Bot 8 and Bot 10 separated"""
+    """Backup management submenu — Bot 1 and Bot 2 separated"""
     keyboard = [
-        [KeyboardButton(text="🤖 BOT 8 BACKUP"), KeyboardButton(text="🤖 BOT 10 BACKUP")],
-        [KeyboardButton(text="📊 BOT 8 HISTORY"), KeyboardButton(text="📊 BOT 10 HISTORY")],
+        [KeyboardButton(text="🤖 BOT 1 BACKUP"), KeyboardButton(text="🤖 BOT 2 BACKUP")],
+        [KeyboardButton(text="📊 BOT 1 HISTORY"), KeyboardButton(text="📊 BOT 2 HISTORY")],
+        [KeyboardButton(text="♻️ RESTORE BOT 1"), KeyboardButton(text="♻️ RESTORE BOT 2")],
         [KeyboardButton(text="🗓️ MONTHLY STATUS"), KeyboardButton(text="⚙️ AUTO-BACKUP")],
+        [KeyboardButton(text="📤 JSON RESTORE")],
+        [KeyboardButton(text="🗑️ CLEAR BACKUP HISTORY")],
         [KeyboardButton(text="⬅️ MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -672,9 +864,7 @@ def _format_broadcast_msg(text: str, is_caption: bool = False) -> str:
             "\n📢  MSA NODE  ·  Official"
             f"\n🕐  {dt}"
         )
-        max_body = 1024 - len(footer) - 2
-        if len(body) > max_body:
-            body = body[:max_body].rsplit(" ", 1)[0] + "…"
+        # No truncation — if caption > 1024, caller handles split (send text separately)
         return body + footer
     else:
         header = (
@@ -697,6 +887,66 @@ def _esc_md(text: str) -> str:
     return text
 
 
+# ── CHECK LINKS pagination store (in-memory, keyed by user_id) ──────────────
+# Each entry: list of page strings. TTL is implicit — overwritten on next /check.
+_chk_links_pages: dict[int, list[str]] = {}
+
+def _paginate_report(text: str, max_len: int = 3800) -> list[str]:
+    """
+    Split a report string into pages of at most max_len chars,
+    breaking only at newline boundaries to preserve formatting.
+    """
+    if len(text) <= max_len:
+        return [text]
+    pages: list[str] = []
+    lines = text.split("\n")
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        # +1 for the '\n' we'll rejoin with
+        needed = len(line) + 1
+        if current and current_len + needed > max_len:
+            pages.append("\n".join(current))
+            current = [line]
+            current_len = needed
+        else:
+            current.append(line)
+            current_len += needed
+    if current:
+        pages.append("\n".join(current))
+    return pages
+
+
+def _preview_cap(text: str, limit: int = 3700) -> str:
+    """Truncate broadcast text for safe display inside a Telegram message (≤4096 chars total)."""
+    t = (text or "").strip()
+    if len(t) <= limit:
+        return t
+    return t[:limit].rsplit(" ", 1)[0] + "… _(truncated for preview)_"
+
+
+def _split_text(text: str, max_len: int = 4000) -> list:
+    """Split long text into chunks at newline boundaries (max max_len chars each)."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    lines = text.split("\n")
+    current: list = []
+    current_len = 0
+    for line in lines:
+        needed = len(line) + 1
+        if current and current_len + needed > max_len:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = needed
+        else:
+            current.append(line)
+            current_len += needed
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def get_broadcast_type_menu():
     """Broadcast type selection menu"""
     keyboard = [
@@ -712,7 +962,7 @@ def get_support_management_menu():
         [KeyboardButton(text="🎫 PENDING TICKETS"), KeyboardButton(text="📋 ALL TICKETS")],
         [KeyboardButton(text="✅ RESOLVE TICKET"), KeyboardButton(text="📨 REPLY")],
         [KeyboardButton(text="🔍 SEARCH TICKETS"), KeyboardButton(text="🗑️ DELETE")],
-        [KeyboardButton(text="📊 MORE OPTIONS")],
+        [KeyboardButton(text="👁 VIEW CHANNEL"), KeyboardButton(text="📊 MORE OPTIONS")],
         [KeyboardButton(text="⬅️ MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -765,8 +1015,21 @@ def _parse_admin_uid(text: str) -> int:
         return int(text.split(' - ')[0].strip())
     return int(text.strip())
 
+# Bot 1 main-menu keyboard — sent to all users when bot comes back online
+_BOT1_MAIN_MENU_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 DASHBOARD")],
+        [KeyboardButton(text="🔍 SEARCH CODE")],
+        [KeyboardButton(text="📺 WATCH TUTORIAL")],
+        [KeyboardButton(text="📖 AGENT GUIDE")],
+        [KeyboardButton(text="📜 RULES")],
+        [KeyboardButton(text="📞 SUPPORT")],
+    ],
+    resize_keyboard=True,
+)
+
 def get_bot8_settings_menu():
-    """Bot 8 Settings Menu — TURN ON/OFF, Stats, Log."""
+    """Bot 1 Settings Menu — TURN ON/OFF, Stats, Log."""
     settings = col_bot8_settings.find_one({"setting": "maintenance_mode"})
     is_maintenance = settings.get("value", False) if settings else False
 
@@ -844,7 +1107,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         log_action("✅ ADMIN ACCESS", user_id, f"{user_name} started bot")
         menu = await get_main_menu(user_id)  # Pass user_id for permission filtering
         await message.answer(
-            f"👋 Welcome to Bot 10!\n\n"
+            f"👋 Welcome to Bot 2!\n\n"
             f"Select an option from the menu below:",
             reply_markup=menu
         )
@@ -878,7 +1141,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "banned_at": now_local(),
             "reason": "Automated: Spam detection (3+ unauthorized access attempts)",
             "status": "banned",
-            "scope": "bot10"  # Only blocks Bot 10 admin access, NOT Bot 8
+            "scope": "bot2"  # Only blocks Bot 2 admin access, NOT Bot 1
         }
         try:
             col_banned_users.insert_one(ban_doc)
@@ -1005,10 +1268,10 @@ async def cmd_health(message: types.Message):
     success_rate = (healed / errors * 100) if errors > 0 else 100.0
 
     await message.answer(
-        f"🏥 **BOT 10 HEALTH STATUS**\n"
+        f"🏥 **BOT 2 HEALTH STATUS**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"⚡ **System:**\n"
-        f"• Bot 10: ✅ Running\n"
+        f"• Bot 2: ✅ Running\n"
         f"• Database: {db_status}\n"
         f"• Auto-Healer: ✅ Active\n"
         f"• Health Monitor: ✅ Running\n\n"
@@ -1052,15 +1315,15 @@ async def back_to_main(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-@dp.message(F.text == "🤖 BOT 8 SETTINGS")
+@dp.message(F.text == "🤖 BOT 1 SETTINGS")
 async def bot8_settings_handler(message: types.Message, state: FSMContext):
-    """Show Bot 8 settings menu"""
+    """Show Bot 1 Settings menu"""
     if not await has_permission(message.from_user.id, "bot8"):
-        await message.answer("⛔ Access Denied: You don't have permission to manage Bot 8 settings.")
+        await message.answer("⛔ Access Denied: You don't have permission to manage Bot 1 settings.")
         return
 
     await state.clear()
-    log_action("🤖 BOT 8 SETTINGS", message.from_user.id, "Opened Bot 8 settings")
+    log_action("🤖 BOT 1 SETTINGS", message.from_user.id, "Opened Bot 1 settings")
 
     settings       = col_bot8_settings.find_one({"setting": "maintenance_mode"})
     is_maintenance = settings.get("value", False) if settings else False
@@ -1068,14 +1331,16 @@ async def bot8_settings_handler(message: types.Message, state: FSMContext):
     updated_at     = settings.get("updated_at", None) if settings else None
     updated_str    = updated_at.strftime("%b %d, %Y %I:%M %p") if updated_at else "Never"
 
-    total_users = col_user_tracking.count_documents({})
+    total_tracking = col_user_tracking.count_documents({})
+    total_msa      = col_msa_ids.count_documents({"retired": {"$ne": True}})
 
     await message.answer(
-        f"🤖 **BOT 8 SETTINGS**\n"
+        f"🤖 **BOT 1 SETTINGS**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📡 **Status:** {status_icon}\n"
         f"🕒 **Last Changed:** {updated_str}\n"
-        f"👥 **Registered Users:** {total_users}\n\n"
+        f"👥 **Users who started bot:** {total_tracking}\n"
+        f"🆔 **Verified MSA Members:** {total_msa}\n\n"
         f"**🔴 TURN BOT OFF** — Put bot in Maintenance Mode\n"
         f"**🟢 TURN BOT ON** — Bring bot back online\n\n"
         f"Choose your action below:",
@@ -1085,7 +1350,7 @@ async def bot8_settings_handler(message: types.Message, state: FSMContext):
 
 
 # ==========================================
-# 🤖 BOT 8 — TURN OFF / TURN ON  (with Auto / Template / Custom choice)
+# 🤖 BOT 1 — TURN OFF / TURN ON  (with Auto / Template / Custom choice)
 # ==========================================
 
 @dp.message(F.text.in_({"🔴 TURN BOT OFF", "🟢 TURN BOT ON"}))
@@ -1118,12 +1383,12 @@ async def b8_toggle_start_handler(message: types.Message, state: FSMContext):
         reply_markup=method_kb,
         parse_mode="Markdown"
     )
-    await state.set_state(Bot8SettingsStates.choosing_method)
+    await state.set_state(Bot1SettingsStates.choosing_method)
 
 
-@dp.message(Bot8SettingsStates.choosing_method)
+@dp.message(Bot1SettingsStates.choosing_method)
 async def b8_method_handler(message: types.Message, state: FSMContext):
-    """Handle method choice for Bot 8 on/off notification."""
+    """Handle method choice for Bot 1 on/off notification."""
     if not await has_permission(message.from_user.id, "bot8"):
         await state.clear()
         return
@@ -1169,14 +1434,14 @@ async def b8_method_handler(message: types.Message, state: FSMContext):
             reply_markup=cancel_kb,
             parse_mode="Markdown"
         )
-        await state.set_state(Bot8SettingsStates.entering_custom)
+        await state.set_state(Bot1SettingsStates.entering_custom)
         return
 
     # Unexpected input — re-offer choice silently
     await message.answer("⚠️ Please use the buttons provided.", parse_mode="Markdown")
 
 
-@dp.message(Bot8SettingsStates.entering_custom)
+@dp.message(Bot1SettingsStates.entering_custom)
 async def b8_custom_input_handler(message: types.Message, state: FSMContext):
     """Receive custom broadcast text → show preview + confirm inline keyboard."""
     if not await has_permission(message.from_user.id, "bot8"):
@@ -1327,7 +1592,7 @@ async def b8_template_custom_callback(callback: types.CallbackQuery, state: FSMC
     """Switch from template list to custom message input."""
     direction = callback.data.split(":")[1]
     await state.update_data(b8_direction=direction)
-    await state.set_state(Bot8SettingsStates.entering_custom)
+    await state.set_state(Bot1SettingsStates.entering_custom)
     cancel_kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ CANCEL")]],
         resize_keyboard=True
@@ -1348,9 +1613,8 @@ async def _b8_execute_toggle(message: types.Message, state: FSMContext, directio
         {"$set": {"value": turn_on, "updated_at": now_local(), "updated_by": message.from_user.id}},
         upsert=True
     )
-    # Save to offline log
-    col_bot8_settings.insert_one({
-        "setting": "offline_event",
+    # Save to dedicated offline log collection (never mixed with settings)
+    col_offline_log.insert_one({
         "direction": direction,
         "message": broadcast_text[:200],
         "triggered_by": message.from_user.id,
@@ -1363,11 +1627,14 @@ async def _b8_execute_toggle(message: types.Message, state: FSMContext, directio
     all_users  = list(col_user_tracking.find({}, {"user_id": 1}))
     sent, fail = 0, 0
     progress   = await message.answer(f"📡 Broadcasting to {len(all_users)} users…")
+    # turn_on=True  → maintenance ON  → hide keyboard (ReplyKeyboardRemove)
+    # turn_on=False → maintenance OFF → restore keyboard (_BOT1_MAIN_MENU_KB)
+    _broadcast_kb = ReplyKeyboardRemove() if turn_on else _BOT1_MAIN_MENU_KB
     for doc in all_users:
         uid = doc.get("user_id")
         if not uid: continue
         try:
-            await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown")
+            await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown", reply_markup=_broadcast_kb)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -1396,8 +1663,8 @@ async def _b8_execute_toggle_from_callback(callback: types.CallbackQuery, state:
         {"$set": {"value": turn_on, "updated_at": now_local(), "updated_by": callback.from_user.id}},
         upsert=True
     )
-    col_bot8_settings.insert_one({
-        "setting": "offline_event",
+    # Save to dedicated offline log collection (never mixed with settings)
+    col_offline_log.insert_one({
         "direction": direction,
         "message": broadcast_text[:200],
         "triggered_by": callback.from_user.id,
@@ -1409,11 +1676,12 @@ async def _b8_execute_toggle_from_callback(callback: types.CallbackQuery, state:
 
     all_users  = list(col_user_tracking.find({}, {"user_id": 1}))
     sent, fail = 0, 0
+    _broadcast_kb = ReplyKeyboardRemove() if turn_on else _BOT1_MAIN_MENU_KB
     for doc in all_users:
         uid = doc.get("user_id")
         if not uid: continue
         try:
-            await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown")
+            await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown", reply_markup=_broadcast_kb)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -1433,31 +1701,48 @@ async def _b8_execute_toggle_from_callback(callback: types.CallbackQuery, state:
 
 @dp.message(F.text == "📊 BOT STATS")
 async def b8_stats_handler(message: types.Message):
-    """Show Bot 8 live statistics."""
+    """Show Bot 1 live statistics."""
     if not await has_permission(message.from_user.id, "bot8"):
         return
-    total_users    = col_user_tracking.count_documents({})
-    total_msa      = col_msa_ids.count_documents({})
+
+    # ── User counts ─────────────────────────────────────────────────
+    total_tracking = col_user_tracking.count_documents({})         # Users who started the bot
+    total_msa      = col_msa_ids.count_documents({"retired": {"$ne": True}})  # Active MSA members (vault)
+    total_banned   = col_banned_users.count_documents({})          # Total banned
+    total_suspended = col_suspended_features.count_documents({})   # Feature-suspended users
+
+    # ── Support tickets ─────────────────────────────────────────────
     open_tickets   = col_support_tickets.count_documents({"status": "open"})
     closed_tickets = col_support_tickets.count_documents({"status": "resolved"})
+    total_tickets  = open_tickets + closed_tickets
+
+    # ── Broadcast records (bot10 stored broadcasts in MSANodeDB) ──
     total_bc       = col_broadcasts.count_documents({})
 
-    settings       = col_bot8_settings.find_one({"setting": "maintenance_mode"})
-    is_maint       = settings.get("value", False) if settings else False
-    status_str     = "🔴 Offline (Maintenance)" if is_maint else "🟢 Online"
+    # ── Offline events log ──────────────────────────────────────────
+    total_off_events = col_offline_log.count_documents({})
+
+    # ── Maintenance status ──────────────────────────────────────────
+    settings   = col_bot8_settings.find_one({"setting": "maintenance_mode"})
+    is_maint   = settings.get("value", False) if settings else False
+    status_str = "🔴 Offline (Maintenance)" if is_maint else "🟢 Online"
 
     await message.answer(
-        f"📊 **BOT 8 LIVE STATS**\n"
+        f"📊 **BOT 1 LIVE STATS**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📡 **Status:** {status_str}\n\n"
         f"👥 **Users:**\n"
-        f"• Tracked: `{total_users}`\n"
-        f"• MSA Members: `{total_msa}`\n\n"
+        f"• Started Bot (tracked): `{total_tracking}`\n"
+        f"• Verified MSA Members: `{total_msa}`\n"
+        f"• Banned: `{total_banned}`\n"
+        f"• Feature Suspended: `{total_suspended}`\n\n"
         f"🎫 **Support Tickets:**\n"
         f"• Open: `{open_tickets}`\n"
-        f"• Resolved: `{closed_tickets}`\n\n"
-        f"📢 **Broadcasts Stored:** `{total_bc}`\n\n"
-        f"🕒 _Snapshot: {now_local().strftime('%b %d, %Y %I:%M %p')}_",
+        f"• Resolved: `{closed_tickets}`\n"
+        f"• Total: `{total_tickets}`\n\n"
+        f"📢 **Broadcast Records:** `{total_bc}`\n"
+        f"📜 **Offline Log Events:** `{total_off_events}`\n\n"
+        f"🕒 _Live snapshot: {now_local().strftime('%b %d, %Y %I:%M %p')}_",
         reply_markup=get_bot8_settings_menu(),
         parse_mode="Markdown"
     )
@@ -1470,8 +1755,8 @@ async def b8_offline_log_handler(message: types.Message):
     """Show history of bot on/off events."""
     if not await has_permission(message.from_user.id, "bot8"):
         return
-    events = list(col_bot8_settings.find(
-        {"setting": "offline_event"},
+    events = list(col_offline_log.find(
+        {},
         sort=[("triggered_at", -1)],
     ).limit(10))
 
@@ -1613,8 +1898,10 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
     
     # Find target users based on category
     if category == "ALL":
-        # Use msa_ids as authoritative source — all verified MSA members
-        target_users = list(col_msa_ids.find({}))
+        # Use user_tracking as authoritative source — all users who ever started the bot,
+        # locked to their permanent source. This keeps ALL count consistent with
+        # per-source counts and properly reflects dead-user cleanup.
+        target_users = list(col_user_tracking.find({}, {"user_id": 1}))
     else:
         target_users = list(col_user_tracking.find({"source": category}))
     
@@ -1624,7 +1911,7 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
         print(f"⚠️ No users found for category: {category}")
         await message.answer(
             f"⚠️ **No users found for category: {category}**\n\n"
-            "Users need to start Bot 8 before receiving broadcasts.",
+            "Users need to start Bot 1 before receiving broadcasts.",
             reply_markup=get_broadcast_menu(),
             parse_mode="Markdown"
         )
@@ -1636,37 +1923,62 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
     print(f"🆔 Broadcast ID: {broadcast_id}")
     print(f"📂 Category: {category}")
     print(f"👥 Target users: {len(target_users)}")
-    print(f"🤖 Delivery method: Bot 8")
-    
+    print(f"🤖 Delivery method: Bot 1")
+
+    # ── PRE-DOWNLOAD MEDIA ONCE (avoid re-downloading per user) ─────────────
+    _media_bytes = None
+    if media_type and file_id:
+        try:
+            print(f"📥 Pre-downloading {media_type} (file_id={file_id[:20]}…) from Bot 2…")
+            _file_obj = await bot.get_file(file_id)
+            _fd = await bot.download_file(_file_obj.file_path)
+            _media_bytes = _fd.read()
+            print(f"✅ Pre-download complete — {len(_media_bytes):,} bytes")
+        except Exception as _dl_err:
+            print(f"⚠️ Media pre-download failed: {_dl_err}  (will attempt per-user)")
+    # ────────────────────────────────────────────────────────────────────────
+
+    # ── PRE-COMPUTE CAPTION / TEXT (once, shared across all users) ───────────
+    _bcast_caption = _format_broadcast_msg(message_text, is_caption=True) if message_text and message_text.strip() else ""
+    _bcast_caption_split = len(_bcast_caption) > 1024   # True = too long for caption
+    _bcast_full_text = _format_broadcast_msg(message_text or "📢 MSA NODE Broadcast", is_caption=False)
+    _bcast_text_chunks = _split_text(_bcast_full_text)  # list of ≤4000-char chunks; usually just 1
+    # ─────────────────────────────────────────────────────────────────────────
+
     status_msg = await message.answer(
-        f"📤 **Sending Broadcast via Bot 8...**\n\n"
+        f"📤 **Sending Broadcast via Bot 1...**\n\n"
         f"🆔 ID: `{broadcast_id}`\n"
         f"📂 Category: {category}\n"
         f"👥 Target Users: {len(target_users)}\n"
-        f"🤖 Delivery Bot: Bot 8\n\n"
+        f"🤖 Delivery Bot: Bot 1\n\n"
         f"⏳ Preparing to send...",
         parse_mode="Markdown"
     )
-    
+
     success_count = 0
     failed_count = 0
     blocked_count = 0
     error_details = []
     sent_message_ids = {}  # Store message IDs for later deletion
-    
+
     # Send to each user with progress updates
     for i, user_doc in enumerate(target_users, 1):
-        user_id = user_doc['user_id']
+        # ── Safe user_id access — skip doc if field missing ─────────────────
+        user_id = user_doc.get('user_id')
+        if not user_id:
+            failed_count += 1
+            error_details.append(f"Skipped doc #{i}: missing user_id field")
+            continue
         
         # Update progress every 5 users or for small batches
         if i % 5 == 0 or len(target_users) <= 10:
             try:
                 await status_msg.edit_text(
-                    f"📤 **Sending via Bot 8...**\n\n"
+                    f"📤 **Sending via Bot 1...**\n\n"
                     f"🆔 ID: `{broadcast_id}`\n"
                     f"📂 Category: {category}\n"
                     f"👥 Target Users: {len(target_users)}\n"
-                    f"🤖 Via: Bot 8\n\n"
+                    f"🤖 Via: Bot 1\n\n"
                     f"📝 Progress: {i}/{len(target_users)} users\n"
                     f"✅ Success: {success_count} | ❌ Failed: {failed_count}",
                     parse_mode="Markdown"
@@ -1674,193 +1986,143 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
             except:
                 pass  # Ignore edit errors during sending
         
-        try:
-            # CROSS-BOT MEDIA FIX - Download from Bot 10 and send through Bot 8 with retry logic
-            if media_type == "photo" and file_id:
-                print(f"📸 Processing photo for user {user_id} with retry logic...")
-                try:
-                    # Download with retry logic
-                    async def download_photo():
-                        photo_file = await bot.get_file(file_id)
-                        file_data = await bot.download_file(photo_file.file_path)
-                        return file_data.read()  # Extract bytes from BytesIO
-                    
-                    photo_bytes = await retry_operation(download_photo, max_retries=3, operation_name="Photo download")
-                    
-                    # Upload with retry logic - recreate BufferedInputFile on each attempt
-                    async def upload_photo():
-                        photo_input = BufferedInputFile(photo_bytes, filename="broadcast_photo.jpg")
-                        if message_text and message_text.strip():
-                            return await bot_8.send_photo(user_id, photo_input, caption=_format_broadcast_msg(message_text, is_caption=True))
+        for _attempt in range(3):
+            try:
+                # CROSS-BOT MEDIA: use pre-downloaded bytes, fall back to per-user download if needed
+                _bytes = _media_bytes  # pre-downloaded bytes (may be None if pre-download failed)
+
+                if media_type == "photo" and file_id:
+                    if not _bytes:
+                        _f = await bot.get_file(file_id)
+                        _fd = await bot.download_file(_f.file_path)
+                        _bytes = _fd.read()
+                    photo_input = BufferedInputFile(_bytes, filename="broadcast_photo.jpg")
+                    if message_text and message_text.strip():
+                        if _bcast_caption_split:
+                            sent_msg = await bot_8.send_photo(user_id, photo_input)
+                            for _chunk in _bcast_text_chunks:
+                                await bot_8.send_message(user_id, _chunk)
                         else:
-                            return await bot_8.send_photo(user_id, photo_input)
-                    
-                    sent_msg = await retry_operation(upload_photo, max_retries=3, operation_name="Photo upload")
-                    sent_message_ids[user_id] = sent_msg.message_id  # Store message ID
-                    print(f"✅ Photo sent successfully to user {user_id}")
-                    
-                except Exception as e:
-                    print(f"❌ Photo transfer failed for user {user_id}: {str(e)}")
-                    raise Exception(f"Photo upload failed: {str(e)[:50]}...")
-                    
-            elif media_type == "video" and file_id:
-                print(f"🎥 Processing video for user {user_id} with retry logic...")
-                try:
-                    # Download with retry logic
-                    async def download_video():
-                        video_file = await bot.get_file(file_id)
-                        file_data = await bot.download_file(video_file.file_path)
-                        return file_data.read()  # Extract bytes from BytesIO
-                    
-                    video_bytes = await retry_operation(download_video, max_retries=3, operation_name="Video download")
-                    
-                    # Upload with retry logic - recreate BufferedInputFile on each attempt
-                    async def upload_video():
-                        video_input = BufferedInputFile(video_bytes, filename="broadcast_video.mp4")
-                        if message_text and message_text.strip():
-                            return await bot_8.send_video(user_id, video_input, caption=_format_broadcast_msg(message_text, is_caption=True))
+                            sent_msg = await bot_8.send_photo(user_id, photo_input, caption=_bcast_caption)
+                    else:
+                        sent_msg = await bot_8.send_photo(user_id, photo_input)
+                    sent_message_ids[str(user_id)] = sent_msg.message_id
+
+                elif media_type == "video" and file_id:
+                    if not _bytes:
+                        _f = await bot.get_file(file_id)
+                        _fd = await bot.download_file(_f.file_path)
+                        _bytes = _fd.read()
+                    video_input = BufferedInputFile(_bytes, filename="broadcast_video.mp4")
+                    if message_text and message_text.strip():
+                        if _bcast_caption_split:
+                            sent_msg = await bot_8.send_video(user_id, video_input)
+                            for _chunk in _bcast_text_chunks:
+                                await bot_8.send_message(user_id, _chunk)
                         else:
-                            return await bot_8.send_video(user_id, video_input)
-                    
-                    sent_msg = await retry_operation(upload_video, max_retries=3, operation_name="Video upload")
-                    sent_message_ids[user_id] = sent_msg.message_id  # Store message ID
-                    print(f"✅ Video sent successfully to user {user_id}")
-                    
-                except Exception as e:
-                    print(f"❌ Video transfer failed for user {user_id}: {str(e)}")
-                    raise Exception(f"Video upload failed: {str(e)[:50]}...")
-                    
-            elif media_type == "animation" and file_id:
-                print(f"🎬 Processing animation for user {user_id} with retry logic...")
-                try:
-                    # Download with retry logic
-                    async def download_animation():
-                        animation_file = await bot.get_file(file_id)
-                        file_data = await bot.download_file(animation_file.file_path)
-                        return file_data.read()  # Extract bytes from BytesIO
-                    
-                    animation_bytes = await retry_operation(download_animation, max_retries=3, operation_name="Animation download")
-                    
-                    # Upload with retry logic - recreate BufferedInputFile on each attempt
-                    async def upload_animation():
-                        animation_input = BufferedInputFile(animation_bytes, filename="broadcast_animation.gif")
-                        if message_text and message_text.strip():
-                            return await bot_8.send_animation(user_id, animation_input, caption=_format_broadcast_msg(message_text, is_caption=True))
+                            sent_msg = await bot_8.send_video(user_id, video_input, caption=_bcast_caption)
+                    else:
+                        sent_msg = await bot_8.send_video(user_id, video_input)
+                    sent_message_ids[str(user_id)] = sent_msg.message_id
+
+                elif media_type == "animation" and file_id:
+                    if not _bytes:
+                        _f = await bot.get_file(file_id)
+                        _fd = await bot.download_file(_f.file_path)
+                        _bytes = _fd.read()
+                    anim_input = BufferedInputFile(_bytes, filename="broadcast_animation.gif")
+                    if message_text and message_text.strip():
+                        if _bcast_caption_split:
+                            sent_msg = await bot_8.send_animation(user_id, anim_input)
+                            for _chunk in _bcast_text_chunks:
+                                await bot_8.send_message(user_id, _chunk)
                         else:
-                            return await bot_8.send_animation(user_id, animation_input)
-                    
-                    sent_msg = await retry_operation(upload_animation, max_retries=3, operation_name="Animation upload")
-                    sent_message_ids[user_id] = sent_msg.message_id  # Store message ID
-                    print(f"✅ Animation sent successfully to user {user_id}")
-                    
-                except Exception as e:
-                    print(f"❌ Animation transfer failed for user {user_id}: {str(e)}")
-                    raise Exception(f"Animation upload failed: {str(e)[:50]}...")
-                    
-            elif media_type == "document" and file_id:
-                print(f"📄 Processing document for user {user_id} with retry logic...")
-                try:
-                    # Download with retry logic
-                    async def download_document():
-                        document_file = await bot.get_file(file_id)
-                        print(f"📥 Downloading document bytes (size: {document_file.file_size} bytes)")
-                        file_data = await bot.download_file(document_file.file_path)
-                        return file_data.read()  # Extract bytes from BytesIO
-                    
-                    document_bytes = await retry_operation(download_document, max_retries=3, operation_name="Document download")
-                    
-                    # Upload with retry logic - recreate BufferedInputFile on each attempt
-                    async def upload_document():
-                        document_input = BufferedInputFile(document_bytes, filename="broadcast_document")
-                        print(f"📤 Uploading document via Bot 8 to user {user_id}")
-                        if message_text and message_text.strip():
-                            return await bot_8.send_document(user_id, document_input, caption=_format_broadcast_msg(message_text, is_caption=True))
+                            sent_msg = await bot_8.send_animation(user_id, anim_input, caption=_bcast_caption)
+                    else:
+                        sent_msg = await bot_8.send_animation(user_id, anim_input)
+                    sent_message_ids[str(user_id)] = sent_msg.message_id
+
+                elif media_type == "document" and file_id:
+                    if not _bytes:
+                        _f = await bot.get_file(file_id)
+                        _fd = await bot.download_file(_f.file_path)
+                        _bytes = _fd.read()
+                    doc_input = BufferedInputFile(_bytes, filename="broadcast_document")
+                    if message_text and message_text.strip():
+                        if _bcast_caption_split:
+                            sent_msg = await bot_8.send_document(user_id, doc_input)
+                            for _chunk in _bcast_text_chunks:
+                                await bot_8.send_message(user_id, _chunk)
                         else:
-                            return await bot_8.send_document(user_id, document_input)
-                    
-                    sent_msg = await retry_operation(upload_document, max_retries=3, operation_name="Document upload")
-                    sent_message_ids[user_id] = sent_msg.message_id  # Store message ID
-                    print(f"✅ Document sent successfully to user {user_id}")
-                    
-                except Exception as e:
-                    print(f"❌ Document transfer failed for user {user_id}: {str(e)}")
-                    raise Exception(f"Document upload failed: {str(e)[:50]}...")
-                    
-            elif media_type == "audio" and file_id:
-                print(f"🎵 Processing audio for user {user_id} with retry logic...")
-                try:
-                    # Download with retry logic
-                    async def download_audio():
-                        audio_file = await bot.get_file(file_id)
-                        file_data = await bot.download_file(audio_file.file_path)
-                        return file_data.read()  # Extract bytes from BytesIO
-                    
-                    audio_bytes = await retry_operation(download_audio, max_retries=3, operation_name="Audio download")
-                    
-                    # Upload with retry logic - recreate BufferedInputFile on each attempt
-                    async def upload_audio():
-                        audio_input = BufferedInputFile(audio_bytes, filename="broadcast_audio.mp3")
-                        if message_text and message_text.strip():
-                            return await bot_8.send_audio(user_id, audio_input, caption=_format_broadcast_msg(message_text, is_caption=True))
+                            sent_msg = await bot_8.send_document(user_id, doc_input, caption=_bcast_caption)
+                    else:
+                        sent_msg = await bot_8.send_document(user_id, doc_input)
+                    sent_message_ids[str(user_id)] = sent_msg.message_id
+
+                elif media_type == "audio" and file_id:
+                    if not _bytes:
+                        _f = await bot.get_file(file_id)
+                        _fd = await bot.download_file(_f.file_path)
+                        _bytes = _fd.read()
+                    audio_input = BufferedInputFile(_bytes, filename="broadcast_audio.mp3")
+                    if message_text and message_text.strip():
+                        if _bcast_caption_split:
+                            sent_msg = await bot_8.send_audio(user_id, audio_input)
+                            for _chunk in _bcast_text_chunks:
+                                await bot_8.send_message(user_id, _chunk)
                         else:
-                            return await bot_8.send_audio(user_id, audio_input)
-                    
-                    sent_msg = await retry_operation(upload_audio, max_retries=3, operation_name="Audio upload")
-                    sent_message_ids[user_id] = sent_msg.message_id  # Store message ID
-                    print(f"✅ Audio sent successfully to user {user_id}")
-                    
-                except Exception as e:
-                    print(f"❌ Audio transfer failed for user {user_id}: {str(e)}")
-                    raise Exception(f"Audio upload failed: {str(e)[:50]}...")
-                    
-            elif media_type == "voice" and file_id:
-                print(f"🎙️ Processing voice for user {user_id} with retry logic...")
-                try:
-                    # Download with retry logic
-                    async def download_voice():
-                        voice_file = await bot.get_file(file_id)
-                        file_data = await bot.download_file(voice_file.file_path)
-                        return file_data.read()  # Extract bytes from BytesIO
-                    
-                    voice_bytes = await retry_operation(download_voice, max_retries=3, operation_name="Voice download")
-                    
-                    # Upload with retry logic - recreate BufferedInputFile on each attempt (voice messages don't support captions)
-                    async def upload_voice():
-                        voice_input = BufferedInputFile(voice_bytes, filename="broadcast_voice.ogg")
-                        return await bot_8.send_voice(user_id, voice_input)
-                    
-                    sent_msg = await retry_operation(upload_voice, max_retries=3, operation_name="Voice upload")
-                    sent_message_ids[user_id] = sent_msg.message_id  # Store message ID
-                    print(f"✅ Voice sent successfully to user {user_id}")
-                    
-                except Exception as e:
-                    print(f"❌ Voice transfer failed for user {user_id}: {str(e)}")
-                    raise Exception(f"Voice upload failed: {str(e)[:50]}...")
-                
-            else:
-                # Send text message
-                sent_msg = await bot_8.send_message(user_id, _format_broadcast_msg(message_text or "📢 MSA NODE Broadcast"))
-                sent_message_ids[user_id] = sent_msg.message_id  # Store message ID
-                print(f"✅ Text message sent successfully to user {user_id}")
-            
-            success_count += 1
-            
-            # Small delay to avoid rate limits
-            if len(target_users) > 10:
-                await asyncio.sleep(0.1)  # 100ms delay for large broadcasts
-        except Exception as e:
-            failed_count += 1
-            error_msg = str(e)
-            
-            # Categorize error types
-            if "blocked" in error_msg.lower():
-                blocked_count += 1
-            elif "not found" in error_msg.lower():
-                error_details.append(f"User {user_id}: Account deleted")
-            elif "restricted" in error_msg.lower():
-                error_details.append(f"User {user_id}: Restricted")
-            else:
-                error_details.append(f"User {user_id}: {error_msg[:30]}...")
+                            sent_msg = await bot_8.send_audio(user_id, audio_input, caption=_bcast_caption)
+                    else:
+                        sent_msg = await bot_8.send_audio(user_id, audio_input)
+                    sent_message_ids[str(user_id)] = sent_msg.message_id
+
+                elif media_type == "voice" and file_id:
+                    if not _bytes:
+                        _f = await bot.get_file(file_id)
+                        _fd = await bot.download_file(_f.file_path)
+                        _bytes = _fd.read()
+                    voice_input = BufferedInputFile(_bytes, filename="broadcast_voice.ogg")
+                    sent_msg = await bot_8.send_voice(user_id, voice_input)
+                    sent_message_ids[str(user_id)] = sent_msg.message_id
+
+                else:
+                    # Plain text — send in chunks if message exceeds 4096 chars
+                    sent_msg = None
+                    for _chunk in _bcast_text_chunks:
+                        sent_msg = await bot_8.send_message(user_id, _chunk)
+                    sent_message_ids[str(user_id)] = sent_msg.message_id
+
+                success_count += 1
+                await asyncio.sleep(0.04)  # ~25 msgs/sec — within Telegram rate limits
+                break  # success — exit retry loop
+
+            except TelegramRetryAfter as rafe:
+                print(f"⏳ Flood wait for {user_id}: sleeping {rafe.retry_after}s (attempt {_attempt+1}/3)")
+                await asyncio.sleep(rafe.retry_after + 1)
+                if _attempt == 2:
+                    failed_count += 1
+                    error_details.append(f"User {user_id}: Flood wait — all retries exhausted")
+            except Exception as e:
+                failed_count += 1
+                error_msg = str(e)
+
+                # Categorize error types — order matters: most specific first
+                _em = error_msg.lower()
+                if "bot was blocked" in _em or "user is deactivated" in _em:
+                    blocked_count += 1
+                elif "unauthorized" in _em or "forbidden" in _em:
+                    # User never started Bot 1, or revoked access
+                    blocked_count += 1
+                    error_details.append(f"User {user_id}: Telegram server says - Unauthorized (never started Bot 1)")
+                elif "blocked" in _em:
+                    blocked_count += 1
+                elif "not found" in _em or "chat not found" in _em:
+                    error_details.append(f"User {user_id}: Account deleted or not found")
+                elif "restricted" in _em:
+                    error_details.append(f"User {user_id}: Restricted")
+                else:
+                    error_details.append(f"User {user_id}: {error_msg[:50]}")
+                break  # don't retry for non-flood errors
     
     # Final status update after all sends complete
     print(f"✅ Broadcast sending complete! Success: {success_count}, Failed: {failed_count}")
@@ -1870,7 +2132,7 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
             f"🆔 ID: `{broadcast_id}`\n"
             f"📂 Category: {category}\n"
             f"👥 Target Users: {len(target_users)}\n"
-            f"🤖 Via: Bot 8\n\n"
+            f"🤖 Via: Bot 1\n\n"
             f"✅ Success: {success_count} | ❌ Failed: {failed_count}",
             parse_mode="Markdown"
         )
@@ -1893,10 +2155,9 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
         "last_sent": now_local()
     }
     
-    # Add media info if applicable
+    # Add media type label if applicable — file_id NOT stored (keep DB clean, no media blobs)
     if media_type:
         broadcast_data["media_type"] = media_type
-        broadcast_data["file_id"] = file_id
     
     # Store message IDs for later deletion (convert keys to strings for MongoDB)
     broadcast_data["message_ids"] = {str(k): v for k, v in sent_message_ids.items()}
@@ -1916,7 +2177,7 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
     report = f"✅ **Broadcast Complete & Saved!**\n\n"
     report += f"🆔 ID: `{broadcast_id}`\n"
     report += f"📂 Category: {category}\n"
-    report += f"🤖 Delivered via: **Bot 8**\n"
+    report += f"🤖 Delivered via: **Bot 1**\n"
     report += f"🕐 Sent At: {sent_time}\n\n"
     report += f"📊 **Delivery Report:**\n"
     report += f"✅ **Success: {success_count}** users received\n"
@@ -1974,9 +2235,9 @@ async def show_broadcast_list_page(message: types.Message, state: FSMContext, pa
     response = f"📋 **BROADCASTS (Page {page + 1})** - Total: {total}\n\n"
     for brd in broadcasts:
         category = brd.get('category', 'ALL')
-        # Get user count for this category
+        # Get user count — live, consistent with actual send targets (no retired/dead users)
         if category == "ALL":
-            user_count = col_msa_ids.count_documents({})  # All verified MSA members
+            user_count = col_user_tracking.count_documents({})  # All tracked users (live)
         else:
             user_count = col_user_tracking.count_documents({"source": category})
         
@@ -2061,28 +2322,45 @@ async def process_list_search(message: types.Message, state: FSMContext):
     
     if not broadcast:
         await message.answer(
-            f"❌ Broadcast `{search}` not found.\n\n"
+            f"\u274c Broadcast `{search}` not found.\n\n"
             "Send a valid ID (brd1) or index (1).",
             parse_mode="Markdown"
         )
         return
     
     # Display full broadcast details
-    response = f"📋 **BROADCAST DETAILS**\n\n"
-    response += f"🆔 ID: `{broadcast['broadcast_id']}`\n"
-    response += f"📍 Index: {broadcast['index']}\n"
-    response += f"📂 Category: {broadcast.get('category', 'ALL')}\n"
-    response += f"📝 Type: {broadcast['message_type'].title()}\n"
-    response += f"📊 Status: {broadcast['status'].title()}\n"
-    response += f"📤 Sent: {broadcast.get('sent_count', 0)} users\n"
-    response += f"🕐 Created: {format_datetime(broadcast.get('created_at'))}\n"
+    response = f"\U0001f4cb **BROADCAST DETAILS**\n\n"
+    response += f"\U0001f194 ID: `{broadcast['broadcast_id']}`\n"
+    response += f"\U0001f4cd Index: {broadcast['index']}\n"
+    response += f"\U0001f4c2 Category: {broadcast.get('category', 'ALL')}\n"
+    response += f"\U0001f4dd Type: {broadcast['message_type'].title()}\n"
+    response += f"\U0001f4ca Status: {broadcast['status'].title()}\n"
+    response += f"\U0001f4e4 Sent: {broadcast.get('sent_count', 0)} users\n"
+    response += f"\U0001f550 Created: {format_datetime(broadcast.get('created_at'))}\n"
     if broadcast.get('last_edited'):
-        response += f"📝 Last Edited: {format_datetime(broadcast.get('last_edited'))}\n"
+        response += f"\U0001f4dd Last Edited: {format_datetime(broadcast.get('last_edited'))}\n"
     if broadcast.get('last_sent'):
-        response += f"📤 Last Sent: {format_datetime(broadcast.get('last_sent'))}\n"
-    response += f"\n💬 **Full Message:**\n{broadcast['message_text']}"
+        response += f"\U0001f4e4 Last Sent: {format_datetime(broadcast.get('last_sent'))}\n"
+    # Guard message text length before appending
+    _full_text = (broadcast.get('message_text') or "").strip()
+    _header_len = len(response) + len("\n\U0001f4ac **Full Message:**\n")
+    _text_cap = 4000 - _header_len
+    if len(_full_text) > _text_cap:
+        _full_text = _full_text[:max(_text_cap - 3, 0)].rsplit(" ", 1)[0] + "\u2026"
+    response += f"\n\U0001f4ac **Full Message:**\n{_full_text}"
     
     await message.answer(response, parse_mode="Markdown")
+
+    # Show media type info — actual file not retrievable (file_id not stored by design)
+    if broadcast.get("media_type"):
+        _m_type = broadcast["media_type"]
+        _type_icons = {"photo": "📷", "video": "🎥", "animation": "🎞️", "document": "📄", "audio": "🎵", "voice": "🎙️"}
+        _icon = _type_icons.get(_m_type, "📎")
+        await message.answer(
+            f"{_icon} **Media Type:** {_m_type.capitalize()}\n"
+            f"_Media files are not stored in the database (text only policy)._",
+            parse_mode="Markdown"
+        )
 
 @dp.message(F.text == "✏️ EDIT BROADCAST")
 async def edit_broadcast_handler(message: types.Message, state: FSMContext):
@@ -2091,6 +2369,7 @@ async def edit_broadcast_handler(message: types.Message, state: FSMContext):
 
 async def show_edit_broadcast_list(message: types.Message, state: FSMContext, page: int = 0):
     """Show paginated list for editing"""
+    reindex_broadcasts()  # Ensure sequential, duplicate-free indexes
     per_page = 10
     skip = page * per_page
     
@@ -2108,9 +2387,9 @@ async def show_edit_broadcast_list(message: types.Message, state: FSMContext, pa
     response = f"✏️ **EDIT BROADCAST (Page {page + 1})** - Total: {total}\n\nAvailable broadcasts:\n\n"
     for brd in broadcasts:
         category = brd.get('category', 'ALL')
-        # Get user count for this category
+        # Get user count for this category — consistent with actual send targets
         if category == "ALL":
-            user_count = col_msa_ids.count_documents({})  # All verified MSA members
+            user_count = col_user_tracking.count_documents({})  # All tracked users (live)
         else:
             user_count = col_user_tracking.count_documents({"source": category})
         
@@ -2194,12 +2473,17 @@ async def process_edit_id(message: types.Message, state: FSMContext):
     created = format_datetime(broadcast.get('created_at'))
     last_edited = format_datetime(broadcast.get('last_edited'))
     
+    # Guard current message text length for display
+    _cur_msg = (broadcast.get('message_text') or "").strip()
+    if len(_cur_msg) > 3600:
+        _cur_msg = _cur_msg[:3600].rsplit(" ", 1)[0] + "\u2026 _(truncated for display)_"
+
     await message.answer(
-        f"✏️ **Editing: {broadcast['broadcast_id']}**\n\n"
-        f"📂 Category: {broadcast.get('category', 'ALL')}\n"
-        f"🕐 Created: {created}\n"
-        f"📝 Last Edited: {last_edited}\n\n"
-        f"**Current message:**\n{broadcast['message_text']}\n\n"
+        f"\u270f\ufe0f **Editing: {broadcast['broadcast_id']}**\n\n"
+        f"\U0001f4c2 Category: {broadcast.get('category', 'ALL')}\n"
+        f"\U0001f550 Created: {created}\n"
+        f"\U0001f4dd Last Edited: {last_edited}\n\n"
+        f"**Current message:**\n{_cur_msg}\n\n"
         "Send the new content for this broadcast.",
         reply_markup=cancel_kb,
         parse_mode="Markdown"
@@ -2251,10 +2535,11 @@ async def process_edit_content(message: types.Message, state: FSMContext):
         resize_keyboard=True
     )
     
+    _edit_preview_fmt = _format_broadcast_msg(update_data['message_text']) if update_data.get('message_type') == 'text' else _format_broadcast_msg(update_data['message_text'], is_caption=True)
     await message.answer(
-        f"📝 **Preview New Content:**\n\n"
-        f"{update_data['message_text']}\n\n"
-        f"✅ Confirm to update broadcast `{broadcast_id}`?",
+        f"\U0001f4dd **Preview New Content (with template):**\n\n"
+        f"{_preview_cap(_edit_preview_fmt)}\n\n"
+        f"\u2705 Confirm to update broadcast `{broadcast_id}`?",
         reply_markup=confirm_kb,
         parse_mode="Markdown"
     )
@@ -2328,6 +2613,10 @@ async def process_edit_confirm(message: types.Message, state: FSMContext):
     # Detect original message type from DB record (to know if we should edit caption vs text)
     orig_media_type = broadcast.get("media_type")  # set when originally sent
 
+    # Pre-format once — consistent MSA NODE template + timestamp across all edited messages
+    _fmt_text    = _format_broadcast_msg(new_text) if new_text else ""
+    _fmt_caption = _format_broadcast_msg(new_text, is_caption=True) if new_text else ""
+
     for user_id, msg_id in message_ids.items():
         try:
             if message_type == "text" and not orig_media_type:
@@ -2335,7 +2624,7 @@ async def process_edit_confirm(message: types.Message, state: FSMContext):
                 await bot_8.edit_message_text(
                     chat_id=int(user_id),
                     message_id=msg_id,
-                    text=new_text,
+                    text=_fmt_text,
                     reply_markup=orig_reply_markup
                 )
             elif message_type == "text" and orig_media_type:
@@ -2343,7 +2632,7 @@ async def process_edit_confirm(message: types.Message, state: FSMContext):
                 await bot_8.edit_message_caption(
                     chat_id=int(user_id),
                     message_id=msg_id,
-                    caption=new_text,
+                    caption=_fmt_caption,
                     reply_markup=orig_reply_markup
                 )
             elif message_type == "media":
@@ -2352,11 +2641,11 @@ async def process_edit_confirm(message: types.Message, state: FSMContext):
                     from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo, InputMediaDocument
                     buf = BufferedInputFile(_new_file_bytes, filename=_new_file_name)
                     if new_media_type == "photo":
-                        new_media = InputMediaPhoto(media=buf, caption=new_text)
+                        new_media = InputMediaPhoto(media=buf, caption=_fmt_caption)
                     elif new_media_type == "video":
-                        new_media = InputMediaVideo(media=buf, caption=new_text)
+                        new_media = InputMediaVideo(media=buf, caption=_fmt_caption)
                     else:
-                        new_media = InputMediaDocument(media=buf, caption=new_text)
+                        new_media = InputMediaDocument(media=buf, caption=_fmt_caption)
                     await bot_8.edit_message_media(
                         chat_id=int(user_id),
                         message_id=msg_id,
@@ -2367,21 +2656,33 @@ async def process_edit_confirm(message: types.Message, state: FSMContext):
                     await bot_8.edit_message_caption(
                         chat_id=int(user_id),
                         message_id=msg_id,
-                        caption=new_text
+                        caption=_fmt_caption
                     )
 
             edited_count += 1
             print(f"✅ Edited message for user {user_id}")
             await asyncio.sleep(0.03)  # mild rate-limit throttle
 
+        except TelegramRetryAfter as rafe:
+            await asyncio.sleep(rafe.retry_after + 1)
+            try:
+                if message_type == "text" and not orig_media_type:
+                    await bot_8.edit_message_text(chat_id=int(user_id), message_id=msg_id, text=_fmt_text, reply_markup=orig_reply_markup)
+                elif message_type == "text" and orig_media_type:
+                    await bot_8.edit_message_caption(chat_id=int(user_id), message_id=msg_id, caption=_fmt_caption, reply_markup=orig_reply_markup)
+                edited_count += 1
+            except Exception as _re:
+                failed_count += 1
+                print(f"⚠️ Edit retry failed for {user_id}: {_re}")
         except Exception as e:
             failed_count += 1
             print(f"⚠️ Failed to edit message for user {user_id}: {str(e)}")
     
-    # Apply update to database
+    # Apply update to database — strip file_id (not stored), always refresh last_edited
+    _db_update = {k: v for k, v in update_data.items() if k != "file_id"}
     col_broadcasts.update_one(
         {"broadcast_id": broadcast_id},
-        {"$set": update_data}
+        {"$set": {**_db_update, "last_edited": now_local()}}
     )
     
     print(f"✅ Database updated for {broadcast_id}")
@@ -2405,6 +2706,7 @@ async def delete_broadcast_handler(message: types.Message, state: FSMContext):
 
 async def show_delete_broadcast_list(message: types.Message, state: FSMContext, page: int = 0):
     """Show paginated list for deletion"""
+    reindex_broadcasts()  # Ensure sequential, duplicate-free indexes
     per_page = 10
     skip = page * per_page
     
@@ -2422,9 +2724,9 @@ async def show_delete_broadcast_list(message: types.Message, state: FSMContext, 
     response = f"🗑️ **DELETE BROADCAST (Page {page + 1})** - Total: {total}\n\nAvailable broadcasts:\n\n"
     for brd in broadcasts:
         category = brd.get('category', 'ALL')
-        # Get user count for this category
+        # Get user count for this category — consistent with actual send targets
         if category == "ALL":
-            user_count = col_msa_ids.count_documents({})  # All verified MSA members
+            user_count = col_user_tracking.count_documents({})  # All tracked users (live)
         else:
             user_count = col_user_tracking.count_documents({"source": category})
         
@@ -2778,7 +3080,7 @@ async def direct_send_broadcast(message: types.Message, state: FSMContext):
     igcc_count = col_user_tracking.count_documents({"source": "IGCC"})
     ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
     unknown_count = col_user_tracking.count_documents({"source": "UNKNOWN"})
-    all_count = col_msa_ids.count_documents({})  # All verified MSA members
+    all_count = col_user_tracking.count_documents({})  # All tracked users (source-locked, live)
     
     print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, ALL={all_count}")
     
@@ -2809,7 +3111,7 @@ async def broadcast_with_buttons_start(message: types.Message, state: FSMContext
     igcc_count = col_user_tracking.count_documents({"source": "IGCC"})
     ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
     unknown_count = col_user_tracking.count_documents({"source": "UNKNOWN"})
-    all_count = col_msa_ids.count_documents({})  # All verified MSA members
+    all_count = col_user_tracking.count_documents({})  # All tracked users (source-locked, live)
     
     print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, ALL={all_count}")
     
@@ -3003,7 +3305,7 @@ async def show_button_broadcast_preview(message: types.Message, state: FSMContex
     
     # Get target users count
     if category == "ALL":
-        target_count = col_msa_ids.count_documents({})  # All verified MSA members
+        target_count = col_user_tracking.count_documents({})  # All tracked users (live)
     else:
         target_count = col_user_tracking.count_documents({"source": category})
     
@@ -3048,8 +3350,8 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
         
         # Get target users
         if category == "ALL":
-            # Use msa_ids as authoritative source — all verified MSA members
-            target_users = list(col_msa_ids.find({}))
+            # Use user_tracking as authoritative source — consistent with per-source broadcasts
+            target_users = list(col_user_tracking.find({}, {"user_id": 1}))
         else:
             target_users = list(col_user_tracking.find({"source": category}))
         
@@ -3079,7 +3381,7 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
         success = 0
         failed = 0
 
-        # Pre-download media once (cross-bot: Bot10 file_id → bytes → Bot8 upload)
+        # Pre-download media once (cross-bot: Bot2 file_id → bytes → Bot1 upload)
         photo_bytes = None
         video_bytes = None
         if message_type == 'photo' and data.get('file_id'):
@@ -3097,48 +3399,87 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
             except Exception as dl_err:
                 print(f"⚠️ Could not pre-download video: {dl_err}")
 
+        # Precompute caption once — split if > 1024 (send text separately to avoid truncation)
+        _btn_raw_cap_text = data.get('caption') or data.get('text', '')
+        _btn_caption     = _format_broadcast_msg(_btn_raw_cap_text, is_caption=True) if _btn_raw_cap_text else ""
+        _btn_cap_split   = len(_btn_caption) > 1024
+        _btn_full_text   = _format_broadcast_msg(_btn_raw_cap_text, is_caption=False) if _btn_raw_cap_text else ""
+
         # Send to all users
         sent_message_ids = {}  # Track per-user message IDs so edit/delete work later
+        btn_error_details = []
+        btn_blocked = 0
         for user_doc in target_users:
-            user_id = user_doc['user_id']
-            try:
-                sent_msg = None
-                if message_type == 'text':
-                    sent_msg = await bot_8.send_message(
-                        user_id,
-                        _format_broadcast_msg(data.get('text', '')),
-                        reply_markup=reply_markup
-                    )
-                elif message_type == 'photo' and photo_bytes:
-                    caption_text = _format_broadcast_msg(data.get('caption', ''), is_caption=True) if data.get('caption') else None
-                    photo_input = BufferedInputFile(photo_bytes, filename="broadcast_photo.jpg")
-                    if caption_text:
-                        sent_msg = await bot_8.send_photo(user_id, photo_input, caption=caption_text, reply_markup=reply_markup)
-                    else:
-                        sent_msg = await bot_8.send_photo(user_id, photo_input, reply_markup=reply_markup)
-                elif message_type == 'video' and video_bytes:
-                    caption_text = _format_broadcast_msg(data.get('caption', ''), is_caption=True) if data.get('caption') else None
-                    video_input = BufferedInputFile(video_bytes, filename="broadcast_video.mp4")
-                    if caption_text:
-                        sent_msg = await bot_8.send_video(user_id, video_input, caption=caption_text, reply_markup=reply_markup)
-                    else:
-                        sent_msg = await bot_8.send_video(user_id, video_input, reply_markup=reply_markup)
-                else:
-                    # fallback: pure text
-                    sent_msg = await bot_8.send_message(
-                        user_id,
-                        _format_broadcast_msg(data.get('text', data.get('caption', '📢 MSA NODE Broadcast'))),
-                        reply_markup=reply_markup
-                    )
-
-                if sent_msg:
-                    sent_message_ids[str(user_id)] = sent_msg.message_id
-                success += 1
-
-                if len(target_users) > 10:
-                    await asyncio.sleep(0.1)
-            except Exception:
+            # Safe user_id access
+            user_id = user_doc.get('user_id')
+            if not user_id:
                 failed += 1
+                continue
+            for _attempt in range(3):
+                try:
+                    sent_msg = None
+                    if message_type == 'text':
+                        sent_msg = await bot_8.send_message(
+                            user_id,
+                            _format_broadcast_msg(data.get('text', '')),
+                            reply_markup=reply_markup
+                        )
+                    elif message_type == 'photo' and photo_bytes:
+                        photo_input = BufferedInputFile(photo_bytes, filename="broadcast_photo.jpg")
+                        if _btn_caption:
+                            if _btn_cap_split:
+                                # Caption too long for Telegram: send media clean, then text + buttons
+                                await bot_8.send_photo(user_id, photo_input)
+                                sent_msg = await bot_8.send_message(user_id, _btn_full_text, reply_markup=reply_markup)
+                            else:
+                                sent_msg = await bot_8.send_photo(user_id, photo_input, caption=_btn_caption, reply_markup=reply_markup)
+                        else:
+                            sent_msg = await bot_8.send_photo(user_id, photo_input, reply_markup=reply_markup)
+                    elif message_type == 'video' and video_bytes:
+                        video_input = BufferedInputFile(video_bytes, filename="broadcast_video.mp4")
+                        if _btn_caption:
+                            if _btn_cap_split:
+                                await bot_8.send_video(user_id, video_input)
+                                sent_msg = await bot_8.send_message(user_id, _btn_full_text, reply_markup=reply_markup)
+                            else:
+                                sent_msg = await bot_8.send_video(user_id, video_input, caption=_btn_caption, reply_markup=reply_markup)
+                        else:
+                            sent_msg = await bot_8.send_video(user_id, video_input, reply_markup=reply_markup)
+                    else:
+                        # fallback: pure text
+                        sent_msg = await bot_8.send_message(
+                            user_id,
+                            _format_broadcast_msg(data.get('text', data.get('caption', '📢 MSA NODE Broadcast'))),
+                            reply_markup=reply_markup
+                        )
+
+                    if sent_msg:
+                        sent_message_ids[str(user_id)] = sent_msg.message_id
+                    success += 1
+                    await asyncio.sleep(0.04)  # ~25 msgs/sec
+                    break  # success — exit retry loop
+
+                except TelegramRetryAfter as rafe:
+                    print(f"⏳ Flood wait for {user_id}: {rafe.retry_after}s (attempt {_attempt+1}/3)")
+                    await asyncio.sleep(rafe.retry_after + 1)
+                    if _attempt == 2:
+                        failed += 1
+                        btn_error_details.append(f"User {user_id}: Flood wait — all retries exhausted")
+                except Exception as e:
+                    failed += 1
+                    _em = str(e).lower()
+                    if "bot was blocked" in _em or "user is deactivated" in _em:
+                        btn_blocked += 1
+                    elif "unauthorized" in _em or "forbidden" in _em:
+                        btn_blocked += 1
+                        btn_error_details.append(f"User {user_id}: Unauthorized (never started Bot 1)")
+                    elif "blocked" in _em:
+                        btn_blocked += 1
+                    elif "not found" in _em or "chat not found" in _em:
+                        btn_error_details.append(f"User {user_id}: Account not found")
+                    else:
+                        btn_error_details.append(f"User {user_id}: {str(e)[:50]}")
+                    break  # don't retry for non-flood errors
 
         # Save broadcast record to database
         try:
@@ -3159,24 +3500,42 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
                 "last_sent": now_local(),
                 "message_ids": sent_message_ids,  # Required for edit/delete support
             }
-            if message_type in ('photo', 'video'):
+            if message_type in ('photo', 'video', 'animation', 'document', 'audio', 'voice'):
                 brd_doc["media_type"] = message_type
-                brd_doc["file_id"] = data.get('file_id')
+                # file_id NOT stored — keep DB clean, no media references
             col_broadcasts.insert_one(brd_doc)
             print(f"✅ Button broadcast saved to DB as {brd_id} with {len(sent_message_ids)} message IDs")
         except Exception as db_err:
             print(f"⚠️ Could not save button broadcast to DB: {db_err}")
 
-        await status_msg.edit_text(
-            f"✅ **BROADCAST COMPLETE**\n\n"
+        delivery_rate = (success / len(target_users) * 100) if len(target_users) > 0 else 0
+        btn_report = (
+            f"✅ **BROADCAST COMPLETE & SAVED**\n\n"
             f"📂 Category: {category}\n"
-            f"✅ Success: {success}\n"
-            f"❌ Failed: {failed}\n"
-            f"🔘 Buttons: {len(buttons)}",
-            parse_mode="Markdown"
+            f"🔘 Buttons: {len(buttons)}\n\n"
+            f"📊 **Delivery Report:**\n"
+            f"✅ Success: **{success}** users\n"
+            f"❌ Failed: **{failed}** users\n"
+            f"💯 Delivery Rate: **{delivery_rate:.1f}%**"
         )
+        if btn_blocked > 0:
+            btn_report += f"\n🚫 Blocked/Unauthorized: **{btn_blocked}** users"
+        if btn_error_details:
+            btn_report += "\n\n⚠️ **Sample Errors:**\n"
+            for err in btn_error_details[:3]:
+                btn_report += f"• {err}\n"
+
+        try:
+            await status_msg.edit_text(btn_report, parse_mode="Markdown")
+        except Exception:
+            await message.answer(btn_report, parse_mode="Markdown")
 
         await state.clear()
+        await message.answer(
+            "🔄 **Returning to Broadcast Menu...**",
+            reply_markup=get_broadcast_menu(),
+            parse_mode="Markdown"
+        )
         print(f"✅ Button broadcast sent to {success} users")
     else:
         await message.answer("⚠️ Please click **✅ CONFIRM** or **❌ CANCEL**", parse_mode="Markdown")
@@ -3200,9 +3559,9 @@ async def show_send_broadcast_list(message: types.Message, state: FSMContext, pa
     response = f"📤 **SEND BROADCAST (Page {page + 1})** - Total: {total}\n\nAvailable broadcasts:\n\n"
     for brd in broadcasts:
         category = brd.get('category', 'ALL')
-        # Get user count for this category
+        # Get user count — live, consistent with actual send targets (no retired/dead users)
         if category == "ALL":
-            user_count = col_msa_ids.count_documents({})  # All verified MSA members
+            user_count = col_user_tracking.count_documents({})  # All tracked users (live)
         else:
             user_count = col_user_tracking.count_documents({"source": category})
         
@@ -3288,8 +3647,9 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
     
     # Build user filter based on category
     if category == "ALL":
-        # Send to all verified MSA members (authoritative source)
-        target_users = list(col_msa_ids.find({}, {"user_id": 1}))
+        # Use user_tracking as single source of truth — consistent with per-source broadcasts
+        # and properly reflects dead-user cleanup (purged records are gone from both).
+        target_users = list(col_user_tracking.find({}, {"user_id": 1}))
     else:
         # Send only to users who started via specific source
         target_users = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
@@ -3315,7 +3675,7 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
             f"⚠️ **NO USERS FOUND**\n\n"
             f"📂 Category: **{category}**\n"
             f"❌ No users available for this category.{category_breakdown}\n\n"
-            f"💡 Users are tracked when they start Bot 8 via links.",
+            f"💡 Users are tracked when they start Bot 1 via links.",
             reply_markup=get_broadcast_menu(),
             parse_mode="Markdown"
         )
@@ -3323,11 +3683,11 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
     
     # Send broadcast
     status_msg = await message.answer(
-        f"📤 **Sending Broadcast via Bot 8...**\n\n"
+        f"📤 **Sending Broadcast via Bot 1...**\n\n"
         f"🆔 ID: `{broadcast_id}`\n"
         f"📂 Category: {category}\n"
         f"👥 Target Users: {len(target_users)}\n"
-        f"🤖 Delivery Bot: Bot 8\n\n"
+        f"🤖 Delivery Bot: Bot 1\n\n"
         f"⏳ Preparing to send...",
         parse_mode="Markdown"
     )
@@ -3336,7 +3696,12 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
     failed_count = 0
     blocked_count = 0
     error_details = []
-    
+
+    # Precompute caption / text once — split if > 1024 to avoid Telegram truncation (resend flow)
+    _rsnd_caption   = _format_broadcast_msg(message_text, is_caption=True) if message_text and message_text.strip() else ""
+    _rsnd_cap_split = len(_rsnd_caption) > 1024
+    _rsnd_full_text = _format_broadcast_msg(message_text or "📢 MSA NODE Broadcast", is_caption=False)
+
     # Send to each user with progress updates
     for i, user_doc in enumerate(target_users, 1):
         user_id = user_doc['user_id']
@@ -3345,11 +3710,11 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
         if i % 5 == 0 or len(target_users) <= 10:
             try:
                 await status_msg.edit_text(
-                    f"📤 **Sending via Bot 8...**\n\n"
+                    f"📤 **Sending via Bot 1...**\n\n"
                     f"🆔 ID: `{broadcast_id}`\n"
                     f"📂 Category: {category}\n"
                     f"👥 Target Users: {len(target_users)}\n"
-                    f"🤖 Via: Bot 8\n\n"
+                    f"🤖 Via: Bot 1\n\n"
                     f"📝 Progress: {i}/{len(target_users)} users\n"
                     f"✅ Success: {success_count} | ❌ Failed: {failed_count}",
                     parse_mode="Markdown"
@@ -3358,50 +3723,65 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
                 pass  # Ignore edit errors during sending
         
         try:
-            # CROSS-BOT MEDIA FIX - Download from Bot 10 and send through Bot 8
+            # CROSS-BOT MEDIA FIX - Download from Bot 2 and send through Bot 1
             if media_type == "photo" and file_id:
                 photo_file = await bot.get_file(file_id)
                 photo_bytes = await bot.download_file(photo_file.file_path)
                 photo_input = BufferedInputFile(photo_bytes, filename="broadcast_photo.jpg")
-                caption = _format_broadcast_msg(message_text, is_caption=True) if message_text and message_text.strip() else None
-                if caption:
-                    await bot_8.send_photo(user_id, photo_input, caption=caption)
+                if message_text and message_text.strip():
+                    if _rsnd_cap_split:
+                        await bot_8.send_photo(user_id, photo_input)
+                        await bot_8.send_message(user_id, _rsnd_full_text)
+                    else:
+                        await bot_8.send_photo(user_id, photo_input, caption=_rsnd_caption)
                 else:
                     await bot_8.send_photo(user_id, photo_input)
             elif media_type == "video" and file_id:
                 video_file = await bot.get_file(file_id)
                 video_bytes = await bot.download_file(video_file.file_path)
                 video_input = BufferedInputFile(video_bytes, filename="broadcast_video.mp4")
-                caption = _format_broadcast_msg(message_text, is_caption=True) if message_text and message_text.strip() else None
-                if caption:
-                    await bot_8.send_video(user_id, video_input, caption=caption)
+                if message_text and message_text.strip():
+                    if _rsnd_cap_split:
+                        await bot_8.send_video(user_id, video_input)
+                        await bot_8.send_message(user_id, _rsnd_full_text)
+                    else:
+                        await bot_8.send_video(user_id, video_input, caption=_rsnd_caption)
                 else:
                     await bot_8.send_video(user_id, video_input)
             elif media_type == "animation" and file_id:
                 animation_file = await bot.get_file(file_id)
                 animation_bytes = await bot.download_file(animation_file.file_path)
                 animation_input = BufferedInputFile(animation_bytes, filename="broadcast_animation.gif")
-                caption = _format_broadcast_msg(message_text, is_caption=True) if message_text and message_text.strip() else None
-                if caption:
-                    await bot_8.send_animation(user_id, animation_input, caption=caption)
+                if message_text and message_text.strip():
+                    if _rsnd_cap_split:
+                        await bot_8.send_animation(user_id, animation_input)
+                        await bot_8.send_message(user_id, _rsnd_full_text)
+                    else:
+                        await bot_8.send_animation(user_id, animation_input, caption=_rsnd_caption)
                 else:
                     await bot_8.send_animation(user_id, animation_input)
             elif media_type == "document" and file_id:
                 document_file = await bot.get_file(file_id)
                 document_bytes = await bot.download_file(document_file.file_path)
                 document_input = BufferedInputFile(document_bytes, filename="broadcast_document")
-                caption = _format_broadcast_msg(message_text, is_caption=True) if message_text and message_text.strip() else None
-                if caption:
-                    await bot_8.send_document(user_id, document_input, caption=caption)
+                if message_text and message_text.strip():
+                    if _rsnd_cap_split:
+                        await bot_8.send_document(user_id, document_input)
+                        await bot_8.send_message(user_id, _rsnd_full_text)
+                    else:
+                        await bot_8.send_document(user_id, document_input, caption=_rsnd_caption)
                 else:
                     await bot_8.send_document(user_id, document_input)
             elif media_type == "audio" and file_id:
                 audio_file = await bot.get_file(file_id)
                 audio_bytes = await bot.download_file(audio_file.file_path)
                 audio_input = BufferedInputFile(audio_bytes, filename="broadcast_audio.mp3")
-                caption = _format_broadcast_msg(message_text, is_caption=True) if message_text and message_text.strip() else None
-                if caption:
-                    await bot_8.send_audio(user_id, audio_input, caption=caption)
+                if message_text and message_text.strip():
+                    if _rsnd_cap_split:
+                        await bot_8.send_audio(user_id, audio_input)
+                        await bot_8.send_message(user_id, _rsnd_full_text)
+                    else:
+                        await bot_8.send_audio(user_id, audio_input, caption=_rsnd_caption)
                 else:
                     await bot_8.send_audio(user_id, audio_input)
             elif media_type == "voice" and file_id:
@@ -3410,7 +3790,7 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
                 voice_input = BufferedInputFile(voice_bytes, filename="broadcast_voice.ogg")
                 await bot_8.send_voice(user_id, voice_input)
             else:
-                await bot_8.send_message(user_id, _format_broadcast_msg(message_text or "📢 MSA NODE Broadcast"))
+                await bot_8.send_message(user_id, _rsnd_full_text)
             
             success_count += 1
             
@@ -3420,17 +3800,23 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
         except Exception as e:
             failed_count += 1
             error_msg = str(e)
-            
-            # Categorize error types
-            if "blocked" in error_msg.lower():
+
+            # Categorize error types — most specific first
+            _em = error_msg.lower()
+            if "bot was blocked" in _em or "user is deactivated" in _em:
                 blocked_count += 1
-            elif "not found" in error_msg.lower():
-                error_details.append(f"User {user_id}: Account deleted")
-            elif "restricted" in error_msg.lower():
+            elif "unauthorized" in _em or "forbidden" in _em:
+                blocked_count += 1
+                error_details.append(f"User {user_id}: Unauthorized (never started Bot 1)")
+            elif "blocked" in _em:
+                blocked_count += 1
+            elif "not found" in _em or "chat not found" in _em:
+                error_details.append(f"User {user_id}: Account not found")
+            elif "restricted" in _em:
                 error_details.append(f"User {user_id}: Restricted")
             else:
-                error_details.append(f"User {user_id}: {error_msg[:30]}...")
-            
+                error_details.append(f"User {user_id}: {error_msg[:50]}")
+
             continue
     
     # Update broadcast sent count
@@ -3449,7 +3835,7 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
     report = f"✅ **Broadcast Complete!**\n\n"
     report += f"🆔 ID: `{broadcast_id}`\n"
     report += f"📂 Category: {category}\n"
-    report += f"🤖 Delivered via: **Bot 8**\n"
+    report += f"🤖 Delivered via: **Bot 1**\n"
     report += f"🕐 Sent At: {sent_time}\n\n"
     report += f"📊 **Delivery Report:**\n"
     report += f"✅ **Success: {success_count}** users received\n"
@@ -3473,13 +3859,14 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
             report += f"• {error}\n"
         report += f"• ...and {len(error_details) - 2} more\n\n"
     
-    await status_msg.edit_text(report, parse_mode="Markdown")
-    
+    try:
+        await status_msg.edit_text(report, parse_mode="Markdown")
+    except Exception:
+        await message.answer(report, parse_mode="Markdown")
+
+    # Return to broadcast menu
     await message.answer(
-        "📤 **Broadcasting complete!**\n\n"
-        "🤖 Messages delivered through **Bot 8**\n"
-        "👥 Users received broadcasts from Bot 8\n"
-        "🔍 Check Bot 8 for any user replies",
+        "🔄 **Returning to Broadcast Menu...**",
         reply_markup=get_broadcast_menu(),
         parse_mode="Markdown"
     )
@@ -3535,15 +3922,14 @@ async def cancel_button_handler(message: types.Message, state: FSMContext):
 async def find_handler(message: types.Message, state: FSMContext):
     """Find user by MSA ID or User ID"""
     print(f"🔍 USER ACTION: {message.from_user.first_name} ({message.from_user.id}) accessed FIND feature")
-    
+
     await state.set_state(FindStates.waiting_for_search)
-    
-    # Create back button keyboard
+
     back_keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="⬅️ BACK")]],
         resize_keyboard=True
     )
-    
+
     await message.answer(
         "🔍 **FIND USER**\n\n"
         "Enter one of the following:\n"
@@ -3558,9 +3944,8 @@ async def find_handler(message: types.Message, state: FSMContext):
 
 @dp.message(FindStates.waiting_for_search)
 async def process_find_search(message: types.Message, state: FSMContext):
-    """Process MSA ID or User ID search"""
-    
-    # Check for back button
+    """Process MSA ID or User ID search — full cross-collection profile"""
+
     if message.text and message.text.strip() in ["⬅️ BACK", "/cancel", "❌ CANCEL"]:
         await state.clear()
         await message.answer(
@@ -3569,429 +3954,711 @@ async def process_find_search(message: types.Message, state: FSMContext):
             parse_mode="Markdown"
         )
         return
-    
-    search_input = message.text.strip()
-    
+
+    search_input = message.text.strip() if message.text else ""
+
     if not search_input:
         await message.answer(
-            "⚠️ **INVALID INPUT**\n\n"
-            "Please enter a valid MSA ID or User ID.",
+            "⚠️ **INVALID INPUT**\n\nPlease enter a valid MSA ID or User ID.",
             parse_mode="Markdown"
         )
         return
-    
-    print(f"🔎 Searching for: {search_input}")
-    
-    # Show loading message
+
+    print(f"🔎 FIND searching for: {search_input}")
     loading_msg = await message.answer("⏳ Searching database...", parse_mode="Markdown")
-    
+
     try:
-        user_doc = None
-        search_type = ""
-        
-        # Try to search by MSA ID first
-        if search_input.upper().startswith("MSA"):
-            search_type = "MSA ID"
-            user_doc = col_user_tracking.find_one({"msa_id": search_input.upper()})
-            print(f"📋 Searching by MSA ID: {search_input.upper()}")
-        
-        # If not found or is numeric, try User ID
-        if not user_doc and search_input.isdigit():
-            search_type = "User ID"
-            user_id = int(search_input)
-            user_doc = col_user_tracking.find_one({"user_id": user_id})
-            print(f"📋 Searching by User ID: {user_id}")
-        
-        # If still not found and original input had MSA prefix
-        if not user_doc and search_input.upper().startswith("MSA"):
+        # ── Step 1: Resolve user_id + tracking doc ──────────────────────────
+        tracking_doc = None
+        msa_doc      = None
+        search_clean = search_input.strip()
+
+        if search_clean.upper().startswith("MSA"):
+            # Search by MSA ID in both collections (MSA ID is in msa_ids AND user_tracking)
+            tracking_doc = col_user_tracking.find_one({"msa_id": search_clean.upper()})
+            msa_doc      = col_msa_ids.find_one({"msa_id": search_clean.upper()})
+        elif search_clean.isdigit():
+            uid = int(search_clean)
+            tracking_doc = col_user_tracking.find_one({"user_id": uid})
+            msa_doc      = col_msa_ids.find_one({"user_id": uid})
+        else:
+            # Try case-insensitive name search in user_tracking
+            tracking_doc = col_user_tracking.find_one(
+                {"first_name": {"$regex": f"^{search_clean}$", "$options": "i"}}
+            )
+            if tracking_doc:
+                msa_doc = col_msa_ids.find_one({"user_id": tracking_doc.get("user_id")})
+
+        # ── Step 2: If nothing found, clear and report ───────────────────────
+        if not tracking_doc and not msa_doc:
             await loading_msg.delete()
+            hint = "MSA ID" if search_clean.upper().startswith("MSA") else \
+                   "User ID" if search_clean.isdigit() else "name"
             await message.answer(
                 f"❌ **NOT FOUND**\n\n"
-                f"No user found with MSA ID: `{search_input.upper()}`\n\n"
-                f"Please check the ID and try again, or search by User ID instead.",
+                f"No user found matching {hint}: `{search_clean}`\n\n"
+                f"• For MSA ID use format `MSA001`\n"
+                f"• For User ID enter numeric ID only\n"
+                f"• Make sure user has started Bot 1",
                 parse_mode="Markdown"
             )
             return
-        
-        # If not found at all
-        if not user_doc:
-            await loading_msg.delete()
-            await message.answer(
-                f"❌ **NOT FOUND**\n\n"
-                f"No user found with {search_type}: `{search_input}`\n\n"
-                f"Make sure the user has started Bot 8 at least once.",
-                parse_mode="Markdown"
-            )
-            return
-        
-        # User found - extract and format details
-        user_id = user_doc.get("user_id", "N/A")
-        msa_id = user_doc.get("msa_id", "N/A")
-        username = user_doc.get("username", "N/A")
-        first_name = user_doc.get("first_name", "Unknown")
-        source = user_doc.get("source", "N/A")
-        first_start_dt = user_doc.get("first_start")
-        last_start_dt = user_doc.get("last_start")
-        
-        # Format timestamps to 12-hour AM/PM format
+
+        # ── Step 3: Merge data from both docs ────────────────────────────────
+        # Prefer tracking_doc for activity fields, msa_doc for allocation fields
+        primary = tracking_doc or msa_doc
+        user_id   = primary.get("user_id")
+        msa_id    = (tracking_doc or {}).get("msa_id") or (msa_doc or {}).get("msa_id", "N/A")
+        first_name = (tracking_doc or {}).get("first_name") or (msa_doc or {}).get("first_name", "Unknown")
+        username   = (tracking_doc or {}).get("username") or (msa_doc or {}).get("username", "N/A")
+        source     = (tracking_doc or {}).get("source", "N/A")
+
+        first_start_dt = (tracking_doc or {}).get("first_start")
+        last_start_dt  = (tracking_doc or {}).get("last_start")
+        assigned_at_dt = (msa_doc or {}).get("assigned_at")
+
+        # ── Step 4: Cross-collection lookups (all by user_id) ────────────────
+        ban_doc    = col_banned_users.find_one({"user_id": user_id}) if user_id else None
+        susp_doc   = col_suspended_features.find_one({"user_id": user_id}) if user_id else None
+        susp_list  = (susp_doc or {}).get("suspended_features", [])
+        ticket_total = col_support_tickets.count_documents({"user_id": user_id}) if user_id else 0
+        ticket_open  = col_support_tickets.count_documents({"user_id": user_id, "status": "open"}) if user_id else 0
+
+        # ── Step 5: Format timestamps ─────────────────────────────────────────
+        def _fmt_dt(dt):
+            return dt.strftime("%b %d, %Y  %I:%M %p") if dt else "N/A"
+
+        first_start_str  = _fmt_dt(first_start_dt)
+        last_start_str   = _fmt_dt(last_start_dt)
+        assigned_at_str  = _fmt_dt(assigned_at_dt)
+
+        # Time since first join
         if first_start_dt:
-            first_start_str = first_start_dt.strftime("%b %d, %Y at %I:%M:%S %p")
-        else:
-            first_start_str = "N/A"
-        
-        if last_start_dt:
-            last_start_str = last_start_dt.strftime("%b %d, %Y at %I:%M:%S %p")
-        else:
-            last_start_str = "N/A"
-        
-        # Calculate time since first start
-        if first_start_dt:
-            time_diff = now_local() - first_start_dt
-            days = time_diff.days
-            hours = time_diff.seconds // 3600
-            minutes = (time_diff.seconds % 3600) // 60
-            
-            if days > 0:
-                time_since = f"{days}d {hours}h {minutes}m ago"
-            elif hours > 0:
-                time_since = f"{hours}h {minutes}m ago"
-            else:
-                time_since = f"{minutes}m ago"
+            diff = now_local() - first_start_dt
+            d, h, m = diff.days, diff.seconds // 3600, (diff.seconds % 3600) // 60
+            time_since = (f"{d}d {h}h {m}m ago" if d > 0 else
+                          f"{h}h {m}m ago"       if h > 0 else
+                          f"{m}m ago")
         else:
             time_since = "N/A"
-        
-        # Determine source description
-        source_descriptions = {
-            "YT": "📺 YouTube Link",
-            "IG": "📸 Instagram Link",
-            "IGCC": "📎 Instagram CC Link",
-            "YTCODE": "🔗 YouTube Code Link"
+
+        # ── Step 6: Build display strings ─────────────────────────────────────
+        source_map = {
+            "YT":     "📺 YouTube Link",
+            "IG":     "📸 Instagram Link",
+            "IGCC":   "📎 Instagram CC Link",
+            "YTCODE": "🔗 YouTube Code Link",
         }
-        source_display = source_descriptions.get(source, f"Unknown ({source})")
-        
-        # Format username with @ prefix if available
-        username_display = f"@{username}" if username != "N/A" and username != "unknown" else "No username"
-        
-        # Build detailed user profile
-        user_profile = (
+        source_display   = source_map.get(source, f"❓ Unknown ({source})")
+        username_display = f"@{username}" if username not in ("N/A", "unknown", None, "") else "—"
+
+        # Account status
+        if ban_doc:
+            ban_type = ban_doc.get("ban_type", "permanent")
+            if ban_type == "temporary":
+                acc_status = "⏰ TEMP BANNED"
+            else:
+                acc_status = "🔴 BANNED"
+        elif susp_list:
+            acc_status = "⚠️ SUSPENDED (partial)"
+        else:
+            acc_status = "🟢 Active"
+
+        # ── Step 7: Build profile message ─────────────────────────────────────
+        profile = (
             f"👤 **USER PROFILE**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            
+
             f"🆔 **MSA ID:** `{msa_id}`\n"
             f"👁️ **User ID:** `{user_id}`\n"
-            f"👤 **Name:** {first_name}\n"
-            f"📱 **Username:** {username_display}\n\n"
-            
+            f"👤 **Name:** {_esc_md(str(first_name))}\n"
+            f"📱 **Username:** {username_display}\n"
+            f"🔒 **Status:** {acc_status}\n\n"
+
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📍 **SOURCE TRACKING**\n\n"
-            
+            f"📍 **ACTIVITY**\n\n"
+
             f"🔗 **Entry Source:** {source_display}\n"
             f"📅 **First Joined:** {first_start_str}\n"
+            f"🆔 **MSA Allocated:** {assigned_at_str}\n"
             f"⏰ **Last Active:** {last_start_str}\n"
             f"🕐 **Member Since:** {time_since}\n\n"
-            
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"ℹ️ **NOTES**\n\n"
-            f"• User is tracked in broadcast system\n"
-            f"• Can receive {source} category broadcasts\n"
-            f"• Profile synced with Bot 8 database\n\n"
-            
-            f"🔍 Search another user or press ⬅️ BACK"
-        )
-        
-        await loading_msg.delete()
 
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 **ACCOUNT DETAILS**\n\n"
+
+            f"🎫 **Support Tickets:** {ticket_total} total ({ticket_open} open)\n"
+            f"⏸️ **Suspended Features:** {len(susp_list) if susp_list else 0}\n"
+        )
+
+        # List suspended features if any
+        if susp_list:
+            profile += "".join(f"   └─ {f.replace('_', ' ').title()}\n" for f in susp_list)
+
+        # Ban details block
+        if ban_doc:
+            ban_at_str  = _fmt_dt(ban_doc.get("banned_at"))
+            ban_by      = ban_doc.get("banned_by", "N/A")
+            ban_reason  = _esc_md(str(ban_doc.get("reason", "N/A")))
+            ban_type_lbl = "⏰ Temporary" if ban_doc.get("ban_type") == "temporary" else "🔴 Permanent"
+            profile += (
+                f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🚫 **BAN DETAILS**\n\n"
+                f"   └─ Type: {ban_type_lbl}\n"
+                f"   └─ Banned At: {ban_at_str}\n"
+                f"   └─ Banned By: {ban_by}\n"
+                f"   └─ Reason: {ban_reason}\n"
+            )
+            if ban_doc.get("ban_expires"):
+                profile += f"   └─ Expires: {_fmt_dt(ban_doc['ban_expires'])}\n"
+
+        # ── VERIFICATION DETAILS ────────────────────────────────────────────
+        verif_doc = col_user_verification.find_one({"user_id": user_id}) if user_id else None
+        if verif_doc:
+            vault_joined   = verif_doc.get("vault_joined", False)
+            ever_verified  = verif_doc.get("ever_verified", False)
+            is_verified    = verif_doc.get("verified", False)
+            first_start_v  = verif_doc.get("first_start")
+            profile += (
+                f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔐 **VERIFICATION**\n\n"
+                f"   └─ Vault Joined: {'✅ Yes' if vault_joined else '❌ No'}\n"
+                f"   └─ Currently Verified: {'✅ Yes' if is_verified else '❌ No'}\n"
+                f"   └─ Ever Verified: {'✅ Yes' if ever_verified else '❌ No'}\n"
+                f"   └─ First Start: {_fmt_dt(first_start_v)}\n"
+            )
+
+        # ── RECENT SUPPORT TICKETS ──────────────────────────────────────────
+        recent_tickets = list(col_support_tickets.find({"user_id": user_id}).sort("created_at", -1).limit(3)) if user_id else []
+        if recent_tickets:
+            profile += (
+                f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎫 **RECENT TICKETS** _(latest 3)_\n\n"
+            )
+            for tk in recent_tickets:
+                tk_id     = tk.get("ticket_id", tk.get("_id", "?"))
+                tk_status = tk.get("status", "?")
+                tk_date   = _fmt_dt(tk.get("created_at"))
+                tk_subj   = _esc_md(str(tk.get("subject") or tk.get("message") or "")[:40])
+                status_icon = "🟢" if tk_status == "open" else "🔴" if tk_status == "resolved" else "⚪"
+                profile += f"   {status_icon} `{tk_id}` — {tk_date}\n"
+                if tk_subj:
+                    profile += f"      _{tk_subj}_\n"
+
+        # ── BROADCASTS RECEIVED ─────────────────────────────────────────────
+        if user_id:
+            # Count broadcasts targeting this user's source
+            user_source       = source
+            bc_for_user       = col_broadcasts.count_documents({"category": "ALL"}) + \
+                                (col_broadcasts.count_documents({"category": user_source}) if user_source not in (None, "N/A", "") else 0)
+            profile += (
+                f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📢 **BROADCASTS**\n\n"
+                f"   └─ Broadcasts Targeting This User: {bc_for_user}\n"
+                f"   └─ Source Category: {source_display}\n"
+            )
+
+        profile += (
+            f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 Search another user or press ⬅️ BACK"
+        )
+
+        await loading_msg.delete()
         back_keyboard = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="⬅️ BACK")]],
             resize_keyboard=True
         )
-        await message.answer(user_profile, reply_markup=back_keyboard, parse_mode="Markdown")
-        
-        print(f"✅ Found user: {msa_id} (User ID: {user_id})")
-        
-        # Keep state active for continuous searching
-        # User can search again or press BACK button
-        
+        await message.answer(profile, reply_markup=back_keyboard, parse_mode="Markdown")
+        print(f"✅ FIND: {msa_id} (uid={user_id}) — ban={bool(ban_doc)} susp={len(susp_list)} tickets={ticket_total}")
+
+        # State stays active — admin can search another user immediately
+
     except Exception as e:
-        await loading_msg.delete()
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
         await message.answer(
-            f"❌ **ERROR**\n\n"
-            f"Search failed: {str(e)[:100]}\n\n"
-            f"Please try again or contact support.",
+            f"❌ **ERROR**\n\nSearch failed: {_esc_md(str(e)[:120])}\n\nPlease try again.",
             parse_mode="Markdown"
         )
-        print(f"❌ Find search error: {e}")
+        print(f"❌ FIND search error: {e}")
+
+def _traffic_keyboard() -> ReplyKeyboardMarkup:
+    """Shared keyboard for all traffic sub-views."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔄 REFRESH TRAFFIC"), KeyboardButton(text="🏆 TOP ANALYTICS")],
+            [KeyboardButton(text="🔗 CHECK LINKS"),      KeyboardButton(text="⬅️ MAIN MENU")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def _fetch_traffic_data() -> dict:
+    """
+    Single source-of-truth for all traffic numbers.
+    Returns a dict with all counts so every view is consistent with no duplication.
+
+    Data integrity approach:
+      - vault_members     = col_user_verification.count_documents({vault_joined: True}) — currently IN vault
+      - total_msa         = col_msa_ids.count_documents({retired: {$ne: True}}) — ACTIVE (non-retired) MSA IDs
+      - total_allocated   = col_msa_ids.count_documents({})  — all IDs ever issued incl. retired (for pool display)
+      - total_tracking    = col_user_tracking.count_documents({}) — users who have a tracking record
+      - yt/ig/igcc/ytcode/unknown = exact source counts from user_tracking (locked on first click)
+      - other_source      = tracking records whose source is not one of the 5 known values
+      - untracked         = active MSA members with NO entry in user_tracking at all
+      - coverage_pct      = total_tracking / total_msa * 100
+    """
+    yt_count      = col_user_tracking.count_documents({"source": "YT"})
+    ig_count      = col_user_tracking.count_documents({"source": "IG"})
+    igcc_count    = col_user_tracking.count_documents({"source": "IGCC"})
+    ytcode_count  = col_user_tracking.count_documents({"source": "YTCODE"})
+    unknown_count = col_user_tracking.count_documents({"source": "UNKNOWN"})
+
+    # Users in tracking with a truly unrecognised source (not one of the 5 known values)
+    other_count  = col_user_tracking.count_documents(
+        {"source": {"$nin": ["YT", "IG", "IGCC", "YTCODE", "UNKNOWN", None, ""]}}
+    )
+
+    # total_msa = ACTIVE members only (excludes retired/reset MSA IDs).
+    # total_allocated = all IDs ever issued (active + retired) — used for the pool section.
+    total_msa       = col_msa_ids.count_documents({"retired": {"$ne": True}})
+    total_allocated = col_msa_ids.count_documents({})
+    total_tracking = col_user_tracking.count_documents({})
+
+    # Currently inside the vault right now (vault_joined=True in user_verification)
+    vault_members  = col_user_verification.count_documents({"vault_joined": True})
+
+    # "Untracked" = verified MSA members who have NO entry in user_tracking at all.
+    # After dead-user cleanup both collections shrink together, so this stays meaningful.
+    untracked_count = max(0, total_msa - total_tracking)
+
+    known_sources   = yt_count + ig_count + igcc_count + ytcode_count + unknown_count
+    # Coverage: what % of active MSA members have a tracking record.
+    # Cap at 100 % — tracking can slightly exceed msa during the gap between a
+    # user starting the bot and their MSA being confirmed or after cleanup lag.
+    coverage_pct    = min(100.0, (total_tracking / total_msa * 100)) if total_msa > 0 else 0.0
+    # pct_base: denominator for per-source % breakdown — use total_tracking so all
+    # five source percentages always add up to ≤ 100 % regardless of MSA count.
+    pct_base        = total_tracking if total_tracking > 0 else 1
+
+    return {
+        "yt":              yt_count,
+        "ig":              ig_count,
+        "igcc":            igcc_count,
+        "ytcode":          ytcode_count,
+        "unknown":         unknown_count,
+        "other":           other_count,
+        "untracked":       untracked_count,
+        "total_msa":       total_msa,
+        "total_allocated": total_allocated,
+        "vault_members":   vault_members,
+        "tracking":        total_tracking,
+        "known":           known_sources,
+        "coverage":        coverage_pct,
+        "pct_base":        pct_base,
+        "snapshot_ts":     now_local().strftime("%b %d, %Y  %I:%M:%S %p"),
+    }
+
 
 @dp.message(F.text == "📊 TRAFFIC")
 async def traffic_handler(message: types.Message):
-    """Traffic analytics - Live user source tracking"""
-    print(f"📊 USER ACTION: {message.from_user.first_name} ({message.from_user.id}) accessed TRAFFIC analytics")
-    
-    # Show loading message
-    loading_msg = await message.answer("⏳ Fetching live traffic data...", parse_mode="Markdown")
-    
-    try:
-        # Fetch live counts from database (no duplicates, user_id is unique)
-        yt_count = col_user_tracking.count_documents({"source": "YT"})
-        ig_count = col_user_tracking.count_documents({"source": "IG"})
-        igcc_count = col_user_tracking.count_documents({"source": "IGCC"})
-        ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
-        
-        total_count = col_msa_ids.count_documents({})  # authoritative: all verified MSA members
-        
-        # Calculate true unknown by subtracting tracked users from total verified members
-        tracked_sum = yt_count + ig_count + igcc_count + ytcode_count
-        unknown_count = max(0, total_count - tracked_sum)
-        
-        print(f"📈 Traffic Stats: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, Total={total_count}")
-        
-        # Get Bot 8 information
-        try:
-            bot_8_info = await bot_8.get_me()
-            bot_8_username = f"@{bot_8_info.username}" if bot_8_info.username else "N/A"
-            bot_8_name = bot_8_info.first_name
-            bot_8_status = "🟢 Online"
-        except Exception as e:
-            bot_8_username = "Error"
-            bot_8_name = "Unknown"
-            bot_8_status = "🔴 Offline"
-            print(f"⚠️ Failed to get Bot 8 info: {e}")
-        
-        # Calculate percentages
-        yt_percent = (yt_count / total_count * 100) if total_count > 0 else 0
-        ig_percent = (ig_count / total_count * 100) if total_count > 0 else 0
-        igcc_percent = (igcc_count / total_count * 100) if total_count > 0 else 0
-        ytcode_percent = (ytcode_count / total_count * 100) if total_count > 0 else 0
-        
-        # Calculate UNKNOWN % too
-        unknown_percent = (unknown_count / total_count * 100) if total_count > 0 else 0
+    """Traffic analytics — live, direct DB query, no caching."""
+    if not await has_permission(message.from_user.id, "traffic"):
+        return
+    print(f"📊 TRAFFIC accessed by {message.from_user.first_name} ({message.from_user.id})")
 
-        # Build traffic report
-        traffic_report = (
+    loading_msg = await message.answer("⏳ Fetching live traffic data...", parse_mode="Markdown")
+
+    try:
+        d = await _fetch_traffic_data()
+
+        # Per-source percentages — denominator is total TRACKING records so all
+        # five sources always sum to ≤ 100 % ("other" and "untracked" make up the rest).
+        def _pct(n): return n / d["pct_base"] * 100
+
+        # Bot 1 live status
+        try:
+            b8   = await bot_8.get_me()
+            b8_status   = "🟢 Online"
+            b8_username = f"@{b8.username}" if b8.username else "N/A"
+            b8_name     = b8.first_name
+        except Exception as be:
+            b8_status   = "🔴 Offline"
+            b8_username = "N/A"
+            b8_name     = "Unknown"
+            print(f"⚠️ Bot 1 status check failed: {be}")
+
+        report = (
             "📊 **TRAFFIC ANALYTICS**\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            
-            "👥 **USER SOURCE BREAKDOWN**\n\n"
-            
+
+            "👥 **USER SOURCE BREAKDOWN**\n"
+            "Live from database — no cache\n\n"
+
             f"📺 **YouTube Links (YT)**\n"
-            f"   └─ {yt_count} users ({yt_percent:.1f}%)\n"
-            f"   └─ Direct YouTube video links\n\n"
-            
+            f"   └─ {d['yt']:,} users  ({_pct(d['yt']):.1f}%)\n\n"
+
             f"📸 **Instagram Links (IG)**\n"
-            f"   └─ {ig_count} users ({ig_percent:.1f}%)\n"
-            f"   └─ Instagram bio/post links\n\n"
-            
+            f"   └─ {d['ig']:,} users  ({_pct(d['ig']):.1f}%)\n\n"
+
             f"📎 **Instagram CC Links (IGCC)**\n"
-            f"   └─ {igcc_count} users ({igcc_percent:.1f}%)\n"
-            f"   └─ IG content continuation links\n\n"
-            
+            f"   └─ {d['igcc']:,} users  ({_pct(d['igcc']):.1f}%)\n\n"
+
             f"🔗 **YouTube Code Links (YTCODE)**\n"
-            f"   └─ {ytcode_count} users ({ytcode_percent:.1f}%)\n"
-            f"   └─ YT video MSA CODE prompts\n\n"
-            
-            f"👤 **Unknown (No Link)**\n"
-            f"   └─ {unknown_count} users ({unknown_percent:.1f}%)\n"
-            f"   └─ Joined vault without referral link\n\n"
-            
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👥 **TOTAL VERIFIED MSA MEMBERS:** {total_count}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            
-            "🤖 **BOT 8 STATUS**\n"
-            f"   └─ Name: {bot_8_name}\n"
-            f"   └─ Username: {bot_8_username}\n"
-            f"   └─ Status: {bot_8_status}\n"
-            f"   └─ Role: Message Delivery Bot\n\n"
-            
-            "ℹ️ **NOTE:**\n"
-            "• Each user counted once (no duplicates)\n"
-            "• Source tracked on first /start link\n"
-            "• Data updated in real-time\n"
-            "• Bot 8 handles all user messages\n"
-            f"• Last updated: {now_local().strftime('%I:%M:%S %p')}\n\n"
+            f"   └─ {d['ytcode']:,} users  ({_pct(d['ytcode']):.1f}%)\n\n"
+
+            f"👤 **Direct Access (UNKNOWN)**\n"
+            f"   └─ {d['unknown']:,} users  ({_pct(d['unknown']):.1f}%)\n"
+            f"   └─ Started bot directly — no referral link used\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🆔 **MSA CODE POOL (9-DIGIT)**\n"
-            f"   └─ Total Possible: 900,000,000\n"
-            f"   └─ Allocated: {total_count:,}\n"
-            f"   └─ Available: {900_000_000 - total_count:,}\n"
-            f"   └─ Used: {(total_count / 900_000_000 * 100):.6f}%"
+            "📋 **DATA INTEGRITY**\n\n"
+            f"   🆔 Total Verified MSA Members : {d['total_msa']:,}  (msa\\_ids)\n"
+            f"   📡 Users with Tracking Record  : {d['tracking']:,}  (user\\_tracking)\n"
+            f"   📊 Tracking Coverage           : {d['coverage']:.1f}%\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🤖 **BOT 1 STATUS**\n\n"
+            f"   └─ Name     : {b8_name}\n"
+            f"   └─ Username : {b8_username}\n"
+            f"   └─ Status   : {b8_status}\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🆔 **MSA ID POOL**\n\n"
+            f"   └─ Total Possible : 900,000,000\n"
+            f"   └─ Active Members : {d['total_msa']:,}\n"
+            f"   └─ Retired IDs    : {d['total_allocated'] - d['total_msa']:,}\n"
+            f"   └─ Total Allocated: {d['total_allocated']:,}\n"
+            f"   └─ Available      : {900_000_000 - d['total_allocated']:,}\n"
+            f"   └─ Pool Used      : {(d['total_allocated'] / 900_000_000 * 100):.6f}%\n\n"
+
+            f"🕒 **Live snapshot:** {d['snapshot_ts']}"
         )
-        
-        # Delete loading message and send report
+
+        print(
+            f"📈 TRAFFIC — YT={d['yt']} IG={d['ig']} IGCC={d['igcc']} YTCODE={d['ytcode']} "
+            f"unknown={d['unknown']} other={d['other']} untracked={d['untracked']} "
+            f"total_msa={d['total_msa']} vault_members={d['vault_members']} "
+            f"tracking={d['tracking']} coverage={d['coverage']:.1f}%"
+        )
+
         await loading_msg.delete()
-        
-        # Reply keyboard with refresh + extra analytics buttons
-        traffic_kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🔄 REFRESH TRAFFIC"), KeyboardButton(text="🏆 TOP ANALYTICS")],
-                [KeyboardButton(text="🔗 CHECK LINKS"), KeyboardButton(text="⬅️ MAIN MENU")]
-            ],
-            resize_keyboard=True
-        )
-        
-        await message.answer(traffic_report, parse_mode="Markdown", reply_markup=traffic_kb)
-        
+        await message.answer(report, parse_mode="Markdown", reply_markup=_traffic_keyboard())
+
     except Exception as e:
-        await loading_msg.edit_text(
-            f"❌ **ERROR**\n\nFailed to fetch traffic data:\n{str(e)[:100]}",
-            parse_mode="Markdown"
-        )
+        try:
+            await loading_msg.edit_text(
+                f"❌ **ERROR**\n\nFailed to fetch traffic data:\n{_esc_md(str(e)[:120])}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
         print(f"❌ Traffic handler error: {e}")
 
 
 @dp.message(F.text == "🔄 REFRESH TRAFFIC")
 async def traffic_refresh_handler(message: types.Message):
-    """Refresh traffic analytics — reply keyboard version"""
+    """Refresh — re-runs the main traffic handler for a fresh live pull."""
     await traffic_handler(message)
 
 
 @dp.message(F.text == "🏆 TOP ANALYTICS")
 async def top_analytics_handler(message: types.Message):
-    """Show top-performing sources with live rankings"""
+    """Ranked source view using the same shared data fetch — no separate queries."""
     if not await has_permission(message.from_user.id, "traffic"):
         return
+
+    loading = await message.answer("⏳ Generating rankings...", parse_mode="Markdown")
+
     try:
-        yt_count     = col_user_tracking.count_documents({"source": "YT"})
-        ig_count     = col_user_tracking.count_documents({"source": "IG"})
-        igcc_count   = col_user_tracking.count_documents({"source": "IGCC"})
-        ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
-        total_msa    = col_msa_ids.count_documents({})
-        
-        # True Unknown calculation
-        tracked_sum = yt_count + ig_count + igcc_count + ytcode_count
-        unknown_count = max(0, total_msa - tracked_sum)
+        d = await _fetch_traffic_data()
 
         sources = [
-            ("📺 YT",      yt_count),
-            ("📸 IG",      ig_count),
-            ("📎 IGCC",    igcc_count),
-            ("🔗 YTCODE",  ytcode_count),
-            ("👤 UNKNOWN", unknown_count),
+            ("📺 YT",              d["yt"]),
+            ("📸 IG",              d["ig"]),
+            ("📎 IGCC",            d["igcc"]),
+            ("🔗 YTCODE",          d["ytcode"]),
+            ("👤 Direct (UNKNOWN)", d["unknown"]),
         ]
         sources.sort(key=lambda x: x[1], reverse=True)
 
-        # Use total MSA members for the bar denominator, so percentages add up perfectly
-        total_tracked = total_msa
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣"]
+        denom  = d["pct_base"]  # Use tracking base — same denominator as traffic view
 
-        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
         report = (
-            "🏆 **TOP PERFORMING TRAFFIC SOURCES**\n"
+            "🏆 **TOP TRAFFIC SOURCES — LIVE RANKINGS**\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Live rankings by tracked user count:\n\n"
         )
         for idx, (name, cnt) in enumerate(sources):
-            pct = (cnt / total_tracked * 100) if total_tracked > 0 else 0
-            bar_filled = int(pct / 10)
-            bar = "█" * bar_filled + "░" * (10 - bar_filled)
-            report += f"{medals[idx]} **{name}**\n"
-            report += f"   {bar} {cnt} users ({pct:.1f}%)\n\n"
+            pct       = cnt / denom * 100
+            bar_fill  = round(pct / 10)
+            bar       = "█" * bar_fill + "░" * (10 - bar_fill)
+            medal     = medals[idx] if idx < len(medals) else "▪️"
+            report   += f"{medal} **{name}**\n   {bar}  {cnt:,} users  ({pct:.1f}%)\n\n"
 
-        report += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        report += f"📊 **Total Tracked:** {total_tracked}\n"
-        report += f"👥 **Total MSA Members:** {total_msa}\n"
-
-        # Growth insight
         top_name, top_cnt = sources[0]
-        report += f"\n📈 **Best source:** {top_name} with {top_cnt} users\n"
-        report += f"🕒 Snapshot: {now_local().strftime('%I:%M:%S %p')}"
-
-        traffic_kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🔄 REFRESH TRAFFIC"), KeyboardButton(text="🏆 TOP ANALYTICS")],
-                [KeyboardButton(text="🔗 CHECK LINKS"), KeyboardButton(text="⬅️ MAIN MENU")]
-            ],
-            resize_keyboard=True
+        report += (
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏆 **Top source:** {top_name} — {top_cnt:,} users\n"
+            f"🏠 **Currently in vault:** {d['vault_members']:,}\n"
+            f"🆔 **Total MSA IDs issued:** {d['total_msa']:,}\n"
+            f"📡 **With tracking record:** {d['tracking']:,}  ({d['coverage']:.1f}% coverage)\n"
+            f"🕒 **Snapshot:** {d['snapshot_ts']}"
         )
-        await message.answer(report, parse_mode="Markdown", reply_markup=traffic_kb)
+
+        await loading.delete()
+        await message.answer(report, parse_mode="Markdown", reply_markup=_traffic_keyboard())
+
     except Exception as e:
-        await message.answer(f"❌ **Error:** {str(e)[:100]}", parse_mode="Markdown")
+        try:
+            await loading.edit_text(f"❌ **Error:** {_esc_md(str(e)[:100])}", parse_mode="Markdown")
+        except Exception:
+            pass
+        print(f"❌ Top analytics error: {e}")
 
 
 @dp.message(F.text == "🔗 CHECK LINKS")
 async def check_links_handler(message: types.Message):
-    """Check whether traffic-related start links are active / working"""
+    """
+    Deep link health check — reads real data from live collections.
+    Links are built from bot3_pdfs (ig_start_code / yt_start_code) and
+    bot3_ig_content (start_code).  No env-var guessing.
+    """
     if not await has_permission(message.from_user.id, "traffic"):
         return
-    loading = await message.answer("⏳ Checking all traffic links...")
+
+    loading = await message.answer("⏳ Checking all links and systems...", parse_mode="Markdown")
+    issues: list[str] = []
+
     try:
-        from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest as TBR
-
-        # Retrieve Bot 8 info — confirms Bot 8 is reachable
+        # ── 1. Bot 1 live status ─────────────────────────────────────────────
         try:
-            b8_info = await bot_8.get_me()
-            b8_ok = True
-            b8_name = b8_info.first_name
-            b8_username = f"@{b8_info.username}" if b8_info.username else "unknown"
-        except Exception as e:
+            b8_info    = await bot_8.get_me()
+            b8_ok      = True
+            b8_uname   = b8_info.username or ""
+            b8_display = f"@{b8_uname}" if b8_uname else "(no username)"
+            b8_name    = b8_info.first_name or "Bot 1"
+            base_link  = f"https://t.me/{b8_uname}" if b8_uname else ""
+        except Exception as be:
             b8_ok = False
-            b8_name = "N/A"
-            b8_username = "N/A"
+            b8_uname = b8_display = b8_name = "N/A"
+            base_link = ""
+            issues.append(f"Bot 1 unreachable: {str(be)[:60]}")
 
-        # Check start parameters are configured in environment
-        import os
-        ig_param      = os.getenv("IG_START_PARAM", "")
-        yt_param      = os.getenv("YT_START_PARAM", "")
-        igcc_param    = os.getenv("IGCC_START_PARAM", "")
-        ytcode_param  = os.getenv("YTCODE_START_PARAM", "")
-
-        def link_status(param_val, label):
-            if not param_val:
-                return f"⚠️ {label}: Not configured"
-            # Don't wrap in backticks — param values may have special Markdown chars
-            safe_val = _esc_md(param_val[:20] + "..." if len(param_val) > 20 else param_val)
-            return f"✅ {label}: {safe_val}"
-
-        # Check vault channel
+        # ── 2. MongoDB ping ───────────────────────────────────────────────────
         try:
-            channel_id = os.getenv("CHANNEL_ID", "")
-            if channel_id:
-                ch_info = await bot_8.get_chat(channel_id)
-                channel_ok = f"✅ Vault: {ch_info.title} is accessible"
-            else:
-                channel_ok = "⚠️ Vault: CHANNEL_ID not configured"
-        except Exception as e:
-            channel_ok = f"❌ Vault: Cannot access channel — {str(e)[:60]}"
+            client.admin.command("ping")
+            db_ok  = True
+            db_str = "✅ Connected"
+        except Exception as dbe:
+            db_ok  = False
+            db_str = f"❌ FAILED — {str(dbe)[:60]}"
+            issues.append("MongoDB ping failed")
+
+        # ── 3. bot3_pdfs — IG / YT link codes ────────────────────────────────
+        total_pdfs   = col_bot3_pdfs.count_documents({})
+        pdfs_with_ig = col_bot3_pdfs.count_documents({"ig_start_code": {"$exists": True, "$ne": ""}})
+        pdfs_with_yt = col_bot3_pdfs.count_documents({"yt_start_code": {"$exists": True, "$ne": ""}})
+        pdfs_no_ig   = total_pdfs - pdfs_with_ig
+        pdfs_no_yt   = total_pdfs - pdfs_with_yt
+
+        if pdfs_no_ig > 0:
+            issues.append(f"{pdfs_no_ig} PDF(s) missing IG start code")
+        if pdfs_no_yt > 0:
+            issues.append(f"{pdfs_no_yt} PDF(s) missing YT start code")
+
+        # Build sample links from the first PDF that has codes
+        sample_ig_link  = "—  (no PDFs with IG code)"
+        sample_yt_link  = "—  (no PDFs with YT code)"
+        sample_ytc_link = "—  (no PDFs with YT code)"
+
+        if b8_ok and b8_uname:
+            first_ig_pdf = col_bot3_pdfs.find_one(
+                {"ig_start_code": {"$exists": True, "$ne": ""}},
+                {"ig_start_code": 1, "name": 1}
+            )
+            if first_ig_pdf:
+                ig_code  = first_ig_pdf["ig_start_code"]
+                pdf_name = first_ig_pdf.get("name", "PDF")
+                sample_ig_link = f"https://t.me/{b8_uname}?start={ig_code}_ig_{pdf_name}"
+
+            first_yt_pdf = col_bot3_pdfs.find_one(
+                {"yt_start_code": {"$exists": True, "$ne": ""}},
+                {"yt_start_code": 1, "name": 1}
+            )
+            if first_yt_pdf:
+                yt_code       = first_yt_pdf["yt_start_code"]
+                yt_pdf_name   = first_yt_pdf.get("name", "PDF")
+                sample_yt_link  = f"https://t.me/{b8_uname}?start={yt_code}_yt_{yt_pdf_name}"
+                sample_ytc_link = f"https://t.me/{b8_uname}?start={yt_code}_YTCODE"
+
+        # ── 4. bot3_ig_content — IGCC start codes ────────────────────────────
+        total_igcc      = col_bot3_ig_content.count_documents({})
+        igcc_with_code  = col_bot3_ig_content.count_documents({"start_code": {"$exists": True, "$ne": ""}})
+        igcc_no_code    = total_igcc - igcc_with_code
+
+        if igcc_no_code > 0:
+            issues.append(f"{igcc_no_code} IG CC content item(s) missing start code")
+
+        # Sample IGCC link (needs a real user_id; show template format)
+        igcc_format = f"https://t.me/{b8_uname}?start=USER_ID_igcc_CC_CODE" if b8_ok and b8_uname else "—"
+
+        # ── 5. Review / log channel ───────────────────────────────────────────
+        log_channel_id = REVIEW_LOG_CHANNEL
+        if log_channel_id:
+            try:
+                ch_info   = await bot_8.get_chat(log_channel_id)
+                ch_status = f"✅ {_esc_md(ch_info.title)}"
+            except Exception as ce:
+                ch_status = f"❌ Cannot access — {_esc_md(str(ce)[:60])}"
+                issues.append("Review/log channel inaccessible")
+        else:
+            ch_status = "⚠️ REVIEW_LOG_CHANNEL not configured"
+            issues.append("REVIEW_LOG_CHANNEL not set")
+
+        # ── 6. Build report ───────────────────────────────────────────────────
+        ok_icon = "✅" if b8_ok else "❌"
 
         report = (
-            "🔗 **TRAFFIC LINK STATUS CHECK**\n"
+            "🔗 **LINK & SYSTEM HEALTH CHECK**\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🤖 **Bot 8 Delivery:** {'✅ Online — ' + b8_username if b8_ok else '❌ OFFLINE'}\n\n"
-            "**Start Link Parameters:**\n"
-            f"  {link_status(ig_param, 'IG link')}\n"
-            f"  {link_status(yt_param, 'YT link')}\n"
-            f"  {link_status(igcc_param, 'IGCC link')}\n"
-            f"  {link_status(ytcode_param, 'YTCODE link')}\n\n"
-            f"**Vault Channel:**\n  {channel_ok}\n\n"
+
+            "🤖 **BOT 1 STATUS**\n"
+            f"   └─ Status   : {ok_icon} {'Online' if b8_ok else 'OFFLINE'}\n"
+            f"   └─ Name     : {_esc_md(b8_name)}\n"
+            f"   └─ Username : {b8_display}\n"
+            f"   └─ Base URL : {_esc_md(base_link) if base_link else '—'}\n\n"
+
+            "🗄️ **DATABASE**\n"
+            f"   └─ MongoDB  : {db_str}\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📄 **PDF DEEP LINKS** (from bot9\\_pdfs)\n\n"
+            f"   Total PDFs          : {total_pdfs}\n"
+            f"   With IG start code  : {pdfs_with_ig} / {total_pdfs}"
+            + (f"  ⚠️ {pdfs_no_ig} missing" if pdfs_no_ig > 0 else "  ✅") + "\n"
+            f"   With YT start code  : {pdfs_with_yt} / {total_pdfs}"
+            + (f"  ⚠️ {pdfs_no_yt} missing" if pdfs_no_yt > 0 else "  ✅") + "\n\n"
+
+            "🔗 **SAMPLE LINKS** _(live, from first available PDF)_\n\n"
+            f"📸 IG link:\n   `{sample_ig_link}`\n\n"
+            f"▶️ YT link:\n   `{sample_yt_link}`\n\n"
+            f"🔗 YTCODE link:\n   `{sample_ytc_link}`\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📸 **IG CC CONTENT** (from bot9\\_ig\\_content)\n\n"
+            f"   Total items         : {total_igcc}\n"
+            f"   With start code     : {igcc_with_code} / {total_igcc}"
+            + (f"  ⚠️ {igcc_no_code} missing" if igcc_no_code > 0 else ("  ✅" if total_igcc > 0 else "  —")) + "\n"
+            f"   IGCC link format:\n   `{igcc_format}`\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📢 **REVIEW / LOG CHANNEL**\n"
+            f"   └─ {ch_status}\n\n"
         )
 
-        # Summary
-        issues_found = (not b8_ok) or (not ig_param) or (not yt_param) or (not igcc_param) or (not ytcode_param)
-        if issues_found:
-            report += "⚠️ **Some links/params need attention.**\nCheck ENV variables and bot status.\n"
+        # ── 7. Summary ────────────────────────────────────────────────────────
+        if issues:
+            report += "━━━━━━━━━━━━━━━━━━━━━━\n"
+            report += f"⚠️ **{len(issues)} ISSUE(S) FOUND:**\n"
+            for i, iss in enumerate(issues, 1):
+                report += f"   {i}. {_esc_md(iss)}\n"
+            report += "\n"
         else:
-            report += "✅ **All links and bot connections are operational.**\n"
+            report += "━━━━━━━━━━━━━━━━━━━━━━\n"
+            report += "✅ **All systems and links are healthy.**\n\n"
 
-        report += f"\n🕒 Checked: {now_local().strftime('%I:%M:%S %p')}"
+        report += f"🕒 Checked: {now_local().strftime('%b %d, %Y  %I:%M:%S %p')}"
+
+        print(
+            f"🔗 CHECK LINKS — bot8={'ok' if b8_ok else 'FAIL'} db={'ok' if db_ok else 'FAIL'} "
+            f"pdfs={total_pdfs} ig_ok={pdfs_with_ig} yt_ok={pdfs_with_yt} "
+            f"igcc={total_igcc} issues={len(issues)}"
+        )
 
         try:
             await loading.delete()
         except Exception:
             pass
-        traffic_kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🔄 REFRESH TRAFFIC"), KeyboardButton(text="🏆 TOP ANALYTICS")],
-                [KeyboardButton(text="🔗 CHECK LINKS"), KeyboardButton(text="⬅️ MAIN MENU")]
-            ],
-            resize_keyboard=True
-        )
-        await message.answer(report, parse_mode="Markdown", reply_markup=traffic_kb)
+
+        # ── Pagination: split if report exceeds Telegram's safe limit ────────
+        pages = _paginate_report(report, max_len=3800)
+        uid   = message.from_user.id
+
+        if len(pages) == 1:
+            # Single page — no nav needed
+            await message.answer(pages[0], parse_mode="Markdown", reply_markup=_traffic_keyboard())
+        else:
+            # Store pages for navigation
+            _chk_links_pages[uid] = pages
+            nav_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀️ Prev", callback_data=f"chk_lnk_pg:{uid}:0:prev"),
+                InlineKeyboardButton(text="📄 1 / " + str(len(pages)), callback_data="chk_lnk_noop"),
+                InlineKeyboardButton(text="Next ▶️", callback_data=f"chk_lnk_pg:{uid}:0:next"),
+            ]])
+            await message.answer(
+                pages[0] + f"\n\n_Page 1 of {len(pages)}_",
+                parse_mode="Markdown",
+                reply_markup=nav_kb
+            )
+
     except Exception as e:
         try:
-            await loading.edit_text(f"❌ Check Links Error: {str(e)[:100]}")
+            await loading.edit_text(
+                f"❌ **Check Links Error**\n\n{_esc_md(str(e)[:150])}",
+                parse_mode="Markdown"
+            )
         except Exception:
             pass
+        print(f"❌ CHECK LINKS error: {e}")
 
+# ==================== CHECK LINKS PAGINATION ====================
+
+@dp.callback_query(F.data.startswith("chk_lnk_pg:"))
+async def chk_links_page_nav(callback: types.CallbackQuery):
+    """Navigate CHECK LINKS report pages (◀️ Prev / Next ▶️)."""
+    try:
+        # Format: chk_lnk_pg:{uid}:{current_page}:{direction}
+        parts    = callback.data.split(":")
+        uid      = int(parts[1])
+        cur_page = int(parts[2])
+        direction = parts[3]   # "prev" or "next"
+
+        pages = _chk_links_pages.get(uid)
+        if not pages:
+            await callback.answer("⏳ Session expired — please run 🔗 CHECK LINKS again.", show_alert=True)
+            return
+
+        total = len(pages)
+        if direction == "next":
+            new_page = min(cur_page + 1, total - 1)
+        else:
+            new_page = max(cur_page - 1, 0)
+
+        nav_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️ Prev",  callback_data=f"chk_lnk_pg:{uid}:{new_page}:prev"),
+            InlineKeyboardButton(text=f"📄 {new_page + 1} / {total}", callback_data="chk_lnk_noop"),
+            InlineKeyboardButton(text="Next ▶️",  callback_data=f"chk_lnk_pg:{uid}:{new_page}:next"),
+        ]])
+        await callback.message.edit_text(
+            pages[new_page] + f"\n\n_Page {new_page + 1} of {total}_",
+            parse_mode="Markdown",
+            reply_markup=nav_kb
+        )
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ Error: {str(e)[:50]}", show_alert=True)
+        print(f"❌ chk_links_page_nav error: {e}")
+
+
+@dp.callback_query(F.data == "chk_lnk_noop")
+async def chk_links_noop(callback: types.CallbackQuery):
+    """No-op: page indicator button in CHECK LINKS nav bar."""
+    await callback.answer()
+
+# ================================================================
 # ==================== SUPPORT PAGINATION CALLBACKS ====================
 @dp.callback_query(F.data.startswith("pending_page_"))
 async def pending_page_navigation(callback: types.CallbackQuery):
@@ -4033,11 +4700,14 @@ async def backup_page_navigation(callback: types.CallbackQuery):
 @dp.message(F.text == "🩺 DIAGNOSIS")
 async def diagnosis_menu(message: types.Message):
     """Diagnosis menu"""
+    if not await has_permission(message.from_user.id, "diagnosis"):
+        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="Markdown")
+        return
     log_action("CMD", message.from_user.id, "Opened Diagnosis Menu")
     
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📱 BOT 8 DIAGNOSIS"), KeyboardButton(text="🎛️ BOT 10 DIAGNOSIS")],
+            [KeyboardButton(text="📱 BOT 1 DIAGNOSIS"), KeyboardButton(text="🎛️ BOT 2 DIAGNOSIS")],
             [KeyboardButton(text="⬅️ MAIN MENU")]
         ],
         resize_keyboard=True
@@ -4051,13 +4721,16 @@ async def diagnosis_menu(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message(F.text == "📱 BOT 8 DIAGNOSIS")
+@dp.message(F.text == "📱 BOT 1 DIAGNOSIS")
 async def bot8_diagnosis(message: types.Message):
-    """Run comprehensive diagnosis on Bot 8 system"""
-    log_action("DIAGNOSIS", message.from_user.id, "Running Bot 8 Diagnosis", "bot8")
+    """Run comprehensive diagnosis on Bot 1 system"""
+    if not await has_permission(message.from_user.id, "diagnosis"):
+        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="Markdown")
+        return
+    log_action("DIAGNOSIS", message.from_user.id, "Running Bot 1 Diagnosis", "bot8")
     
     status_msg = await message.answer(
-        "🔄 **INITIALIZING BOT 8 DIAGNOSTICS**\n\n"
+        "🔄 **INITIALIZING BOT 1 DIAGNOSTICS**\n\n"
         "⏳ Scanning system components...\n"
         "📊 Analyzing database health...\n"
         "🔍 Checking data integrity...",
@@ -4108,7 +4781,7 @@ async def bot8_diagnosis(message: types.Message):
     try:
         expected_collections = [
             "msa_ids", "user_verification", "support_tickets",
-            "banned_users", "suspended_features", "bot9_pdfs", "bot9_ig_content"
+            "banned_users", "suspended_features", "bot3_pdfs", "bot3_ig_content"
         ]
         existing = db.list_collection_names()
         missing = [c for c in expected_collections if c not in existing]
@@ -4130,7 +4803,8 @@ async def bot8_diagnosis(message: types.Message):
     total_checks += 1
     
     try:
-        total_users = col_msa_ids.count_documents({})
+        # Exclude retired MSA IDs (from RESET USER DATA) so health check reflects real active users
+        total_users = col_msa_ids.count_documents({"retired": {"$ne": True}})
         pending_vers = col_user_verification.count_documents({})
         banned_users = col_banned_users.count_documents({})
         suspended_users = col_suspended_features.count_documents({})
@@ -4188,8 +4862,8 @@ async def bot8_diagnosis(message: types.Message):
     total_checks += 1
     
     try:
-        pdf_count = col_bot9_pdfs.count_documents({})
-        ig_count = col_bot9_ig_content.count_documents({})
+        pdf_count = col_bot3_pdfs.count_documents({})
+        ig_count = col_bot3_ig_content.count_documents({})
         
         if pdf_count == 0 and ig_count == 0:
             warnings.append("**No Content Found:** PDF and IG collections are empty.")
@@ -4310,7 +4984,7 @@ async def bot8_diagnosis(message: types.Message):
         status_icon = "❌"
         status_text = "CRITICAL"
     
-    report = f"📱 **BOT 8 DIAGNOSTIC REPORT**\n"
+    report = f"📱 **BOT 1 DIAGNOSTIC REPORT**\n"
     report += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     report += f"🕐 **Scan Time:** {scan_time}\n"
     report += f"💾 **Database:** {db_status}\n"
@@ -4350,13 +5024,13 @@ async def bot8_diagnosis(message: types.Message):
         if "database" in il or "latency" in il:
             solutions.append("🔧 DB slow: Check MongoDB Atlas cluster load, upgrade tier, or add indexes")
         if "verification queue" in il or "stuck in queue" in il:
-            solutions.append("🔧 Verification queue: Restart Bot 8, check CHANNEL_ID is correct, verify bot has admin rights in vault")
+            solutions.append("🔧 Verification queue: Restart Bot 1, check CHANNEL_ID is correct, verify bot has admin rights in vault")
         if "ban rate" in il:
             solutions.append("🔧 High ban rate: Review recent ban reasons in SHOOT panel, check if auto-ban threshold is too low")
         if "support overload" in il:
             solutions.append("🔧 Support backlog: Go to 💬 SUPPORT → resolve tickets, or increase response team")
         if "missing collections" in il:
-            solutions.append("🔧 Missing collections will be auto-created on first write — restart Bot 8 to trigger initialization")
+            solutions.append("🔧 Missing collections will be auto-created on first write — restart Bot 1 to trigger initialization")
         if "high error rate" in il:
             solutions.append("🔧 Error logs: Check DIAGNOSIS → logs for specific error patterns, may need bot restart")
     for warn in warnings:
@@ -4371,7 +5045,7 @@ async def bot8_diagnosis(message: types.Message):
     # Final verdict
     if not issues and not warnings:
         report += "✅ **ALL SYSTEMS OPERATIONAL**\n"
-        report += "No issues detected. Bot 8 is healthy."
+        report += "No issues detected. Bot 1 is healthy."
     elif issues:
         report += "🚨 **ACTION REQUIRED**\n"
         report += "Critical issues detected. Address immediately."
@@ -4386,17 +5060,20 @@ async def bot8_diagnosis(message: types.Message):
 
     await status_msg.edit_text(report, parse_mode="Markdown")
 
-@dp.message(F.text == "🎛️ BOT 10 DIAGNOSIS")
+@dp.message(F.text == "🎛️ BOT 2 DIAGNOSIS")
 async def bot10_diagnosis(message: types.Message):
-    """Run comprehensive diagnosis on Bot 10 admin system"""
-    log_action("DIAGNOSIS", message.from_user.id, "Running Bot 10 Diagnosis", "bot10")
+    """Run comprehensive diagnosis on Bot 2 admin system"""
+    if not await has_permission(message.from_user.id, "diagnosis"):
+        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="Markdown")
+        return
+    log_action("DIAGNOSIS", message.from_user.id, "Running Bot 2 Diagnosis", "bot10")
     
     status_msg = await message.answer(
-        "🔄 **INITIALIZING BOT 10 DIAGNOSTICS**\n\n"
+        "🔄 <b>INITIALIZING BOT 2 DIAGNOSTICS</b>\n\n"
         "⏳ Checking admin systems...\n"
         "🔐 Verifying configurations...\n"
         "💾 Analyzing backups...",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     
     await asyncio.sleep(0.8)
@@ -4414,28 +5091,24 @@ async def bot10_diagnosis(message: types.Message):
     total_checks += 1
     
     try:
-        required_files = {
-            "bot10.py": "Main bot script",
-            "token.json": "Drive API credentials",
-            "db_config.json": "Database configuration"
-            # .env intentionally omitted — Render injects env vars directly, no file needed
-        }
-        
-        missing = []
-        present = []
-        
-        for file, desc in required_files.items():
-            if os.path.exists(file):
-                present.append(file)
-            else:
-                missing.append(f"{file} ({desc})")
-        
-        if missing:
-            issues.append(f"**Missing Critical Files:** {', '.join(missing)}")
+        # Check files that are actually expected in this deployment
+        # bot2.py = the running script; credentials.json = Google Drive API key (optional)
+        # .env is NOT checked — Render injects env vars directly, no file needed
+        required_files = ["bot2.py"]
+        optional_files = ["credentials.json"]
+
+        missing_req = [f for f in required_files if not os.path.exists(f)]
+        missing_opt = [f for f in optional_files if not os.path.exists(f)]
+
+        if missing_req:
+            issues.append(f"**Missing Core Files:** {', '.join(missing_req)}")
         else:
             checks_passed += 1
-            info_items.append(f"All {len(required_files)} config files present")
-            
+            info_items.append("Core bot file present (bot2.py)")
+
+        if missing_opt:
+            info_items.append(f"Optional not found: {', '.join(missing_opt)} (Drive backups may be unavailable)")
+
     except Exception as e:
         issues.append(f"**File System Check Failed:** {_esc_md(str(e)[:80])}")
     
@@ -4491,21 +5164,21 @@ async def bot10_diagnosis(message: types.Message):
         log_health = True
         
         if bot10_log_count >= MAX_LOGS:
-            warnings.append(f"**Log Buffer Full:** Bot 10 buffer at capacity ({MAX_LOGS}). Active rotation.")
+            warnings.append(f"**Log Buffer Full:** Bot 2 buffer at capacity ({MAX_LOGS}). Active rotation.")
             log_health = False
             
         if bot8_log_count >= MAX_LOGS:
-            warnings.append(f"**Log Buffer Full:** Bot 8 tracking buffer at capacity.")
+            warnings.append(f"**Log Buffer Full:** Bot 1 tracking buffer at capacity.")
             log_health = False
         
         if log_health:
             checks_passed += 1
-            info_items.append(f"Logs: Bot8={bot8_log_count}, Bot10={bot10_log_count}")
+            info_items.append(f"Logs: Bot1={bot8_log_count}, Bot2={bot10_log_count}")
             
         # Check for error patterns
         error_count_bot10 = sum(1 for l in bot10_logs if 'error' in l.get('details', '').lower())
         if error_count_bot10 > 5:
-            warnings.append(f"**Admin Errors Detected:** {error_count_bot10} error events in Bot 10 logs.")
+            warnings.append(f"**Admin Errors Detected:** {error_count_bot10} error events in Bot 2 logs.")
             
     except Exception as e:
         warnings.append(f"Log system check skipped: {_esc_md(str(e)[:50])}")
@@ -4599,7 +5272,7 @@ async def bot10_diagnosis(message: types.Message):
                       "🟢 HEALTHY")
             bar    = "█" * filled + "░" * empty
             db_bar_line = (
-                f"**Filesystem:** `[{bar}]` "
+                f"<b>Filesystem:</b> <code>[{bar}]</code> "
                 f"{pct:.1f}% ({fs_used:.0f}MB / {fs_total:.0f}MB) — {risk}"
             )
             if pct > 90:
@@ -4622,21 +5295,21 @@ async def bot10_diagnosis(message: types.Message):
                       "🟢 HEALTHY")
             bar    = "█" * filled + "░" * empty
             db_bar_line = (
-                f"**DB Used:** `[{bar}]` "
+                f"<b>DB Used:</b> <code>[{bar}]</code> "
                 f"{pct:.1f}% of 512MB M0 cap ({total_mb:.1f}MB) — {risk}"
             )
             checks_passed += 1
 
         db_space_line = (
-            f"📦 Data: `{data_mb:.1f}MB`  "
-            f"💾 Storage: `{storage_mb:.1f}MB`  "
-            f"🔖 Indexes: `{index_mb:.1f}MB`"
+            f"📦 Data: <code>{data_mb:.1f}MB</code>  "
+            f"💾 Storage: <code>{storage_mb:.1f}MB</code>  "
+            f"🔖 Indexes: <code>{index_mb:.1f}MB</code>"
         )
         info_items.append(f"DB space — data:{data_mb:.1f}MB storage:{storage_mb:.1f}MB idx:{index_mb:.1f}MB")
     except Exception as space_err:
         db_space_line = ""
         db_bar_line   = ""
-        info_items.append(f"DB space check skipped: {_esc_md(str(space_err)[:50])}")
+        info_items.append(f"DB space check skipped: {html.escape(str(space_err)[:50])}")
 
     # ═══════════════════════════════════════
     # GENERATE COMPREHENSIVE REPORT
@@ -4659,48 +5332,48 @@ async def bot10_diagnosis(message: types.Message):
         status_icon = "❌"
         status_text = "CRITICAL"
     
-    report = f"🎛️ **BOT 10 DIAGNOSTIC REPORT**\n"
+    report = f"🎛️ <b>BOT 2 DIAGNOSTIC REPORT</b>\n"
     report += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    report += f"🕐 **Scan Time:** {scan_time}\n"
-    report += f"💻 **Version:** Administrator v2.1\n"
-    report += f"📊 **Health Score:** {checks_passed}/{total_checks} ({health_percentage}%)\n"
-    report += f"🎯 **Status:** {status_icon} {status_text}\n"
+    report += f"🕐 <b>Scan Time:</b> {scan_time}\n"
+    report += f"💻 <b>Version:</b> Administrator v2.1\n"
+    report += f"📊 <b>Health Score:</b> {checks_passed}/{total_checks} ({health_percentage}%)\n"
+    report += f"🎯 <b>Status:</b> {status_icon} {status_text}\n"
     if db_space_line:
-        report += f"🗄️ **Space:** {db_space_line}\n"
+        report += f"🗄️ <b>Space:</b> {db_space_line}\n"
     if db_bar_line:
         report += f"📊 {db_bar_line}\n"
     report += "\n"
     
     # Critical issues section
     if issues:
-        report += f"❌ **CRITICAL ALERTS ({len(issues)}):**\n"
+        report += f"❌ <b>CRITICAL ALERTS ({len(issues)}):</b>\n"
         for i, issue in enumerate(issues, 1):
-            report += f"{i}. {issue}\n"
+            report += f"{i}. {html.escape(str(issue))}\n"
         report += "\n"
     
     # Warnings section
     if warnings:
-        report += f"⚠️ **WARNINGS ({len(warnings)}):**\n"
+        report += f"⚠️ <b>WARNINGS ({len(warnings)}):</b>\n"
         for i, warning in enumerate(warnings, 1):
-            report += f"{i}. {warning}\n"
+            report += f"{i}. {html.escape(str(warning))}\n"
         report += "\n"
     
     # System info
     if info_items:
-        report += "ℹ️ **SYSTEM STATUS:**\n"
+        report += "ℹ️ <b>SYSTEM STATUS:</b>\n"
         for info in info_items[:5]:
-            report += f"• {info}\n"
+            report += f"• {html.escape(str(info))}\n"
         report += "\n"
     
     # Final verdict
     if not issues and not warnings:
-        report += "✅ **ALL SYSTEMS OPERATIONAL**\n"
-        report += "Bot 10 admin panel is healthy and ready."
+        report += "✅ <b>ALL SYSTEMS OPERATIONAL</b>\n"
+        report += "Bot 2 admin panel is healthy and ready."
     elif issues:
-        report += "🚨 **IMMEDIATE ACTION REQUIRED**\n"
+        report += "🚨 <b>IMMEDIATE ACTION REQUIRED</b>\n"
         report += "Critical issues detected. Resolve to restore full admin functionality."
     else:
-        report += "✅ **SYSTEM FUNCTIONAL**\n"
+        report += "✅ <b>SYSTEM FUNCTIONAL</b>\n"
         report += "Minor warnings present. Monitor but system is operational."
 
     # ═══════════════════════════════════════
@@ -4713,75 +5386,118 @@ async def bot10_diagnosis(message: types.Message):
         item_l = item.lower()
         if "mongodb" in item_l or "database" in item_l or "db" in item_l:
             solutions.append(
-                "🔧 **DB Connection Failed:** Check `MONGO_URI` in your `.env` / Render env vars. "
-                "Ensure MongoDB Atlas IP Whitelist includes 0.0.0.0/0 (or your server IP). "
-                "Verify cluster is not paused on Atlas dashboard."
+                "<b>DB:</b> Check MONGO_URI in Render env vars. Ensure MongoDB Atlas IP Whitelist "
+                "includes 0.0.0.0/0 (or your server IP). Verify Atlas cluster is not paused."
             )
         if "broadcast" in item_l or "broadcast collection" in item_l:
             solutions.append(
-                "📢 **Broadcast Issues:** Run `/cleanbroadcasts` to remove stale entries. "
-                "If broadcast stuck, use CANCEL BROADCAST from the broadcast menu."
+                "<b>Broadcast:</b> Use CANCEL BROADCAST from the broadcast menu to clear stuck entries."
             )
         if "backup" in item_l or "backups" in item_l:
             solutions.append(
-                "💾 **Backup System:** Trigger a manual backup via BACKUP MENU → CREATE BACKUP. "
-                "Check `bot10_backups` collection exists in MongoDB. "
-                "If Drive backups fail, re-authenticate: delete `token.json` and run drive setup again."
+                "Backups: Trigger manual backup via BACKUP MENU -> CREATE BACKUP. "
+                "Check that the backups collection exists in MongoDB."
             )
         if "drive" in item_l or "token" in item_l:
             solutions.append(
-                "☁️ **Drive Token Issue:** Delete `token.json` and re-run the Google Drive auth flow. "
-                "Ensure `DRIVE_FOLDER_ID` env var is set correctly."
+                "Drive: Delete token.json and re-run Google Drive auth flow. "
+                "Ensure DRIVE FOLDER ID env var is set in Render."
             )
         if "environment" in item_l or "env" in item_l or "missing" in item_l:
             solutions.append(
-                "⚙️ **Missing Env Vars:** Open Render dashboard → Environment → add the missing variable. "
-                "Redeploy the service after saving."
+                "Env Vars: Open Render dashboard -> Environment -> add the missing variable, then redeploy."
             )
         if "latency" in item_l or "slow" in item_l or "timeout" in item_l:
             solutions.append(
-                "⏱️ **High Latency:** Upgrade MongoDB Atlas cluster tier (M0→M10). "
-                "Add indexes on frequently queried fields (`user_id`, `source`). "
+                "Latency: Upgrade MongoDB Atlas tier (M0 to M10). Add indexes on frequently queried fields. "
                 "Check Render region matches Atlas region for low ping."
             )
-        if "msa" in item_l or "id" in item_l:
+        if "msa" in item_l:
             solutions.append(
-                "🆔 **MSA ID Issues:** Verify `msa_ids` collection is intact. "
-                "Run `/checkvault` from bot8 admin panel to inspect allocations. "
-                "Do NOT manually delete documents from `msa_ids`."
+                "MSA IDs: Verify the msa ids collection is intact. "
+                "Do NOT manually delete documents from it."
             )
         if "ban" in item_l or "banned" in item_l:
             solutions.append(
-                "🚫 **High Ban Count:** Review ban triggers in bot8 auto-ban logic. "
-                "Use SHOOT MENU → SEARCH USER to inspect individual cases. "
-                "Consider raising ban threshold if false positives are high."
+                "Bans: Review ban triggers in bot8 auto-ban logic. "
+                "Use SHOOT -> SEARCH USER to inspect individual cases."
             )
 
     if not solutions and (issues or warnings):
         solutions.append(
-            "🔄 **General Fix:** Restart Bot 10 service on Render. "
+            "General Fix: Restart Bot 2 service on Render. "
             "If issue persists, check Render logs for stack traces and contact developer."
         )
 
     if solutions:
         unique_solutions = list(dict.fromkeys(solutions))
-        report += "\n\n💡 **POSSIBLE SOLUTIONS:**\n"
-        report += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        report += "\nPOSSIBLE SOLUTIONS:\n"
         for idx, sol in enumerate(unique_solutions, 1):
             report += f"{idx}. {sol}\n\n"
 
+    # Safe truncation: cut at last newline to avoid splitting mid-sentence or mid-entity
     if len(report) > 3800:
-        report = report[:3750] + "\n\n_…report truncated_"
+        cut = report[:3750]
+        last_nl = cut.rfind('\n')
+        report = (cut[:last_nl] if last_nl > 0 else cut) + "\n\n(report truncated)"
     try:
-        await status_msg.edit_text(report, parse_mode="Markdown")
+        await status_msg.edit_text(report, parse_mode="HTML")
     except Exception as _diag_err:
+        # Fallback: send plain text so the admin always gets something readable
         try:
-            await status_msg.edit_text(
-                f"❌ **BOT 10 DIAGNOSIS ERROR**\n\n`{str(_diag_err)[:300]}`\n\nCheck Render logs for details.",
-                parse_mode="Markdown"
-            )
+            plain = f"BOT 2 DIAGNOSIS ERROR\n\nParse error: {str(_diag_err)[:200]}\n\nCheck Render logs."
+            await status_msg.edit_text(plain)
         except Exception:
             pass
+
+def _resolve_user(search_input: str):
+    """
+    Cross-collection user lookup for all SHOOT action handlers.
+    Checks col_user_tracking AND col_msa_ids — so a user is found even when
+    only one collection has a record (e.g. vault-joined but no tracking entry,
+    or tracking exists but msa_id field was empty).
+    Returns a merged dict or None if not found in either collection.
+    Returned keys: user_id, msa_id, first_name, username, source,
+                   first_start, last_start, assigned_at
+    """
+    s = search_input.strip()
+    tracking_doc = None
+    msa_doc = None
+
+    if s.upper().startswith("MSA"):
+        tracking_doc = col_user_tracking.find_one({"msa_id": s.upper()})
+        msa_doc      = col_msa_ids.find_one({"msa_id": s.upper()})
+    elif s.isdigit():
+        uid = int(s)
+        tracking_doc = col_user_tracking.find_one({"user_id": uid})
+        msa_doc      = col_msa_ids.find_one({"user_id": uid})
+    else:
+        # Name search fallback
+        tracking_doc = col_user_tracking.find_one(
+            {"first_name": {"$regex": f"^{s}$", "$options": "i"}}
+        )
+        if tracking_doc:
+            msa_doc = col_msa_ids.find_one({"user_id": tracking_doc.get("user_id")})
+
+    if not tracking_doc and not msa_doc:
+        return None
+
+    # If found only in msa_doc, try resolving tracking by user_id (activity fields)
+    if not tracking_doc and msa_doc:
+        tracking_doc = col_user_tracking.find_one({"user_id": msa_doc.get("user_id")})
+
+    return {
+        "user_id":     (tracking_doc or msa_doc).get("user_id"),
+        # msa_doc is the authoritative source for the MSA ID
+        "msa_id":      (msa_doc or {}).get("msa_id") or (tracking_doc or {}).get("msa_id", "N/A"),
+        "first_name":  (tracking_doc or {}).get("first_name") or (msa_doc or {}).get("first_name", "Unknown"),
+        "username":    (tracking_doc or {}).get("username") or (msa_doc or {}).get("username", "N/A"),
+        "source":      (tracking_doc or {}).get("source", "N/A"),
+        "first_start": (tracking_doc or {}).get("first_start"),
+        "last_start":  (tracking_doc or {}).get("last_start"),
+        "assigned_at": (msa_doc or {}).get("assigned_at"),
+    }
+
 
 def get_shoot_menu():
     """Shoot (Admin Control) submenu"""
@@ -4799,6 +5515,9 @@ def get_shoot_menu():
 @dp.message(F.text == "📸 SHOOT")
 async def shoot_handler(message: types.Message, state: FSMContext):
     """Shoot (Admin Control) feature - User management"""
+    if not await has_permission(message.from_user.id, "shoot"):
+        await message.answer("⛔ You don't have permission to use SHOOT.", parse_mode="Markdown")
+        return
     await state.clear()
     await message.answer(
         "📸 **SHOOT - ADMIN CONTROL**\n\n"
@@ -4810,7 +5529,7 @@ async def shoot_handler(message: types.Message, state: FSMContext):
         "▶️ **UNSUSPEND** - Remove all suspended features\n"
         "🔄 **RESET USER DATA** - Reset user information\n"
         "🔍 **SEARCH USER** - View detailed user info\n\n"
-        "⚠️ **Warning:** These actions affect Bot 8 users.",
+        "⚠️ **Warning:** These actions affect Bot 1 users.",
         reply_markup=get_shoot_menu(),
         parse_mode="Markdown"
     )
@@ -4833,7 +5552,7 @@ async def ban_user_start(message: types.Message, state: FSMContext):
         "🚫 **BAN USER**\n\n"
         "Enter the user's **MSA ID** or **User ID** to ban:\n\n"
         "⚠️ Banned users will:\n"
-        "  • Lose all Bot 8 access\n"
+        "  • Lose all Bot 1 access\n"
         "  • See only SUPPORT button\n"
         "  • Receive ban notification\n\n"
         "Type ⬅️ BACK or ❌ CANCEL to abort.",
@@ -4853,12 +5572,8 @@ async def process_ban_id(message: types.Message, state: FSMContext):
     loading_msg = await message.answer("⏳ Searching user...", parse_mode="Markdown")
     
     try:
-        # Find user
-        user_doc = None
-        if search_input.upper().startswith("MSA"):
-            user_doc = col_user_tracking.find_one({"msa_id": search_input.upper()})
-        elif search_input.isdigit():
-            user_doc = col_user_tracking.find_one({"user_id": int(search_input)})
+        # Find user — cross-collection: checks col_user_tracking AND col_msa_ids
+        user_doc = _resolve_user(search_input)
         
         if not user_doc:
             await loading_msg.delete()
@@ -4911,7 +5626,7 @@ async def process_ban_id(message: types.Message, state: FSMContext):
             f"👁️ **User ID:** `{user_id}`\n"
             f"📱 **Username:** @{username if username != 'N/A' else 'None'}\n\n"
             f"⚠️ **This will:**\n"
-            f"  • Ban user from all Bot 8 functions\n"
+            f"  • Ban user from all Bot 1 functions\n"
             f"  • Hide all menus and buttons\n"
             f"  • Show only SUPPORT option\n"
             f"  • Send ban notification to user\n\n"
@@ -4997,7 +5712,7 @@ async def process_ban_confirm(message: types.Message, state: FSMContext):
             await state.clear()
             await message.answer(
                 f"✅ **USER BANNED**\n\n"
-                f"👤 {first_name} (`{msa_id}`) has been banned from Bot 8.\n\n"
+                f"👤 {first_name} (`{msa_id}`) has been banned from Bot 1.\n\n"
                 f"🕐 Banned at: {now_local().strftime('%I:%M:%S %p')}\n\n"
                 f"User will see ban notification on next interaction.",
                 reply_markup=get_shoot_menu(),
@@ -5028,7 +5743,7 @@ async def temp_ban_user_start(message: types.Message, state: FSMContext):
         "⏰ **TEMPORARY BAN**\n\n"
         "Enter the user's **MSA ID** or **User ID** to temporarily ban:\n\n"
         "⚠️ Temporary ban will:\n"
-        "  • Block all Bot 8 access for selected duration\n"
+        "  • Block all Bot 1 access for selected duration\n"
         "  • Show countdown timer to user\n"
         "  • Auto-unban when time expires\n"
         "  • Allow user to appeal via support\n\n"
@@ -5049,12 +5764,8 @@ async def process_temp_ban_id(message: types.Message, state: FSMContext):
     loading_msg = await message.answer("⏳ Searching user...", parse_mode="Markdown")
     
     try:
-        # Find user
-        user_doc = None
-        if search_input.upper().startswith("MSA"):
-            user_doc = col_user_tracking.find_one({"msa_id": search_input.upper()})
-        elif search_input.isdigit():
-            user_doc = col_user_tracking.find_one({"user_id": int(search_input)})
+        # Find user — cross-collection: checks col_user_tracking AND col_msa_ids
+        user_doc = _resolve_user(search_input)
         
         if not user_doc:
             await loading_msg.delete()
@@ -5178,7 +5889,7 @@ async def process_temp_ban_duration(message: types.Message, state: FSMContext):
         f"⏱️ **Duration:** {message.text.replace('⏱️ ', '')}\n"
         f"🕐 **Ban Until:** {ban_expires.strftime('%b %d, %Y at %I:%M:%S %p')}\n\n"
         f"⚠️ **This will:**\n"
-        f"  • Block user from all Bot 8 functions\n"
+        f"  • Block user from all Bot 1 functions\n"
         f"  • Show countdown timer to user\n"
         f"  • Auto-unban on {ban_expires.strftime('%b %d at %I:%M %p')}\n"
         f"  • Send notification with countdown\n\n"
@@ -5221,9 +5932,13 @@ async def process_temp_ban_confirm(message: types.Message, state: FSMContext):
             
             # Calculate time remaining for display
             time_diff = ban_expires - now_local()
-            total_seconds = ban_duration_hours * 3600
-            elapsed_seconds = total_seconds - time_diff.total_seconds()
-            progress_percentage = (elapsed_seconds / total_seconds) * 100
+            total_seconds = (ban_duration_hours or 0) * 3600
+            if total_seconds > 0:
+                elapsed_seconds = total_seconds - time_diff.total_seconds()
+                progress_percentage = min(100.0, max(0.0, (elapsed_seconds / total_seconds) * 100))
+            else:
+                elapsed_seconds = 0
+                progress_percentage = 0.0
             
             days = time_diff.days
             hours = time_diff.seconds // 3600
@@ -5242,7 +5957,7 @@ async def process_temp_ban_confirm(message: types.Message, state: FSMContext):
             empty = 20 - filled
             progress_bar = "▰" * filled + "▱" * empty
             
-            # Try to notify user via Bot 8
+            # Try to notify user via Bot 1
             try:
                 ban_message = (
                     "⏰ **TEMPORARY RESTRICTION**\n"
@@ -5509,7 +6224,7 @@ async def process_unban_confirm(message: types.Message, state: FSMContext):
             result = col_banned_users.delete_one({"user_id": user_id})
             
             if result.deleted_count > 0:
-                # Try to notify user via Bot 8 with menu restoration
+                # Try to notify user via Bot 1 with menu restoration
                 try:
                     from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
                     
@@ -5598,12 +6313,8 @@ async def process_delete_id(message: types.Message, state: FSMContext):
     loading_msg = await message.answer("⏳ Searching user...", parse_mode="Markdown")
     
     try:
-        # Find user
-        user_doc = None
-        if search_input.upper().startswith("MSA"):
-            user_doc = col_user_tracking.find_one({"msa_id": search_input.upper()})
-        elif search_input.isdigit():
-            user_doc = col_user_tracking.find_one({"user_id": int(search_input)})
+        # Find user — cross-collection: checks col_user_tracking AND col_msa_ids
+        user_doc = _resolve_user(search_input)
         
         if not user_doc:
             await loading_msg.delete()
@@ -5737,12 +6448,8 @@ async def process_reset_id(message: types.Message, state: FSMContext):
     loading_msg = await message.answer("⏳ Searching user...", parse_mode="Markdown")
     
     try:
-        # Find user
-        user_doc = None
-        if search_input.upper().startswith("MSA"):
-            user_doc = col_user_tracking.find_one({"msa_id": search_input.upper()})
-        elif search_input.isdigit():
-            user_doc = col_user_tracking.find_one({"user_id": int(search_input)})
+        # Find user — cross-collection: checks col_user_tracking AND col_msa_ids
+        user_doc = _resolve_user(search_input)
         
         if not user_doc:
             await loading_msg.delete()
@@ -5807,22 +6514,16 @@ async def process_reset_confirm(message: types.Message, state: FSMContext):
         first_name = data.get("first_name")
         
         try:
-            # ── Step 1: Retire MSA ID — keeps number permanently taken so it is NEVER reused ──
-            msa_doc = col_msa_ids.find_one({"user_id": user_id})
-            retired_msa_id = msa_id  # fallback to state data value
+            # ── Step 1: DELETE MSA ID permanently — number returned to pool, can be reallocated ──
+            # Look up by msa_id string (e.g. "MSA324935688") — avoids user_id type mismatch
+            msa_doc = col_msa_ids.find_one({"msa_id": msa_id})
+            if not msa_doc and user_id:
+                # fallback: try by user_id in case msa_id field is missing
+                msa_doc = col_msa_ids.find_one({"user_id": user_id})
+            deleted_msa_id = msa_id  # fallback to state data value
             if msa_doc:
-                retired_msa_id = msa_doc.get("msa_id", msa_id)
-                col_msa_ids.update_one(
-                    {"user_id": user_id},
-                    {
-                        "$set": {
-                            "user_id": f"retired_{user_id}_{int(time.time())}",
-                            "retired": True,
-                            "retired_at": now_local(),
-                            "retired_first_name": first_name
-                        }
-                    }
-                )
+                deleted_msa_id = msa_doc.get("msa_id", msa_id)
+                col_msa_ids.delete_one({"_id": msa_doc["_id"]})
 
             # ── Step 2: Delete verification record — bot8 treats user as brand-new ──
             col_user_verification.delete_one({"user_id": user_id})
@@ -5834,18 +6535,21 @@ async def process_reset_confirm(message: types.Message, state: FSMContext):
             col_banned_users.delete_one({"user_id": user_id})
             col_suspended_features.delete_one({"user_id": user_id})
 
+            # ── Step 5: Delete all support tickets for this user ──
+            col_support_tickets.delete_many({"user_id": user_id})
+
             await state.clear()
             await message.answer(
                 f"✅ **USER PERMANENTLY ERASED**\n\n"
-                f"👤 {first_name} (`{retired_msa_id}`) has been fully removed.\n\n"
-                f"🗑️ **Deleted:** verification, tracking, bans, suspensions\n"
-                f"🔒 **MSA ID `{retired_msa_id}` retired** — number permanently reserved, never reused\n\n"
-                f"🆕 If this user starts Bot 8 again they will receive a **brand-new MSA ID**.\n\n"
+                f"👤 {first_name} (`{deleted_msa_id}`) has been fully removed.\n\n"
+                f"🗑️ **Deleted:** MSA ID, verification, tracking, bans, suspensions, ticket history\n"
+                f"🆓 **MSA ID `{deleted_msa_id}` deleted** — number freed back to allocation pool\n\n"
+                f"🆕 If this user starts Bot 1 again they will receive a **brand-new MSA ID**.\n\n"
                 f"🕒 Erased at: {now_local().strftime('%I:%M:%S %p')}",
                 reply_markup=get_shoot_menu(),
                 parse_mode="Markdown"
             )
-            print(f"🗑️ User {user_id} ({retired_msa_id}) permanently erased by admin {message.from_user.id}")
+            print(f"🗑️ User {user_id} ({deleted_msa_id}) permanently erased (MSA deleted) by admin {message.from_user.id}")
         
         except Exception as e:
             await message.answer(f"❌ **RESET FAILED:** {str(e)[:100]}", parse_mode="Markdown")
@@ -5891,12 +6595,8 @@ async def process_suspend_id(message: types.Message, state: FSMContext):
     loading_msg = await message.answer("⏳ Searching user...", parse_mode="Markdown")
     
     try:
-        # Find user
-        user_doc = None
-        if search_input.upper().startswith("MSA"):
-            user_doc = col_user_tracking.find_one({"msa_id": search_input.upper()})
-        elif search_input.isdigit():
-            user_doc = col_user_tracking.find_one({"user_id": int(search_input)})
+        # Find user — cross-collection: checks col_user_tracking AND col_msa_ids
+        user_doc = _resolve_user(search_input)
         
         if not user_doc:
             await loading_msg.delete()
@@ -5988,7 +6688,7 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
                 upsert=True
             )
             
-            # Send notification via Bot 8 to user
+            # Send notification via Bot 1 to user
             try:
                 notification_text = (
                     "⚠️ **ACCOUNT RESTRICTION**\n"
@@ -6027,7 +6727,7 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
                 f"👤 {first_name} (`{msa_id}`)\n\n"
                 f"⏸️ Suspended features:\n" + "\n".join([f"  • {f.replace('_', ' ')}" for f in suspended_features]) +
                 f"\n\n🕐 Suspended at: {now_local().strftime('%I:%M:%S %p')}\n\n"
-                f"✉️ User has been notified via Bot 8.",
+                f"✉️ User has been notified via Bot 1.",
                 reply_markup=get_shoot_menu(),
                 parse_mode="Markdown"
             )
@@ -6108,7 +6808,7 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
 # UNSUSPEND HANDLERS
 # ==========================================
 
-@dp.message(lambda m: m.text and "UNSUSPEND" in m.text)
+@dp.message(F.text == "▶️ UNSUSPEND")
 async def unsuspend_features_start(message: types.Message, state: FSMContext):
     """Start unsuspend features flow"""
     await state.set_state(ShootStates.waiting_for_unsuspend_id)
@@ -6121,7 +6821,7 @@ async def unsuspend_features_start(message: types.Message, state: FSMContext):
     await message.answer(
         "🔓 **UNSUSPEND FEATURES**\n\n"
         "Enter the user's **MSA ID** or **User ID** to remove all suspended features:\n\n"
-        "This will restore full access to all Bot 8 features.\n\n"
+        "This will restore full access to all Bot 1 features.\n\n"
         "Type ⬅️ BACK or ❌ CANCEL to abort.",
         reply_markup=back_keyboard,
         parse_mode="Markdown"
@@ -6139,12 +6839,8 @@ async def process_unsuspend_id(message: types.Message, state: FSMContext):
     loading_msg = await message.answer("⏳ Searching user...", parse_mode="Markdown")
     
     try:
-        # Find user
-        user_doc = None
-        if search_input.upper().startswith("MSA"):
-            user_doc = col_user_tracking.find_one({"msa_id": search_input.upper()})
-        elif search_input.isdigit():
-            user_doc = col_user_tracking.find_one({"user_id": int(search_input)})
+        # Find user — cross-collection: checks col_user_tracking AND col_msa_ids
+        user_doc = _resolve_user(search_input)
         
         if not user_doc:
             await loading_msg.delete()
@@ -6179,14 +6875,14 @@ async def process_unsuspend_id(message: types.Message, state: FSMContext):
         try:
             col_suspended_features.delete_one({"user_id": user_id})
             
-            # Send notification via Bot 8 to user
+            # Send notification via Bot 1 to user
             try:
                 notification_text = (
                     "✅ **FEATURES RESTORED**\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     "All suspended features have been removed from your account.\n\n"
                     "🎉 **Full Access Restored**\n"
-                    "You now have access to all Bot 8 features.\n\n"
+                    "You now have access to all Bot 1 features.\n\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     "Your menu has been automatically restored below. 👇"
                 )
@@ -6215,7 +6911,7 @@ async def process_unsuspend_id(message: types.Message, state: FSMContext):
                 f"👤 {first_name} (`{msa_id}`)\n\n"
                 f"🔓 Previously suspended features:\n" + "\n".join([f"  • {f.replace('_', ' ')}" for f in suspended_features]) +
                 f"\n\n🕐 Unsuspended at: {now_local().strftime('%I:%M:%S %p')}\n\n"
-                f"✉️ User has been notified and menu restored via Bot 8.",
+                f"✉️ User has been notified and menu restored via Bot 1.",
                 reply_markup=get_shoot_menu(),
                 parse_mode="Markdown"
             )
@@ -6268,12 +6964,8 @@ async def process_shoot_search(message: types.Message, state: FSMContext):
     loading_msg = await message.answer("⏳ Searching database...", parse_mode="Markdown")
     
     try:
-        # Find user
-        user_doc = None
-        if search_input.upper().startswith("MSA"):
-            user_doc = col_user_tracking.find_one({"msa_id": search_input.upper()})
-        elif search_input.isdigit():
-            user_doc = col_user_tracking.find_one({"user_id": int(search_input)})
+        # Find user — cross-collection: checks col_user_tracking AND col_msa_ids
+        user_doc = _resolve_user(search_input)
         
         if not user_doc:
             await loading_msg.delete()
@@ -6416,21 +7108,46 @@ async def show_pending_tickets_page(message: types.Message, page: int = 1):
     response += f"📊 Total Pending: **{total_pending}** tickets\n"
     response += f"📄 Showing: {skip + 1}-{skip + len(tickets)} of {total_pending}\n\n"
     
+    _seen_users_page = set()
     for ticket in tickets:
         user_id = ticket.get('user_id')
         user_name = ticket.get('user_name', 'Unknown')
         username = ticket.get('username', 'none')
         msa_id = ticket.get('msa_id', 'Not Assigned') 
-        issue = ticket.get('issue_text', 'No description')[:80]  # First 80 chars
+        issue_full = ticket.get('issue_text', 'No description')
+        issue = issue_full[:80]
         created = ticket.get('created_at', now_local())
         date_str = created.strftime("%b %d, %I:%M %p")
         support_count = ticket.get('support_count', 1)
-        
+
+        # Per-user spam & history info
+        _spam_cutoff = now_local() - timedelta(hours=1)
+        _recent_count = col_support_tickets.count_documents({
+            "user_id": user_id,
+            "created_at": {"$gte": _spam_cutoff}
+        })
+        _total_user = col_support_tickets.count_documents({"user_id": user_id})
+        _prev_list = list(
+            col_support_tickets.find({"user_id": user_id})
+            .sort("created_at", -1).skip(1).limit(1)
+        )
+        _last_sub = (
+            _prev_list[0]["created_at"].strftime("%b %d, %I:%M %p")
+            if _prev_list else "First ever"
+        )
+        _is_dup = user_id in _seen_users_page
+        _seen_users_page.add(user_id)
+
         response += f"━━━━━━━━━━━━━━━━━━━━━\n"
+        if _recent_count >= 2:
+            response += f"⚠️ **SPAM ALERT** — {_recent_count}x in last hour!\n"
+        if _is_dup:
+            response += f"♻️ **DUPLICATE** — multiple open tickets\n"
         response += f"👤 **{user_name}** (@{username})\n"
         response += f"🆔 TG: `{user_id}` | MSA: `{msa_id}`\n"
         response += f"🎫 Ticket #{support_count} · {date_str}\n"
-        response += f"📝 {issue}...\n\n"
+        response += f"📊 Total: {_total_user} ticket(s) · Prev sub: {_last_sub}\n"
+        response += f"📝 {issue}{'…' if len(issue_full) > 80 else ''}\n\n"
     
     response += "💡 Use **✅ RESOLVE TICKET** to resolve by ID"
     
@@ -6655,7 +7372,7 @@ async def process_resolve_ticket(message: types.Message, state: FSMContext):
     if result.modified_count > 0:
         print(f"✅ Ticket resolved for user {user_id} ({user_name})")
         
-        # 1. Send premium DM to user via Bot 8
+        # 1. Send premium DM to user via Bot 1
         try:
             await bot_8.send_message(
                 user_id,
@@ -6679,6 +7396,17 @@ async def process_resolve_ticket(message: types.Message, state: FSMContext):
         # 2. Edit the channel message with resolved status
         if channel_message_id and REVIEW_LOG_CHANNEL:
             try:
+                # Escape Markdown v1 special chars in issue text + cap to prevent 4096 overflow
+                _MAX_CHAN_ISSUE = 3400
+                safe_issue = (
+                    issue_text
+                    .replace('*', '\\*')
+                    .replace('_', '\\_')
+                    .replace('`', '\\`')
+                    .replace('[', '\\[')
+                )
+                if len(safe_issue) > _MAX_CHAN_ISSUE:
+                    safe_issue = safe_issue[:_MAX_CHAN_ISSUE] + "\n_\u2026 (truncated \u2014 full text in database)_"
                 # Build clean updated ticket message
                 updated_ticket_msg = f"""
 🎫 **SUPPORT TICKET** - ✅ **RESOLVED**
@@ -6700,7 +7428,7 @@ async def process_resolve_ticket(message: types.Message, state: FSMContext):
 🔍 **ISSUE DESCRIPTION**
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-{issue_text}
+{safe_issue}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -6863,7 +7591,7 @@ async def process_reply_message(message: types.Message, state: FSMContext):
         )
         return
     
-    # Send message to user via Bot 8
+    # Send message to user via Bot 1
     try:
         await bot_8.send_message(
             user_id,
@@ -6998,7 +7726,9 @@ async def show_admin_search_ticket_page(message_or_cb, user_id: int, page: int):
     date_str = created.strftime("%b %d, %Y at %I:%M %p")
     issue = ticket.get('issue_text', 'No description')
     ticket_type = ticket.get('ticket_type', 'Text Only')
-    char_count = ticket.get('character_count', 0)
+    # character_count was removed from new tickets (redundant); derive from issue_text directly
+    issue_text_raw = ticket.get('issue_text', '')
+    char_count = ticket.get('character_count') or len(issue_text_raw)
     support_num = ticket.get('support_count', page + 1)
     
     response = f"🔍 **USER TICKET HISTORY**\n\n"
@@ -7032,7 +7762,20 @@ async def show_admin_search_ticket_page(message_or_cb, user_id: int, page: int):
             InlineKeyboardButton(text=f"📄 {page + 1}/{total}", callback_data="adm_noop"),
             InlineKeyboardButton(text="▶️", callback_data=f"adm_tkt:{user_id}:{next_pg}")
         ]])
-        
+
+    # Add "View in Channel" button if this ticket has a channel message linked
+    channel_msg_id = ticket.get("channel_message_id")
+    if channel_msg_id and REVIEW_LOG_CHANNEL:
+        cid_str = str(abs(REVIEW_LOG_CHANNEL))
+        if cid_str.startswith("100"):
+            cid_str = cid_str[3:]
+        view_url = f"https://t.me/c/{cid_str}/{channel_msg_id}"
+        view_btn = InlineKeyboardButton(text="📺 View in Channel", url=view_url)
+        if nav_kb:
+            nav_kb.inline_keyboard.append([view_btn])
+        else:
+            nav_kb = InlineKeyboardMarkup(inline_keyboard=[[view_btn]])
+
     if isinstance(message_or_cb, types.Message):
         await message_or_cb.answer(response, reply_markup=nav_kb, parse_mode="Markdown")
         await message_or_cb.answer("Use options below or navigate history above:", reply_markup=get_support_management_menu())
@@ -7174,6 +7917,124 @@ async def back_to_support(message: types.Message, state: FSMContext):
         reply_markup=get_support_management_menu(),
         parse_mode="Markdown"
     )
+
+# ==========================================
+# 👁 VIEW CHANNEL
+# ==========================================
+
+@dp.message(F.text == "👁 VIEW CHANNEL")
+async def view_support_channel_handler(message: types.Message, state: FSMContext):
+    """Ask for user/MSA ID then show direct links to that user's channel messages."""
+    if not await has_permission(message.from_user.id, "support"):
+        return
+
+    if not REVIEW_LOG_CHANNEL:
+        await message.answer(
+            "⚠️ **Support channel not configured.**\n\n"
+            "Please set `REVIEW_LOG_CHANNEL` in the environment.",
+            parse_mode="Markdown",
+            reply_markup=get_support_management_menu()
+        )
+        return
+
+    await state.set_state(SupportStates.waiting_for_view_channel_id)
+    cancel_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+        resize_keyboard=True
+    )
+    await message.answer(
+        "👁 **VIEW MESSAGES IN SUPPORT CHANNEL**\n\n"
+        "Enter the **MSA ID** (e.g. `MSA324935688`) or **Telegram User ID** to jump\n"
+        "directly to that user’s ticket messages in the support channel.\n\n"
+        "_I will show you a direct link for each message from that user._",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb
+    )
+
+
+@dp.message(SupportStates.waiting_for_view_channel_id)
+async def process_view_channel_id(message: types.Message, state: FSMContext):
+    """Look up stored channel_message_ids for the user and return direct t.me links."""
+    if message.text and message.text.strip() in ["\u274c CANCEL", "/cancel"]:
+        await state.clear()
+        await message.answer("❌ Cancelled.", reply_markup=get_support_management_menu(), parse_mode="Markdown")
+        return
+
+    search_input = message.text.strip()
+
+    # Build query
+    if search_input.upper().startswith("MSA"):
+        query = {"msa_id": search_input.upper()}
+    elif search_input.isdigit():
+        query = {"user_id": int(search_input)}
+    else:
+        query = {"user_name": {"$regex": f"^{search_input}$", "$options": "i"}}
+
+    tickets = list(col_support_tickets.find(query).sort("created_at", -1))
+
+    await state.clear()
+
+    if not tickets:
+        await message.answer(
+            f"❌ **No tickets found** for `{search_input}`\n\n"
+            "Check MSA ID or Telegram User ID and try again.",
+            parse_mode="Markdown",
+            reply_markup=get_support_management_menu()
+        )
+        return
+
+    # Build channel base URL
+    cid_str = str(abs(REVIEW_LOG_CHANNEL))
+    if cid_str.startswith("100"):
+        cid_str = cid_str[3:]
+
+    # Collect tickets that have a stored channel message ID
+    linked = [(t, t.get("channel_message_id")) for t in tickets if t.get("channel_message_id")]
+    no_link = [t for t in tickets if not t.get("channel_message_id")]
+
+    first = tickets[0]
+    user_name  = first.get("user_name", "Unknown")
+    user_id    = first.get("user_id", "?")
+    msa_id     = first.get("msa_id", "N/A")
+    username   = first.get("username", "none")
+
+    header = (
+        f"👁 **CHANNEL MESSAGES — {user_name}**\n"
+        f"🆔 MSA: `{msa_id}` · TG: `{user_id}` · @{username}\n"
+        f"📊 Total tickets: {len(tickets)} · 🔗 With channel link: {len(linked)}\n\n"
+        "Click a button below to jump directly to that message in the support channel:"
+    )
+
+    if not linked:
+        await message.answer(
+            header + "\n\n⚠️ No channel message links stored for this user.\n"
+            "_Old tickets submitted before message tracking was added have no link._",
+            parse_mode="Markdown",
+            reply_markup=get_support_management_menu()
+        )
+        return
+
+    # Build one inline button per linked ticket (max 40 buttons to stay safe)
+    buttons = []
+    for t, msg_id in linked[:40]:
+        created  = t.get("created_at", now_local())
+        date_str = created.strftime("%b %d %I:%M %p")
+        status   = "✅" if t.get("status") == "resolved" else "⏳"
+        label    = f"{status} {date_str} — #{t.get('support_count', '?')}"
+        url      = f"https://t.me/c/{cid_str}/{msg_id}"
+        buttons.append([InlineKeyboardButton(text=label, url=url)])
+
+    if no_link:
+        header += f"\n\n⚠️ {len(no_link)} older ticket(s) have no channel link stored."
+
+    nav_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(header, parse_mode="Markdown", reply_markup=nav_kb)
+    await message.answer(
+        "_Each button above opens that exact message in the support channel._",
+        parse_mode="Markdown",
+        reply_markup=get_support_management_menu()
+    )
+
 
 # ==========================================
 # 📈 STATISTICS
@@ -7505,28 +8366,69 @@ async def backup_handler(message: types.Message, state: FSMContext):
         last_backup = "Never"
         backup_status = "❌ No backups yet"
     
-    # Bot 8 backup count
+    # Bot 1 backup count + live record counts
     b8_backup_count = col_bot8_backups.count_documents({})
     latest_b8_backup = col_bot8_backups.find_one({}, sort=[("backup_date", -1)])
     if latest_b8_backup:
         last_b8_backup = format_datetime(latest_b8_backup['backup_date'])
-        b8_backup_status = f"✅ {b8_backup_count} backups"
+        b8_backup_status = f"✅ {b8_backup_count} snapshots stored"
+        b8cc = latest_b8_backup.get("collection_counts", {})
+        b8_last_records = (
+            f"  Last Backup Records:\n"
+            f"    🆔 msa_ids: {b8cc.get('msa_ids', 0):,}  |  "
+            f"✅ user_verification: {b8cc.get('user_verification', 0):,}\n"
+            f"    📊 user_tracking: {b8cc.get('bot10_user_tracking', 0):,}  |  "
+            f"🚫 perm_banned: {b8cc.get('permanently_banned_msa', 0):,}\n"
+        )
     else:
         last_b8_backup = "Never"
         b8_backup_status = "❌ No backups yet"
+        b8_last_records = ""
+
+    # Live record counts for both bots
+    live_msa       = col_msa_ids.count_documents({})
+    live_verif     = col_user_verification.count_documents({})
+    live_tracking  = col_user_tracking.count_documents({})
+    live_perm_ban  = col_permanently_banned_msa.count_documents({})
+    live_b8_total  = live_msa + live_verif + live_tracking + live_perm_ban
+
+    live_bcast     = col_broadcasts.count_documents({})
+    live_tickets   = col_support_tickets.count_documents({})
+    live_banned    = col_banned_users.count_documents({})
+    live_susp      = col_suspended_features.count_documents({})
+    live_logs      = col_cleanup_logs.count_documents({})
+    live_b10_total = live_bcast + live_tickets + live_banned + live_susp + live_logs
+
+    # Bot 2 last backup record counts
+    if latest_backup:
+        b10cc = latest_backup.get("collection_counts", {})
+        b10_last_records = (
+            f"  Last Backup Records:\n"
+            f"    📢 broadcasts: {b10cc.get('bot10_broadcasts', 0):,}  |  "
+            f"🎫 tickets: {b10cc.get('support_tickets', 0):,}\n"
+            f"    🚫 banned: {b10cc.get('banned_users', 0):,}  |  "
+            f"⏸ suspended: {b10cc.get('suspended_features', 0):,}\n"
+        )
+    else:
+        b10_last_records = ""
 
     message_text = (
         "💾 <b>BACKUP MANAGEMENT SYSTEM</b>\n\n"
-        "<b>🤖 Bot 8 Backups:</b>\n"
+        "<b>🤖 Bot 1 Backups:</b>\n"
         f"  Status: {b8_backup_status}\n"
-        f"  Last: {last_b8_backup}\n\n"
-        "<b>🤖 Bot 10 Backups:</b>\n"
+        f"  Last: {last_b8_backup}\n"
+        f"{b8_last_records}"
+        f"  Live DB Now: <b>{live_b8_total:,} total records</b>\n"
+        f"    🆔 {live_msa:,} msa  |  ✅ {live_verif:,} verified  |  "
+        f"📊 {live_tracking:,} tracked  |  🚫 {live_perm_ban:,} banned\n\n"
+        "<b>🤖 Bot 2 Backups:</b>\n"
         f"  Status: {backup_status}\n"
-        f"  Last: {last_backup}\n\n"
-        "<b>Bot 8 Data:</b> msa_ids, user_verification, user_tracking\n"
-        "<b>Bot 10 Data:</b> broadcasts, banned_users, tickets, logs\n\n"
+        f"  Last: {last_backup}\n"
+        f"{b10_last_records}"
+        f"  Live DB Now: <b>{live_b10_total:,} total records</b>\n"
+        f"    📢 {live_bcast:,} broadcasts  |  🎫 {live_tickets:,} tickets  |  "
+        f"🚫 {live_banned:,} banned  |  🧹 {live_logs:,} logs\n\n"
         "<b>Storage:</b> MongoDB (Cloud-Safe)\n"
-        "<b>Download:</b> JSON files sent to you\n"
         "<b>Works On:</b> Render/Heroku/Railway ✅\n"
     )
     
@@ -7571,8 +8473,8 @@ async def create_backup_mongodb_scalable(backup_type="manual", admin_id=None, pr
     try:
         # Define collections to backup
         collections_to_backup = [
-            ("broadcasts", col_broadcasts),
-            ("user_tracking", col_user_tracking),
+            ("bot10_broadcasts", col_broadcasts),
+            ("bot10_user_tracking", col_user_tracking),
             ("support_tickets", col_support_tickets),
             ("banned_users", col_banned_users),
             ("suspended_features", col_suspended_features),
@@ -7645,7 +8547,25 @@ async def create_backup_mongodb_scalable(backup_type="manual", admin_id=None, pr
             old_backup_ids = [b['_id'] for b in old_backups]
             col_bot10_backups.delete_many({"_id": {"$in": old_backup_ids}})
             print(f"🗑️ Cleaned up {backup_count - 60} old backups (kept last 60)")
-        
+
+        # === STORE FULL DATA FOR RESTORE (replace-always, single doc keyed "bot10_latest") ===
+        try:
+            col_bot10_restore_data.replace_one(
+                {"_id": "bot10_latest"},
+                {
+                    "_id": "bot10_latest",
+                    "backup_date": now,
+                    "timestamp": timestamp,
+                    "total_records": backup_summary["total_records"],
+                    "collection_counts": backup_summary["collection_counts"],
+                    "collections": collections_data,
+                },
+                upsert=True,
+            )
+            print(f"💾 Bot2 restore snapshot updated — {backup_summary['total_records']:,} records")
+        except Exception as rs_err:
+            print(f"⚠️ Bot2 restore snapshot store failed (data may be too large for single doc): {rs_err}")
+
         return {
             "success": True,
             "backup_id": backup_id,
@@ -7665,9 +8585,9 @@ async def create_backup_mongodb_scalable(backup_type="manual", admin_id=None, pr
             "total_records": backup_summary.get('total_records', 0)
         }
 
-@dp.message(F.text == "🤖 BOT 10 BACKUP")
+@dp.message(F.text == "🤖 BOT 2 BACKUP")
 async def backup_now_handler(message: types.Message, state: FSMContext):
-    """Create Bot 10 manual backup — broadcasts, banned, tickets, logs"""
+    """Create Bot 2 manual backup — broadcasts, banned, tickets, logs"""
     if not await has_permission(message.from_user.id, "backup"):
         return
     status_msg = await message.answer("⏳ <b>Starting Backup...</b>\n\nInitializing enterprise-grade backup system...", parse_mode="HTML")
@@ -7808,9 +8728,11 @@ async def backup_now_handler(message: types.Message, state: FSMContext):
         error_msg = str(e).replace('<', '&lt;').replace('>', '&gt;')
         await status_msg.edit_text(f"❌ <b>BACKUP ERROR</b>\n\n{error_msg}", parse_mode="HTML")
 
-@dp.message(F.text == "📊 BOT 10 HISTORY")
+@dp.message(F.text == "📊 BOT 2 HISTORY")
 async def view_backups_handler(message: types.Message):
-    """Show Bot 10 MongoDB backups with pagination"""
+    """Show Bot 2 MongoDB backups with pagination"""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
     await show_backups_page(message, page=1)
 
 async def show_backups_page(message: types.Message, page: int = 1):
@@ -7883,6 +8805,8 @@ async def show_backups_page(message: types.Message, page: int = 1):
 @dp.message(F.text == "🗓️ MONTHLY STATUS")
 async def monthly_status_handler(message: types.Message):
     """Check monthly backup status from MongoDB"""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
     try:
         now = now_local()
         
@@ -7920,6 +8844,8 @@ async def monthly_status_handler(message: types.Message):
 @dp.message(F.text == "⚙️ AUTO-BACKUP")
 async def auto_backup_info_handler(message: types.Message):
     """Show auto-backup information"""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
     msg_text = (
         "⚙️ <b>AUTOMATIC BACKUP SYSTEM</b>\n\n"
         "<b>Schedule:</b>\n"
@@ -7939,8 +8865,8 @@ async def auto_backup_info_handler(message: types.Message):
         "✅ No local disk storage needed\n"
         "✅ Keeps last 60 backups (30 days × 2/day)\n\n"
         "<b>Bot Separation:</b>\n"
-        "🟢 Bot 8 → <code>bot8_backups</code> collection\n"
-        "🔵 Bot 10 → <code>bot10_backups</code> collection\n"
+        "🟢 Bot 1 → <code>bot8_backups</code> collection\n"
+        "🔵 Bot 2 → <code>bot10_backups</code> collection\n"
         "❌ No mixing between bots\n\n"
         "<b>Status:</b>\n"
         "🟢 ACTIVE — Running every 12 hours\n\n"
@@ -7949,9 +8875,482 @@ async def auto_backup_info_handler(message: types.Message):
     
     await message.answer(msg_text, parse_mode="HTML")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLEAR BACKUP HISTORY — 4-step double-confirm flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dp.message(F.text == "🗑️ CLEAR BACKUP HISTORY")
+async def clear_backup_start(message: types.Message, state: FSMContext):
+    """Step 1 — Ask which bot's backups to clear"""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🤖 BOT 1 BACKUPS"), KeyboardButton(text="🤖 BOT 2 BACKUPS")],
+            [KeyboardButton(text="❌ CANCEL")]
+        ],
+        resize_keyboard=True
+    )
+    await state.set_state(BackupStates.selecting_clear_target)
+    await message.answer(
+        "🗑️ <b>CLEAR BACKUP HISTORY</b>\n\n"
+        "⚠️ <b>WARNING:</b> This will permanently delete backup records from the database.\n\n"
+        "Select which bot's backup history to clear:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+
+@dp.message(BackupStates.selecting_clear_target)
+async def clear_backup_select_target(message: types.Message, state: FSMContext):
+    """Step 2 — Store target, show record count, ask for CONFIRM"""
+    if not await has_permission(message.from_user.id, "backup"):
+        await state.clear()
+        return
+
+    text = message.text
+
+    if text == "❌ CANCEL":
+        await state.clear()
+        await message.answer(
+            "✅ Cancelled. Returning to backup menu.",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML"
+        )
+        return
+
+    if text == "🤖 BOT 1 BACKUPS":
+        target = "bot8"
+        col = col_bot8_backups
+        label = "Bot 1"
+    elif text == "🤖 BOT 2 BACKUPS":
+        target = "bot10"
+        col = col_bot10_backups
+        label = "Bot 2"
+    else:
+        await message.answer(
+            "❌ Invalid choice. Please select <b>BOT 1 BACKUPS</b>, <b>BOT 2 BACKUPS</b>, or <b>CANCEL</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+    record_count = col.count_documents({})
+    await state.update_data(clear_target=target, clear_count=record_count)
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+        resize_keyboard=True
+    )
+    await state.set_state(BackupStates.waiting_for_clear_confirm1)
+    await message.answer(
+        f"⚠️ <b>CONFIRM DELETION — STEP 1 of 2</b>\n\n"
+        f"You are about to permanently delete all <b>{label}</b> backup records.\n\n"
+        f"📊 Records that will be deleted: <b>{record_count:,}</b>\n\n"
+        f"🔴 This action <b>cannot be undone</b>.\n\n"
+        f"Type <b>CONFIRM</b> to proceed, or press ❌ CANCEL to abort:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+
+@dp.message(BackupStates.waiting_for_clear_confirm1)
+async def clear_backup_confirm1(message: types.Message, state: FSMContext):
+    """Step 3 — Must type CONFIRM, then show final warning asking for DELETE"""
+    if not await has_permission(message.from_user.id, "backup"):
+        await state.clear()
+        return
+
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        await message.answer(
+            "✅ Cancelled. Returning to backup menu.",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML"
+        )
+        return
+
+    if message.text != "CONFIRM":
+        await message.answer(
+            "❌ Incorrect. You must type exactly <b>CONFIRM</b> (all caps) to proceed, "
+            "or press ❌ CANCEL.",
+            parse_mode="HTML"
+        )
+        return
+
+    data = await state.get_data()
+    target = data.get("clear_target")
+    record_count = data.get("clear_count", 0)
+    label = "Bot 1" if target == "bot8" else "Bot 2"
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+        resize_keyboard=True
+    )
+    await state.set_state(BackupStates.waiting_for_clear_confirm2)
+    await message.answer(
+        f"🔴 <b>FINAL WARNING — STEP 2 of 2</b>\n\n"
+        f"You are about to permanently erase <b>{record_count:,}</b> {label} backup records.\n\n"
+        f"⛔ <b>THIS CANNOT BE UNDONE.</b>\n\n"
+        f"Only the <b>{label} backup collection</b> will be affected.\n"
+        f"No user data, MSA IDs, or other collections will be touched.\n\n"
+        f"Type <b>DELETE</b> to permanently erase all {label} backups, "
+        f"or press ❌ CANCEL to abort:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+
+@dp.message(BackupStates.waiting_for_clear_confirm2)
+async def clear_backup_confirm2(message: types.Message, state: FSMContext):
+    """Step 4 — Must type DELETE, then execute delete_many on ONLY the chosen backup collection"""
+    if not await has_permission(message.from_user.id, "backup"):
+        await state.clear()
+        return
+
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        await message.answer(
+            "✅ Cancelled. Returning to backup menu.",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML"
+        )
+        return
+
+    if message.text != "DELETE":
+        await message.answer(
+            "❌ Incorrect. You must type exactly <b>DELETE</b> (all caps) to proceed, "
+            "or press ❌ CANCEL.",
+            parse_mode="HTML"
+        )
+        return
+
+    data = await state.get_data()
+    target = data.get("clear_target")
+    label = "Bot 1" if target == "bot8" else "Bot 2"
+
+    try:
+        if target == "bot8":
+            result = col_bot8_backups.delete_many({})
+        else:
+            result = col_bot10_backups.delete_many({})
+
+        deleted = result.deleted_count
+        await state.clear()
+        await message.answer(
+            f"✅ <b>BACKUP HISTORY CLEARED</b>\n\n"
+            f"🗑️ Deleted: <b>{deleted:,}</b> {label} backup record(s)\n\n"
+            f"Only the {label} backup collection was affected.\n"
+            f"All other data remains intact.",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML"
+        )
+        log_action(
+            f"🗑️ BACKUP CLEARED — {label}",
+            message.from_user.id,
+            f"Admin deleted {deleted} {label} backup records",
+            "bot10"
+        )
+
+    except Exception as e:
+        await state.clear()
+        error_msg = str(e).replace('<', '&lt;').replace('>', '&gt;')
+        await message.answer(
+            f"❌ <b>CLEAR FAILED</b>\n\n{error_msg}\n\nReturning to backup menu.",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON RESTORE — Upload a .json or .json.gz file; auto-detect collections
+# and upsert every document into the correct MongoDB collection.
+# Supports single-collection JSON (list of docs) or multi-collection JSON
+# (dict mapping collection_name → list of docs).
+# No duplicates — uses upsert keyed by the unique index defined per collection.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Collections allowed for JSON restore and their unique dedup keys.
+# Documents are upserted (never duplicated) using these keys.
+# Aliases: short/old export key names → canonical registry keys
+# Covers old bot2 exports (broadcasts, user_tracking) and bot3 ZIP/view-JSON exports (pdfs, ig_content, etc.)
+_JSON_RESTORE_ALIASES = {
+    # Bot 2 old alias names (exported before rename fix)
+    "broadcasts":         "bot10_broadcasts",
+    "user_tracking":      "bot10_user_tracking",
+    # Bot 3 short names (inside ZIP files and view-JSON exports)
+    "pdfs":               "bot3_pdfs",
+    "ig_content":         "bot3_ig_content",
+    "admins":             "bot3_admins",
+    "settings":           "bot3_settings",
+    "logs":               "bot3_logs",
+    "banned_users_b3":    "bot3_banned_users",   # if renamed to avoid ambiguity with bot1/2
+}
+
+_JSON_RESTORE_COLLECTIONS = {
+    # Bot 1 (bot8) collections
+    "user_verification":      "user_id",
+    "msa_ids":                "user_id",
+    "support_tickets":        "_id",
+    "banned_users":           "user_id",
+    "suspended_features":     "user_id",
+    "permanently_banned_msa": "msa_id",
+    "bot8_state_persistence": "key",
+    "bot8_offline_log":       "_id",
+    "bot8_backups":           "_id",
+    "bot8_restore_data":      "_id",
+    # Bot 2 (bot10) collections
+    "bot10_broadcasts":       "broadcast_id",
+    "bot10_admins":           "user_id",
+    "bot10_user_tracking":    "user_id",
+    "bot10_runtime_state":    "state_key",
+    "bot10_backups":          "_id",
+    "bot10_restore_data":     "_id",
+    "bot10_access_attempts":  "_id",
+    "cleanup_backups":        "_id",
+    "cleanup_logs":           "_id",
+    "live_terminal_logs":     "_id",
+    # Bot 3 (bot3) collections
+    "bot3_pdfs":              "msa_code",
+    "bot3_ig_content":        "cc_code",
+    "bot3_admins":            "user_id",
+    "bot3_banned_users":      "user_id",
+    "bot3_settings":          "_id",
+    "bot3_logs":              "_id",
+    "bot3_user_activity":     "_id",
+    "bot3_backups":           "_id",
+    "bot3_state":             "_id",
+    "bot3_tutorials":         "_id",
+}
+
+
+@dp.message(F.text == "📤 JSON RESTORE")
+async def json_restore_start(message: types.Message, state: FSMContext):
+    """Start JSON restore — prompt admin to send a JSON or JSON.GZ file."""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
+
+    await state.set_state(BackupStates.waiting_for_json_file)
+    await message.answer(
+        "📤 <b>JSON RESTORE</b>\n\n"
+        "Send a <b>.json</b> or <b>.json.gz</b> file to restore data.\n\n"
+        "<b>Accepted formats:</b>\n"
+        "• <b>Multi-collection</b> — <code>{\"collection_name\": [{...}, ...], ...}</code>\n"
+        "• <b>Single-collection</b> — <code>[{...}, ...]</code> with filename as collection name\n\n"
+        "<b>Known collections:</b>\n"
+        + "\n".join(f"  • <code>{c}</code>" for c in sorted(_JSON_RESTORE_COLLECTIONS))
+        + "\n\n"
+        "⚠️ All inserts use <b>upsert</b> — no duplicates will be created.\n"
+        "Existing records are updated; new records are added.\n\n"
+        "Press <b>❌ CANCEL</b> to abort.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+
+
+@dp.message(BackupStates.waiting_for_json_file)
+async def json_restore_receive(message: types.Message, state: FSMContext):
+    """Receive the file, parse it, and upsert all documents into MongoDB."""
+    if not await has_permission(message.from_user.id, "backup"):
+        await state.clear()
+        return
+
+    # Cancel button
+    if message.text and ("CANCEL" in message.text.upper()):
+        await state.clear()
+        await message.answer("✅ JSON restore cancelled.", reply_markup=get_backup_menu(), parse_mode="HTML")
+        return
+
+    # Must be a document (file)
+    if not message.document:
+        await message.answer(
+            "❌ Please send a <b>.json</b> or <b>.json.gz</b> file.\n"
+            "Press ❌ CANCEL to go back.",
+            parse_mode="HTML"
+        )
+        return
+
+    doc = message.document
+    fname = (doc.file_name or "").lower()
+    if not (fname.endswith(".json") or fname.endswith(".json.gz")):
+        await message.answer(
+            "❌ Unsupported file type. Only <b>.json</b> and <b>.json.gz</b> are accepted.",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.clear()
+    status_msg = await message.answer("⏳ <b>Downloading file...</b>", parse_mode="HTML")
+
+    import io, gzip as _gzip, json as _json
+    from bson import ObjectId as _ObjId
+
+    try:
+        # Download file bytes
+        file_info = await bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file_info.file_path, buf)
+        raw_bytes = buf.getvalue()
+
+        # Decompress if gzip
+        if fname.endswith(".json.gz"):
+            raw_bytes = _gzip.decompress(raw_bytes)
+
+        payload = _json.loads(raw_bytes.decode("utf-8"))
+
+    except Exception as parse_err:
+        await status_msg.edit_text(
+            f"❌ <b>Failed to read file</b>\n\n<code>{str(parse_err)[:300]}</code>",
+            parse_mode="HTML"
+        )
+        await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
+        return
+
+    import re as _re
+
+    # ── Normalise to dict: collection_name → list[doc] ──────────────────────
+    # Multi-collection: {"col_name": [...], ...}
+    # Single-collection list: use filename stem as collection name
+    if isinstance(payload, dict):
+        # Unwrap wrapper JSON from full-backup export (has 'collections' key with dict value)
+        if "collections" in payload and isinstance(payload["collections"], dict):
+            col_map = payload["collections"]
+        else:
+            col_map = payload
+    elif isinstance(payload, list):
+        # Derive collection name from filename stem (strip .json / .json.gz + timestamp suffix)
+        stem = doc.file_name or "unknown"
+        for ext in (".json.gz", ".json"):
+            if stem.lower().endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+        # Strip trailing timestamp like _2026-03-12_08-00-00_AM or _2026-03-12_08-57-25
+        stem = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', stem)
+        col_map = {stem: payload}
+    else:
+        await status_msg.edit_text(
+            "❌ <b>Invalid JSON structure.</b>\n\n"
+            "Expected a JSON object <code>{collection: [...]}</code> "
+            "or a JSON array <code>[...]</code>.",
+            parse_mode="HTML"
+        )
+        await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
+        return
+
+    # ── Apply alias mapping + silently drop non-list metadata fields ─────────
+    normalized_map = {}
+    for _k, _v in col_map.items():
+        if not isinstance(_v, list):
+            continue  # silently skip metadata fields (strings, ints, dicts)
+        # Resolve alias (e.g. "broadcasts" → "bot10_broadcasts")
+        resolved = _JSON_RESTORE_ALIASES.get(_k, _k)
+        normalized_map[resolved] = _v
+    col_map = normalized_map
+
+    # ── Helper: coerce string _id back to ObjectId where applicable ──────────
+    def _coerce_id(doc_: dict) -> dict:
+        raw_id = doc_.get("_id")
+        if isinstance(raw_id, str) and len(raw_id) == 24:
+            try:
+                doc_["_id"] = _ObjId(raw_id)
+            except Exception:
+                pass
+        return doc_
+
+    # ── Process each collection ───────────────────────────────────────────────
+    await status_msg.edit_text("⏳ <b>Processing collections...</b>", parse_mode="HTML")
+
+    results = {}
+    skipped_collections = []
+    total_upserted = 0
+    total_errors = 0
+
+    for col_name, docs in col_map.items():
+        if col_name not in _JSON_RESTORE_COLLECTIONS:
+            skipped_collections.append(col_name)
+            continue
+
+        # docs is always a list here (non-lists already filtered above)
+        if not isinstance(docs, list):
+            skipped_collections.append(f"{col_name} (not a list)")
+            continue
+
+        unique_key = _JSON_RESTORE_COLLECTIONS[col_name]
+        collection  = db[col_name]
+        upserted    = 0
+        errors      = 0
+
+        for raw_doc in docs:
+            if not isinstance(raw_doc, dict):
+                errors += 1
+                continue
+            try:
+                doc_to_insert = _coerce_id(dict(raw_doc))
+
+                if unique_key == "_id":
+                    # Upsert by MongoDB _id
+                    filter_q = {"_id": doc_to_insert["_id"]} if "_id" in doc_to_insert else None
+                    if filter_q:
+                        collection.replace_one(filter_q, doc_to_insert, upsert=True)
+                    else:
+                        collection.insert_one(doc_to_insert)
+                else:
+                    key_val = doc_to_insert.get(unique_key)
+                    if key_val is None:
+                        # No unique key — fall back to _id upsert
+                        if "_id" in doc_to_insert:
+                            collection.replace_one({"_id": doc_to_insert["_id"]}, doc_to_insert, upsert=True)
+                        else:
+                            collection.insert_one(doc_to_insert)
+                    else:
+                        collection.update_one(
+                            {unique_key: key_val},
+                            {"$set": doc_to_insert},
+                            upsert=True
+                        )
+                upserted += 1
+            except Exception:
+                errors += 1
+
+        results[col_name] = {"upserted": upserted, "errors": errors}
+        total_upserted += upserted
+        total_errors   += errors
+
+    # ── Build result message ──────────────────────────────────────────────────
+    lines = ["✅ <b>JSON RESTORE COMPLETE</b>\n"]
+    for col_name, r in results.items():
+        emoji = "✅" if r["errors"] == 0 else "⚠️"
+        lines.append(
+            f"{emoji} <code>{col_name}</code>: "
+            f"+{r['upserted']:,} upserted"
+            + (f", {r['errors']} errors" if r["errors"] else "")
+        )
+    if skipped_collections:
+        lines.append("\n⚠️ <b>Skipped (unknown/invalid):</b>")
+        for sc in skipped_collections:
+            lines.append(f"  • <code>{sc}</code>")
+
+    lines.append(f"\n📊 <b>Total upserted:</b> {total_upserted:,}")
+    if total_errors:
+        lines.append(f"❌ <b>Total errors:</b> {total_errors:,}")
+    lines.append("\n<i>All changes used upsert — no duplicates created.</i>")
+
+    await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+    await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
+
+    log_action(
+        "📤 JSON RESTORE",
+        message.from_user.id,
+        f"Restored {total_upserted} docs across {len(results)} collections from {doc.file_name}",
+        "bot10"
+    )
+
+
 @dp.message(F.text == "🖥️ TERMINAL")
 async def terminal_handler(message: types.Message, state: FSMContext):
-    """Terminal - Shows live logs with Bot 8/10 selection"""
+    """Terminal - Shows live logs with Bot 1/10 selection"""
     # Log to console and memory
     log_action("🖥️ TERMINAL ACCESS", message.from_user.id, "Admin opened live terminal", "bot10")
     
@@ -7959,7 +9358,7 @@ async def terminal_handler(message: types.Message, state: FSMContext):
         # Show view selection with reply keyboard
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="📱 BOT 8 LOGS"), KeyboardButton(text="🎛️ BOT 10 LOGS")],
+                [KeyboardButton(text="📱 BOT 1 LOGS"), KeyboardButton(text="🎛️ BOT 2 LOGS")],
                 [KeyboardButton(text="⬅️ MAIN MENU")]
             ],
             resize_keyboard=True
@@ -7968,8 +9367,8 @@ async def terminal_handler(message: types.Message, state: FSMContext):
         await message.answer(
             "<b>🖥️ LIVE TERMINAL</b>\n\n"
             "Select which bot logs to view:\n\n"
-            "📱 <b>Bot 8 Logs</b> - User interactions & content\n"
-            "🎛️ <b>Bot 10 Logs</b> - Admin actions & management\n\n"
+            "📱 <b>Bot 1 Logs</b> - User interactions & content\n"
+            "🎛️ <b>Bot 2 Logs</b> - Admin actions & management\n\n"
             f"<i>💡 Tracking last {MAX_LOGS} actions per bot</i>",
             reply_markup=keyboard,
             parse_mode="HTML"
@@ -7982,26 +9381,26 @@ async def terminal_handler(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
 
-@dp.message(F.text.in_({"📱 BOT 8 LOGS", "🔄 REFRESH BOT 8"}))
+@dp.message(F.text.in_({"📱 BOT 1 LOGS", "🔄 REFRESH BOT 1"}))
 async def view_bot8_logs(message: types.Message, state: FSMContext):
-    """Show Bot 8 live logs in raw terminal format"""
+    """Show Bot 1 live logs in raw terminal format"""
     # Simply log strictly (no stats query)
-    log_action("CMD", message.from_user.id, "Opened Bot 8 Terminal", "bot8")
+    log_action("CMD", message.from_user.id, "Opened Bot 1 Terminal", "bot1")
     
     try:
-        logs_text = get_terminal_logs(bot="bot8", limit=50)
+        logs_text = get_terminal_logs(bot="bot1", limit=50)
         
-        # Specific keyboard for Bot 8 view
+        # Specific keyboard for Bot 1 view
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🔄 REFRESH BOT 8"), KeyboardButton(text="⬅️ RETURN TO MENU")]
+                [KeyboardButton(text="🔄 REFRESH BOT 1"), KeyboardButton(text="⬅️ RETURN TO MENU")]
             ],
             resize_keyboard=True
         )
         
         # Raw terminal appearance
         await message.answer(
-            f"<b>📱 BOT 8 TERMINAL VIEW</b>\n"
+            f"<b>📱 BOT 1 TERMINAL VIEW</b>\n"
             f"<pre language='bash'>{logs_text}</pre>",
             reply_markup=keyboard,
             parse_mode="HTML"
@@ -8010,25 +9409,25 @@ async def view_bot8_logs(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"Error: {e}")
 
-@dp.message(F.text.in_({"🎛️ BOT 10 LOGS", "🔄 REFRESH BOT 10"}))
+@dp.message(F.text.in_({"🎛️ BOT 2 LOGS", "🔄 REFRESH BOT 2"}))
 async def view_bot10_logs(message: types.Message, state: FSMContext):
-    """Show Bot 10 live logs in raw terminal format"""
-    log_action("CMD", message.from_user.id, "Opened Bot 10 Terminal", "bot10")
+    """Show Bot 2 live logs in raw terminal format"""
+    log_action("CMD", message.from_user.id, "Opened Bot 2 Terminal", "bot2")
     
     try:
-        logs_text = get_terminal_logs(bot="bot10", limit=50)
+        logs_text = get_terminal_logs(bot="bot2", limit=50)
         
-        # Specific keyboard for Bot 10 view
+        # Specific keyboard for Bot 2 view
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🔄 REFRESH BOT 10"), KeyboardButton(text="⬅️ RETURN TO MENU")]
+                [KeyboardButton(text="🔄 REFRESH BOT 2"), KeyboardButton(text="⬅️ RETURN TO MENU")]
             ],
             resize_keyboard=True
         )
         
         # Raw terminal appearance  
         await message.answer(
-            f"<b>🎛️ BOT 10 TERMINAL VIEW</b>\n"
+            f"<b>🎛️ BOT 2 TERMINAL VIEW</b>\n"
             f"<pre language='bash'>{logs_text}</pre>",
             reply_markup=keyboard,
             parse_mode="HTML"
@@ -8046,34 +9445,48 @@ async def back_to_terminal_menu(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "terminal_bot8")
 async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
-    """Show Bot 8 terminal view"""
-    log_action("📱 BOT 8 TERMINAL", callback.from_user.id, "Viewing Bot 8 statistics")
+    """Show Bot 1 terminal view"""
+    log_action("📱 BOT 1 TERMINAL", callback.from_user.id, "Viewing Bot 1 statistics")
     
     try:
         await callback.message.edit_text(
-            "<b>📱 BOT 8 TERMINAL</b>\n\n"
-            "⏳ Fetching live Bot 8 data...\n"
+            "<b>📱 BOT 1 TERMINAL</b>\n\n"
+            "⏳ Fetching live Bot 1 data...\n"
             "📊 Analyzing collections...",
             parse_mode="HTML"
         )
         
-        # Get counts from all Bot 8 collections
+        # Get counts from all Bot 1 collections
         user_verification_count = col_user_verification.count_documents({})
         msa_ids_count = col_msa_ids.count_documents({})
-        bot9_pdfs_count = col_bot9_pdfs.count_documents({})
-        bot9_ig_content_count = col_bot9_ig_content.count_documents({})
+        bot3_pdfs_count = col_bot3_pdfs.count_documents({})
+        bot3_ig_content_count = col_bot3_ig_content.count_documents({})
         support_tickets_count = col_support_tickets.count_documents({})
         banned_users_count = col_banned_users.count_documents({})
+        suspended_features_count = col_suspended_features.count_documents({})
+
+        # MongoDB storage stats for both terminal views
+        _st = get_mongo_storage_stats()
+        if _st["ok"]:
+            _storage_line = (
+                f"$ mongodb_storage --live\n"
+                f"Atlas Storage        : [{_st['bar']}]\n"
+                f"Used / Cap           : {_st['used_mb']:.1f}MB / {_st['cap_mb']:.0f}MB  ({_st['pct']:.1f}%)\n"
+                f"Status               : {_st['risk_icon']} {_st['risk_label']}\n"
+                f"Breakdown            : data={_st['data_mb']:.1f}MB  idx={_st['index_mb']:.1f}MB\n"
+            )
+        else:
+            _storage_line = f"$ mongodb_storage --live\nStorage check: unavailable ({_st.get('error','')})\n"
         suspended_features_count = col_suspended_features.count_documents({})
         
         # Calculate total
         total_records = (
-            user_verification_count + msa_ids_count + bot9_pdfs_count + 
-            bot9_ig_content_count + support_tickets_count + 
+            user_verification_count + msa_ids_count + bot3_pdfs_count + 
+            bot3_ig_content_count + support_tickets_count + 
             banned_users_count + suspended_features_count
         )
         
-        # Get Bot 10 collections stats
+        # Get Bot 2 collections stats
         bot10_broadcasts_count = col_broadcasts.count_documents({})
         bot10_user_tracking_count = col_user_tracking.count_documents({})
         bot10_backups_count = col_bot10_backups.count_documents({})
@@ -8089,14 +9502,14 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
             "<b>🖥️ MSA NODE - SYSTEM TERMINAL</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>$ system_info --status\n"
-            f"System: MSANodeDB\n"
+            f"System: {MONGO_DB_NAME}\n"
             f"Status: ONLINE ✅\n"
             f"Timestamp: {now_local().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Admin: Bot 10 Control Panel\n\n"
+            f"Admin: Bot 2 Control Panel\n\n"
             
             f"$ bot10_features --list\n\n"
-            f"BOT 10 AVAILABLE ACTIONS:\n"
-            f"├─ 📢 BROADCAST         : Send messages to all Bot 8 users\n"
+            f"BOT 2 AVAILABLE ACTIONS:\n"
+            f"├─ 📢 BROADCAST         : Send messages to all Bot 1 users\n"
             f"│  ├─ Send Broadcast    : Create & send new broadcast\n"
             f"│  ├─ Delete Broadcast  : Remove broadcast by ID\n"
             f"│  ├─ Edit Broadcast    : Modify existing broadcast\n"
@@ -8106,7 +9519,7 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
             f"│  └─ User lookup       : Get detailed user info\n"
             f"│\n"
             f"├─ 📊 TRAFFIC           : User traffic sources\n"
-            f"│  └─ Analytics         : See how users found Bot 8\n"
+            f"│  └─ Analytics         : See how users found Bot 1\n"
             f"│\n"
             f"├─ 🩺 DIAGNOSIS         : User management tools\n"
             f"│  ├─ Ban User          : Permanent ban with reason\n"
@@ -8117,8 +9530,8 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
             f"│  ├─ Unsuspend         : Restore all features\n"
             f"│  └─ Reset User        : Clear user verification\n"
             f"│\n"
-            f"├─ 📸 SHOOT             : Quick user search\n"
-            f"│  └─ Fast lookup       : Instant user info\n"
+            f"├─ 📸 SHOOT             : User control panel\n"
+            f"│  └─ Actions           : Ban / Unban / Suspend / Delete\n"
             f"│\n"
             f"├─ 💬 SUPPORT           : Support ticket system\n"
             f"│  ├─ Reply to ticket   : Respond to user tickets\n"
@@ -8134,31 +9547,31 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
             f"│\n"
             f"├─ 🖥️ TERMINAL          : System statistics (current)\n"
             f"│  ├─ Database stats    : Collection counts\n"
-            f"│  ├─ Bot 8 data        : User verification, MSA IDs\n"
-            f"│  ├─ Bot 10 data       : Broadcasts, backups\n"
+            f"│  ├─ Bot 1 data        : User verification, MSA IDs\n"
+            f"│  ├─ Bot 2 data       : Broadcasts, backups\n"
             f"│  └─ Security status   : Bans, suspensions\n"
             f"│\n"
             f"├─ 👥 ADMINS            : Admin management [COMING SOON]\n"
             f"│  └─ Multi-admin       : Add/remove admin access\n"
             f"│\n"
-            f"└─ ⚠️ RESET DATA        : Delete ALL Bot 8 data\n"
+            f"└─ ⚠️ RESET DATA        : Delete ALL Bot 1 data\n"
             f"   └─ Double confirm    : RESET → DELETE ALL\n\n"
             
             f"$ bot8_stats --collections\n\n"
-            f"BOT 8 DATA COLLECTIONS:\n"
+            f"BOT 1 DATA COLLECTIONS:\n"
             f"├─ user_verification     : {user_verification_count:,} records\n"
             f"├─ msa_ids              : {msa_ids_count:,} records\n"
-            f"├─ bot9_pdfs            : {bot9_pdfs_count:,} records\n"
-            f"├─ bot9_ig_content      : {bot9_ig_content_count:,} records\n"
+            f"├─ bot3_pdfs            : {bot3_pdfs_count:,} records\n"
+            f"├─ bot3_ig_content      : {bot3_ig_content_count:,} records\n"
             f"├─ support_tickets      : {support_tickets_count:,} records\n"
             f"│  ├─ Open              : {open_tickets:,} tickets\n"
             f"│  └─ Resolved          : {resolved_tickets:,} tickets\n"
             f"├─ banned_users         : {banned_users_count:,} records\n"
             f"└─ suspended_features   : {suspended_features_count:,} records\n\n"
-            f"TOTAL BOT 8 RECORDS     : {total_records:,}\n\n"
+            f"TOTAL BOT 1 RECORDS     : {total_records:,}\n\n"
             
             f"$ bot10_stats --collections\n\n"
-            f"BOT 10 DATA COLLECTIONS:\n"
+            f"BOT 2 DATA COLLECTIONS:\n"
             f"├─ bot10_broadcasts     : {bot10_broadcasts_count:,} records\n"
             f"├─ bot10_user_tracking  : {bot10_user_tracking_count:,} records\n"
             f"├─ bot10_backups        : {bot10_backups_count:,} records\n"
@@ -8167,12 +9580,11 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
             
             f"$ disk_usage --total\n"
             f"Total Database Records  : {total_records + bot10_broadcasts_count + bot10_user_tracking_count + bot10_backups_count + cleanup_backups_count + cleanup_logs_count:,}\n\n"
-            
+            f"{_storage_line}\n"
             f"$ security_status\n"
             f"Banned Users           : {banned_users_count:,}\n"
             f"Suspended Features     : {suspended_features_count:,}\n"
             f"Open Support Tickets   : {open_tickets:,}\n\n"
-            
             f"$ automation_status\n"
             f"Daily Cleanup          : ACTIVE ✅ (3 AM daily)\n"
             f"Monthly Backup         : ACTIVE ✅ (1st of month, 3 AM)\n"
@@ -8184,15 +9596,13 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
             f"<b>Memory:</b> MongoDB Cloud Atlas\n"
             f"<b>Hosting:</b> Cloud-Safe (Render/Heroku Compatible)\n"
             f"<b>Scalability:</b> Enterprise-grade (10M+ users)\n\n"
-            "<i>💡 Terminal displays all Bot 10 features & system stats</i>"
+            "<i>💡 Terminal displays all Bot 2 features & system stats</i>"
         )
-        
-        # Build Bot 8 terminal output
         bot8_terminal = (
-            "<b>📱 BOT 8 LIVE TERMINAL</b>\n"
+            "<b>📱 BOT 1 LIVE TERMINAL</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>$ bot8_info --status\n"
-            f"Bot: MSA Node Bot (Bot 8)\n"
+            f"Bot: MSA Node Bot (Bot 1)\n"
             f"Status: ONLINE ✅\n"
             f"Timestamp: {now_local().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Live Updates: ENABLED ✅\n\n"
@@ -8201,8 +9611,8 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
             f"USER DATA COLLECTIONS:\n"
             f"├─ user_verification     : {user_verification_count:,} users\n"
             f"├─ msa_ids              : {msa_ids_count:,} MSA+ IDs\n"
-            f"├─ bot9_pdfs            : {bot9_pdfs_count:,} PDF records\n"
-            f"└─ bot9_ig_content      : {bot9_ig_content_count:,} IG posts\n\n"
+            f"├─ bot3_pdfs            : {bot3_pdfs_count:,} PDF records\n"
+            f"└─ bot3_ig_content      : {bot3_ig_content_count:,} IG posts\n\n"
             
             f"$ support_system --status\n\n"
             f"SUPPORT TICKETS:\n"
@@ -8216,23 +9626,24 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
             f"└─ Suspended Features   : {suspended_features_count:,} ⚠️\n\n"
             
             f"$ total_bot8_records\n"
-            f"Total Bot 8 Records     : {total_records:,}\n</code>\n\n"
+            f"Total Bot 1 Records     : {total_records:,}\n\n"
+            f"{_storage_line}</code>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Live Monitoring:</b> Active ✅\n"
             f"<b>Console Logging:</b> All actions logged\n"
             f"<b>Last Updated:</b> {now_local().strftime('%H:%M:%S')}\n\n"
-            "<i>💡 Bot 8 serves end users with content & support</i>"
+            "<i>💡 Bot 1 serves end users with content & support</i>"
         )
         
         # Add buttons
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎛️ BOT 10 TERMINAL", callback_data="terminal_bot10")],
+            [InlineKeyboardButton(text="🎛️ BOT 2 TERMINAL", callback_data="terminal_bot10")],
             [InlineKeyboardButton(text="🔄 REFRESH", callback_data="terminal_bot8")]
         ])
         
         await callback.message.edit_text(bot8_terminal, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer("📱 Bot 8 Terminal loaded")
+        await callback.answer("📱 Bot 1 Terminal loaded")
         
     except Exception as e:
         error_msg = str(e).replace('<', '&lt;').replace('>', '&gt;')
@@ -8244,21 +9655,34 @@ async def terminal_bot8_view(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "terminal_bot10")
 async def terminal_bot10_view(callback: types.CallbackQuery, state: FSMContext):
-    """Show Bot 10 terminal view"""
-    log_action("🎛️ BOT 10 TERMINAL", callback.from_user.id, "Viewing Bot 10 admin actions")
+    """Show Bot 2 terminal view"""
+    log_action("🎛️ BOT 2 TERMINAL", callback.from_user.id, "Viewing Bot 2 admin actions")
     
     try:
         # Get counts
         user_verification_count = col_user_verification.count_documents({})
         msa_ids_count = col_msa_ids.count_documents({})
-        bot9_pdfs_count = col_bot9_pdfs.count_documents({})
-        bot9_ig_content_count = col_bot9_ig_content.count_documents({})
+        bot3_pdfs_count = col_bot3_pdfs.count_documents({})
+        bot3_ig_content_count = col_bot3_ig_content.count_documents({})
         support_tickets_count = col_support_tickets.count_documents({})
         banned_users_count = col_banned_users.count_documents({})
         suspended_features_count = col_suspended_features.count_documents({})
         open_tickets = col_support_tickets.count_documents({"status": "open"})
         resolved_tickets = col_support_tickets.count_documents({"status": "resolved"})
-        
+
+        # MongoDB storage stats
+        _st = get_mongo_storage_stats()
+        if _st["ok"]:
+            _storage_line = (
+                f"$ mongodb_storage --live\n"
+                f"Atlas Storage        : [{_st['bar']}]\n"
+                f"Used / Cap           : {_st['used_mb']:.1f}MB / {_st['cap_mb']:.0f}MB  ({_st['pct']:.1f}%)\n"
+                f"Status               : {_st['risk_icon']} {_st['risk_label']}\n"
+                f"Breakdown            : data={_st['data_mb']:.1f}MB  idx={_st['index_mb']:.1f}MB\n"
+            )
+        else:
+            _storage_line = f"$ mongodb_storage --live\nStorage check: unavailable ({_st.get('error','')})\n"
+
         bot10_broadcasts_count = col_broadcasts.count_documents({})
         bot10_user_tracking_count = col_user_tracking.count_documents({})
         bot10_backups_count = col_bot10_backups.count_documents({})
@@ -8266,17 +9690,17 @@ async def terminal_bot10_view(callback: types.CallbackQuery, state: FSMContext):
         cleanup_logs_count = col_cleanup_logs.count_documents({})
         
         total_records = (
-            user_verification_count + msa_ids_count + bot9_pdfs_count + 
-            bot9_ig_content_count + support_tickets_count + 
+            user_verification_count + msa_ids_count + bot3_pdfs_count + 
+            bot3_ig_content_count + support_tickets_count + 
             banned_users_count + suspended_features_count
         )
         
-        # Build Bot 10 terminal output
+        # Build Bot 2 terminal output
         bot10_terminal = (
-            "<b>🎛️ BOT 10 LIVE TERMINAL</b>\n"
+            "<b>🎛️ BOT 2 LIVE TERMINAL</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>$ bot10_info --status\n"
-            f"Bot: Admin Control Panel (Bot 10)\n"
+            f"Bot: Admin Control Panel (Bot 2)\n"
             f"Status: ONLINE ✅\n"
             f"Timestamp: {now_local().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Live Updates: ENABLED ✅\n"
@@ -8295,7 +9719,7 @@ async def terminal_bot10_view(callback: types.CallbackQuery, state: FSMContext):
             f"└─ ⚠️ RESET DATA        : Dangerous operation\n\n"
             
             f"$ bot10_collections --stats\n\n"
-            f"BOT 10 DATA:\n"
+            f"BOT 2 DATA:\n"
             f"├─ bot10_broadcasts     : {bot10_broadcasts_count:,} records\n"
             f"├─ bot10_user_tracking  : {bot10_user_tracking_count:,} records\n"
             f"├─ bot10_backups        : {bot10_backups_count:,} records\n"
@@ -8316,23 +9740,24 @@ async def terminal_bot10_view(callback: types.CallbackQuery, state: FSMContext):
             f"└─ Open Tickets         : {open_tickets:,}\n\n"
             
             f"$ total_database_records\n"
-            f"Total Records           : {total_records + bot10_broadcasts_count + bot10_user_tracking_count + bot10_backups_count + cleanup_backups_count + cleanup_logs_count:,}\n</code>\n\n"
+            f"Total Records           : {total_records + bot10_broadcasts_count + bot10_user_tracking_count + bot10_backups_count + cleanup_backups_count + cleanup_logs_count:,}\n\n"
+            f"{_st['ok'] and _storage_line or 'Storage check unavailable'}\n</code>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Admin Panel:</b> Fully operational ✅\n"
             f"<b>Live Logging:</b> All actions → Console\n"
             f"<b>Last Updated:</b> {now_local().strftime('%H:%M:%S')}\n\n"
-            "<i>💡 Bot 10 manages Bot 8 with admin tools</i>"
+            "<i>💡 Bot 2 manages Bot 1 with admin tools</i>"
         )
         
         # Add buttons
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 BOT 8 TERMINAL", callback_data="terminal_bot8")],
+            [InlineKeyboardButton(text="📱 BOT 1 TERMINAL", callback_data="terminal_bot8")],
             [InlineKeyboardButton(text="🔄 REFRESH", callback_data="terminal_bot10")]
         ])
         
         await callback.message.edit_text(bot10_terminal, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer("🎛️ Bot 10 Terminal loaded")
+        await callback.answer("🎛️ Bot 2 Terminal loaded")
         
     except Exception as e:
         error_msg = str(e).replace('<', '&lt;').replace('>', '&gt;')
@@ -8486,7 +9911,7 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
             f"🔐 Default Permissions: Broadcast, Support\n"
             f"🔒 Status: LOCKED (Inactive)\n"
             f"📅 Added: {now_local().strftime('%b %d, %Y %I:%M %p')}\n\n"
-            f"⚠️ This admin is LOCKED and cannot access Bot 10 yet!\n"
+            f"⚠️ This admin is LOCKED and cannot access Bot 2 yet!\n"
             f"💡 Use 🔒 LOCK/UNLOCK USER to activate them\n"
             f"💡 Use 🔐 PERMISSIONS to add more permissions\n"
             f"💡 Use 👔 MANAGE ROLES to change role",
@@ -8871,7 +10296,7 @@ async def process_permission_admin_id(message: types.Message, state: FSMContext)
     # Store initial permissions in state
     await state.update_data(current_permissions=current_perms.copy())
     
-    # Define all available permissions (10 Bot 10 features)
+    # Define all available permissions (10 Bot 2 features)
     all_permissions = {
         'broadcast': '📢 BROADCAST',
         'find': '🔍 FIND',
@@ -8882,7 +10307,7 @@ async def process_permission_admin_id(message: types.Message, state: FSMContext)
         'backup': '💾 BACKUP',
         'terminal': '🖥️ TERMINAL',
         'admins': '👥 ADMINS',
-        'bot8': '🤖 BOT 8 SETTINGS'
+        'bot8': '🤖 BOT 1 SETTINGS'
     }
     
     # Create toggle buttons for each permission
@@ -8947,7 +10372,7 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
         '💾 BACKUP': 'backup',
         '🖥️ TERMINAL': 'terminal',
         '👥 ADMINS': 'admins',
-        '🤖 BOT 8 SETTINGS': 'bot8'
+        '🤖 BOT 1 SETTINGS': 'bot8'
     }
     
     # Handle SAVE CHANGES
@@ -9032,7 +10457,7 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
         'backup': '💾 BACKUP',
         'terminal': '🖥️ TERMINAL',
         'admins': '👥 ADMINS',
-        'bot8': '🤖 BOT 8 SETTINGS'
+        'bot8': '🤖 BOT 1 SETTINGS'
     }
     
     perm_buttons = []
@@ -9349,7 +10774,7 @@ async def process_role_selection(message: types.Message, state: FSMContext):
                 "banned_at": now_local(),
                 "reason": "Banned by master admin",
                 "status": "banned",
-                "scope": "bot10"  # Only blocks Bot 10 admin access, NOT Bot 8
+                "scope": "bot2"  # Only blocks Bot 2 admin access, NOT Bot 1
             }
             try:
                 col_banned_users.update_one(
@@ -9357,13 +10782,13 @@ async def process_role_selection(message: types.Message, state: FSMContext):
                     {"$setOnInsert": ban_doc},
                     upsert=True
                 )
-                log_action("🚫 ADMIN BANNED (BOT10)", message.from_user.id, f"Banned admin from Bot 10: {user_id}")
+                log_action("🚫 ADMIN BANNED (BOT10)", message.from_user.id, f"Banned admin from Bot 2: {user_id}")
                 await message.answer(
-                    f"🚫 **ADMIN BANNED FROM BOT 10**\n\n"
+                    f"🚫 **ADMIN BANNED FROM BOT 2**\n\n"
                     f"👤 User ID: `{user_id}`\n"
                     f"📅 Banned: {now_local().strftime('%B %d, %Y — %I:%M %p')}\n\n"
-                    f"This user can no longer access Bot 10 admin panel.\n"
-                    f"Their Bot 8 access is **NOT affected**.",
+                    f"This user can no longer access Bot 2 admin panel.\n"
+                    f"Their Bot 1 access is **NOT affected**.",
                     reply_markup=get_admin_menu(),
                     parse_mode="Markdown"
                 )
@@ -9378,7 +10803,7 @@ async def process_role_selection(message: types.Message, state: FSMContext):
                     f"✅ **USER UNBANNED**\n\n"
                     f"👤 User ID: `{user_id}`\n"
                     f"📅 Unbanned: {now_local().strftime('%B %d, %Y — %I:%M %p')}\n\n"
-                    f"This user can now access Bot 8 again.",
+                    f"This user can now access Bot 1 again.",
                     reply_markup=get_admin_menu(),
                     parse_mode="Markdown"
                 )
@@ -9464,7 +10889,7 @@ async def process_role_selection(message: types.Message, state: FSMContext):
             "• Full oversight of administrative operations\n"
             "• Management of broadcasts, support teams & junior admins\n"
             "• Enforcement of system integrity and security protocols\n"
-            "• Access to all Bot 10 management features\n\n"
+            "• Access to all Bot 2 management features\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "⚡ This is a position of significant trust.\n"
             "Execute your responsibilities with precision and discipline.\n\n"
@@ -9692,7 +11117,7 @@ async def _send_lock_unlock_page(message: types.Message, state: FSMContext, page
 
     await message.answer(
         f"🔒 LOCK/UNLOCK ADMIN\n\n"
-        f"🔒 = LOCKED (Inactive - Cannot access Bot 10)\n"
+        f"🔒 = LOCKED (Inactive - Cannot access Bot 2)\n"
         f"🔓 = UNLOCKED (Active - Full access)\n\n"
         f"Select admin to toggle lock status:\n"
         f"Showing {start_idx + 1}-{end_idx} of {len(admins)} admins"
@@ -9842,7 +11267,7 @@ async def execute_lock_action(message: types.Message, state: FSMContext):
                 "**Your Authority:**\n"
                 "• Full oversight of administrative operations\n"
                 "• Management of broadcasts, support teams & junior admins\n"
-                "• Access to all Bot 10 management features\n\n"
+                "• Access to all Bot 2 management features\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 "⚡ Use /start to access your command menu.\n\n"
                 "_— MSA NODE Systems_"
@@ -9905,7 +11330,7 @@ async def execute_lock_action(message: types.Message, state: FSMContext):
         f"✅ STATUS UPDATED\n\n"
         f"👤 User: {user_id}\n"
         f"{icon} Status: {status_text}\n\n"
-        f"{'⚠️ This admin CANNOT access Bot 10 until unlocked!' if new_lock else '✅ This admin can now access Bot 10!'}"
+        f"{'⚠️ This admin CANNOT access Bot 2 until unlocked!' if new_lock else '✅ This admin can now access Bot 2!'}"
     )
     
     # Stay on the same paginated keyboard to allow continuous toggling
@@ -10258,14 +11683,14 @@ _BOT10_GUIDE_PAGES = [
     # Page 1 / 3
     (
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  🖥️  BOT 10 ADMIN GUIDE  ·  <b>Page 1 / 3</b>\n"
+        "  🖥️  BOT 2 ADMIN GUIDE  ·  <b>Page 1 / 3</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📢  <b>BROADCAST</b>\n"
-        "Compose and deliver messages to Bot 8 users.\n\n"
+        "Compose and deliver messages to Bot 1 users.\n\n"
         "  ├─ 📤 <b>SEND BROADCAST</b>\n"
         "  │    Select by ID (brd1) or index (1).\n"
         "  │    Category: ALL · YT · IG · IGCC · YTCODE\n"
-        "  │    Sent via Bot 8 · real-time progress shown.\n"
+        "  │    Sent via Bot 1 · real-time progress shown.\n"
         "  │\n"
         "  ├─ ✏️ <b>EDIT BROADCAST</b>\n"
         "  │    Update text or media of any stored broadcast.\n"
@@ -10280,7 +11705,7 @@ _BOT10_GUIDE_PAGES = [
         "       Adds inline URL buttons (text/photo/video).\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🔍  <b>FIND</b>\n"
-        "Search any Bot 8 user by:\n"
+        "Search any Bot 1 user by:\n"
         "Telegram ID · MSA+ ID · Username\n"
         "Returns: name, join date, verification, MSA+ ID.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -10291,14 +11716,14 @@ _BOT10_GUIDE_PAGES = [
     # Page 2 / 3
     (
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  🖥️  BOT 10 ADMIN GUIDE  ·  <b>Page 2 / 3</b>\n"
+        "  🖥️  BOT 2 ADMIN GUIDE  ·  <b>Page 2 / 3</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🩺  <b>DIAGNOSIS</b>\n"
         "Full system health check — DB status, bot uptime,\n"
         "backup integrity, error counts, auto-healer stats.\n\n"
         "📸  <b>SHOOT</b>\n"
         "Send a photo, video, or document directly to a\n"
-        "specific user by Telegram ID (delivered via Bot 8).\n\n"
+        "specific user by Telegram ID (delivered via Bot 1).\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "💬  <b>SUPPORT</b>  (Ticket Management)\n\n"
         "  ├─ 🎫 <b>PENDING TICKETS</b>   Open, unresolved tickets\n"
@@ -10309,20 +11734,20 @@ _BOT10_GUIDE_PAGES = [
         "  └─ 🗑️ <b>DELETE</b>            Remove from DB\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🚫  <b>BAN CONFIG</b>\n"
-        "Ban or unban any Bot 8 user.\n"
+        "Ban or unban any Bot 1 user.\n"
         "  ├─ Permanent or timed ban.\n"
-        "  ├─ Scope = bot10 — does NOT affect normal\n"
-        "  │    Bot 8 user experience outside admin context.\n"
-        "  └─ Unban restores full Bot 8 access instantly.\n\n"
+        "  ├─ Scope = bot2 — does NOT affect normal\n"
+        "  │    Bot 1 user experience outside admin context.\n"
+        "  └─ Unban restores full Bot 1 access instantly.\n\n"
         "📋  <b>FEATURE SUSPEND</b>\n"
-        "Disable individual Bot 8 features per user:\n"
+        "Disable individual Bot 1 features per user:\n"
         "SEARCH_CODE · DASHBOARD · RULES · GUIDE\n"
         "User sees 'Feature Suspended' when accessing them."
     ),
     # Page 3 / 3
     (
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  🖥️  BOT 10 ADMIN GUIDE  ·  <b>Page 3 / 3</b>\n"
+        "  🖥️  BOT 2 ADMIN GUIDE  ·  <b>Page 3 / 3</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "💾  <b>BACKUP</b>\n\n"
         "  ├─ 📥 <b>BACKUP NOW</b>\n"
@@ -10346,34 +11771,34 @@ _BOT10_GUIDE_PAGES = [
         "Last 50 entries, refreshed on each view.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "👥  <b>ADMINS</b>  (Owner-only)\n"
-        "Add / remove admin roles for Bot 10.\n"
+        "Add / remove admin roles for Bot 2.\n"
         "Roles: viewer (read-only) · admin (full access).\n"
         "All admin actions are audit-logged.\n\n"
         "⚠️  <b>RESET DATA</b>  (Owner-only — IRREVERSIBLE)\n"
-        "Permanently wipe Bot 8 or Bot 10 collections.\n"
+        "Permanently wipe Bot 1 or Bot 2 collections.\n"
         "Requires double confirmation + typed CONFIRM.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🌐  <b>MSA NODE Ecosystem</b>\n"
-        "Bot 10 = admin control center.\n"
-        "Bot 8  = user-facing delivery bot.\n"
+        "Bot 2 = admin control center.\n"
+        "Bot 1  = user-facing delivery bot.\n"
         "Broadcasts, bans &amp; backups managed here flow\n"
-        "through to Bot 8 automatically."
+        "through to Bot 1 automatically."
     ),
 ]
 
 _BOT8_GUIDE_FOR_BOT10 = (
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    "  📱  BOT 8 USER GUIDE  (Reference)\n"
+    "  📱  BOT 1 USER GUIDE  (Reference)\n"
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "📊 <b>DASHBOARD</b> — MSA+ ID, member since, status,\n"
-    "       live announcements from Bot 10 broadcasts.\n\n"
+    "       live announcements from Bot 2 broadcasts.\n\n"
     "🔍 <b>SEARCH CODE</b> — Enter an MSA CODE to unlock\n"
     "       exclusive content from YouTube/Instagram.\n\n"
     "📜 <b>RULES</b>  — Community guidelines &amp; policies.\n\n"
     "📚 <b>GUIDE</b>  — User manual (this reference + personal).\n\n"
     "📞 <b>SUPPORT</b> — Open a support ticket to contact admin.\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    "🔐  <b>OWNER-ONLY COMMANDS</b>  (via Bot 8 directly)\n\n"
+    "🔐  <b>OWNER-ONLY COMMANDS</b>  (via Bot 1 directly)\n\n"
     "  /start          — Launch bot &amp; regenerate main menu\n"
     "  /menu           — Show the reply keyboard\n"
     "  /resolve &lt;uid&gt;  — Resolve a user's support ticket\n"
@@ -10382,22 +11807,22 @@ _BOT8_GUIDE_FOR_BOT10 = (
     "  /health         — Bot health &amp; uptime report\n\n"
     "  ⚡ Regular users get no response — owner-exclusive.\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    "<i>For full user guide details, check Bot 8's 📚 GUIDE.</i>"
+    "<i>For full user guide details, check Bot 1's 📚 GUIDE.</i>"
 )
 
 def _guide_selector_kb() -> ReplyKeyboardMarkup:
     """Keyboard shown on guide selector screen."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📱 BOT 8 USER GUIDE")],
-            [KeyboardButton(text="🖥️ BOT 10 ADMIN GUIDE")],
+            [KeyboardButton(text="📱 BOT 1 USER GUIDE")],
+            [KeyboardButton(text="🖥️ BOT 2 ADMIN GUIDE")],
             [KeyboardButton(text="⬅️ MAIN MENU")],
         ],
         resize_keyboard=True,
     )
 
 def _guide_bot10_kb(page: int, total: int) -> ReplyKeyboardMarkup:
-    """Navigation keyboard for the paginated Bot 10 guide."""
+    """Navigation keyboard for the paginated Bot 2 guide."""
     row_nav = []
     if page > 1:
         row_nav.append(KeyboardButton(text="⬅️ PREV"))
@@ -10411,7 +11836,7 @@ def _guide_bot10_kb(page: int, total: int) -> ReplyKeyboardMarkup:
 
 @dp.message(F.text == "📖 GUIDE")
 async def guide_handler(message: types.Message, state: FSMContext):
-    """Show guide selector — Bot 8 Guide or Bot 10 Admin Guide."""
+    """Show guide selector — Bot 1 Guide or Bot 2 Admin Guide."""
     log_action("📖 GUIDE", message.from_user.id, "Accessed guide selector")
     await state.set_state(GuideStates.selecting)
     await message.answer(
@@ -10419,19 +11844,19 @@ async def guide_handler(message: types.Message, state: FSMContext):
         "  <b>📖 GUIDE — SELECT</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Which guide would you like to view?\n\n"
-        "📱 <b>BOT 8 USER GUIDE</b>\n"
-        "   Full user manual for Bot 8 — features,\n"
+        "📱 <b>BOT 1 USER GUIDE</b>\n"
+        "   Full user manual for Bot 1 — features,\n"
         "   MSA CODE search, owner commands &amp; more.\n\n"
-        "🖥️ <b>BOT 10 ADMIN GUIDE</b>\n"
+        "🖥️ <b>BOT 2 ADMIN GUIDE</b>\n"
         "   Complete admin reference — every feature,\n"
         "   button, and system explained (3 pages).",
         parse_mode="HTML",
         reply_markup=_guide_selector_kb(),
     )
 
-@dp.message(GuideStates.selecting, F.text == "📱 BOT 8 USER GUIDE")
+@dp.message(GuideStates.selecting, F.text == "📱 BOT 1 USER GUIDE")
 async def guide_show_bot8_from_bot10(message: types.Message, state: FSMContext):
-    """Show Bot 8 user guide from inside Bot 10."""
+    """Show Bot 1 user guide from inside Bot 2."""
     await state.set_state(GuideStates.viewing_bot8)
     await message.answer(
         _BOT8_GUIDE_FOR_BOT10,
@@ -10442,9 +11867,9 @@ async def guide_show_bot8_from_bot10(message: types.Message, state: FSMContext):
         ),
     )
 
-@dp.message(GuideStates.selecting, F.text == "🖥️ BOT 10 ADMIN GUIDE")
+@dp.message(GuideStates.selecting, F.text == "🖥️ BOT 2 ADMIN GUIDE")
 async def guide_show_bot10_page1(message: types.Message, state: FSMContext):
-    """Start paginated Bot 10 admin guide at page 1."""
+    """Start paginated Bot 2 admin guide at page 1."""
     page = 1
     await state.set_state(GuideStates.viewing_bot10)
     await state.update_data(guide_page=page)
@@ -10486,10 +11911,10 @@ async def guide_back_to_menu(message: types.Message, state: FSMContext):
         "  <b>📖 GUIDE — SELECT</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Which guide would you like to view?\n\n"
-        "📱 <b>BOT 8 USER GUIDE</b>\n"
-        "   Full user manual for Bot 8 — features,\n"
+        "📱 <b>BOT 1 USER GUIDE</b>\n"
+        "   Full user manual for Bot 1 — features,\n"
         "   MSA CODE search, owner commands &amp; more.\n\n"
-        "🖥️ <b>BOT 10 ADMIN GUIDE</b>\n"
+        "🖥️ <b>BOT 2 ADMIN GUIDE</b>\n"
         "   Complete admin reference — every feature,\n"
         "   button, and system explained (3 pages).",
         parse_mode="HTML",
@@ -10506,7 +11931,7 @@ async def reset_data_handler(message: types.Message, state: FSMContext):
 
     type_kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔴 RESET BOT 8"), KeyboardButton(text="🔴 RESET BOT 10")],
+            [KeyboardButton(text="🔴 RESET BOT 1"), KeyboardButton(text="🔴 RESET BOT 2")],
             [KeyboardButton(text="❌ CANCEL")]
         ],
         resize_keyboard=True
@@ -10514,11 +11939,11 @@ async def reset_data_handler(message: types.Message, state: FSMContext):
     await message.answer(
         "<b>⚠️ RESET DATA — SELECT BOT</b>\n\n"
         "Choose which bot's data to permanently erase:\n\n"
-        "🔴 <b>RESET BOT 8</b>\n"
-        "   user_verification, msa_ids, bot9_pdfs,\n"
-        "   bot9_ig_content, support_tickets,\n"
+        "🔴 <b>RESET BOT 1</b>\n"
+        "   user_verification, msa_ids, bot3_pdfs,\n"
+        "   bot3_ig_content, support_tickets,\n"
         "   banned_users, suspended_features\n\n"
-        "🔴 <b>RESET BOT 10</b>\n"
+        "🔴 <b>RESET BOT 2</b>\n"
         "   broadcasts, user_tracking, cleanup_backups,\n"
         "   cleanup_logs, access_attempts, bot8_settings\n\n"
         "<b>⚠️ ALL DELETIONS ARE PERMANENT AND IRREVERSIBLE!</b>",
@@ -10542,23 +11967,23 @@ async def reset_type_selected(message: types.Message, state: FSMContext):
         resize_keyboard=True
     )
 
-    if choice == "🔴 RESET BOT 8":
+    if choice == "🔴 RESET BOT 1":
         await state.update_data(reset_type="bot8")
         await message.answer(
-            "<b>⚠️ RESET BOT 8 DATA</b>\n\n"
+            "<b>⚠️ RESET BOT 1 DATA</b>\n\n"
             "Will permanently delete:\n"
-            "🗑️ user_verification\n🗑️ msa_ids\n🗑️ bot9_pdfs\n"
-            "🗑️ bot9_ig_content\n🗑️ support_tickets\n"
+            "🗑️ user_verification\n🗑️ msa_ids\n🗑️ bot3_pdfs\n"
+            "🗑️ bot3_ig_content\n🗑️ support_tickets\n"
             "🗑️ banned_users\n🗑️ suspended_features\n\n"
             "<b>⚠️ IRREVERSIBLE! Press ✅ CONFIRM RESET to proceed.</b>",
             parse_mode="HTML", reply_markup=confirm_kb
         )
         await state.set_state(ResetDataStates.waiting_for_first_confirm)
 
-    elif choice == "🔴 RESET BOT 10":
+    elif choice == "🔴 RESET BOT 2":
         await state.update_data(reset_type="bot10")
         await message.answer(
-            "<b>⚠️ RESET BOT 10 DATA</b>\n\n"
+            "<b>⚠️ RESET BOT 2 DATA</b>\n\n"
             "Will permanently delete:\n"
             "🗑️ bot10_broadcasts\n🗑️ bot10_user_tracking\n"
             "🗑️ cleanup_backups\n🗑️ cleanup_logs\n"
@@ -10571,30 +11996,30 @@ async def reset_type_selected(message: types.Message, state: FSMContext):
     else:
         await message.answer("❌ Invalid choice. Please select from the menu.", parse_mode="HTML")
 
-# ── Bot10 reset first confirm ──
+# ── Bot2 reset first confirm ──
 @dp.message(ResetDataStates.bot10_first_confirm)
 async def reset_bot10_first_confirm(message: types.Message, state: FSMContext):
-    """Bot10 first confirmation"""
+    """Bot2 first confirmation"""
     if message.text != "✅ CONFIRM RESET":
         await message.answer("✅ Cancelled. No data deleted.", reply_markup=await get_main_menu(message.from_user.id))
         await state.clear()
         return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True)
     await message.answer(
-        "<b>🚨 LAST WARNING — BOT 10 DATA</b>\n\n"
-        "Type <code>CONFIRM</code> to permanently delete all Bot 10 data.",
+        "<b>🚨 LAST WARNING — BOT 2 DATA</b>\n\n"
+        "Type <code>CONFIRM</code> to permanently delete all Bot 2 data.",
         parse_mode="HTML", reply_markup=cancel_kb
     )
     await state.set_state(ResetDataStates.bot10_final_confirm)
 
 @dp.message(ResetDataStates.bot10_final_confirm)
 async def reset_bot10_final_confirm(message: types.Message, state: FSMContext):
-    """Bot10 final deletion"""
+    """Bot2 final deletion"""
     if message.text.strip() != "CONFIRM":
         await message.answer("✅ Cancelled. No data deleted.", reply_markup=await get_main_menu(message.from_user.id))
         await state.clear()
         return
-    status_msg = await message.answer("<b>🗑️ DELETING ALL BOT 10 DATA...</b>\n\n⏳ Please wait...", parse_mode="HTML")
+    status_msg = await message.answer("<b>🗑️ DELETING ALL BOT 2 DATA...</b>\n\n⏳ Please wait...", parse_mode="HTML")
     try:
         r1 = col_broadcasts.delete_many({})
         r2 = col_user_tracking.delete_many({})
@@ -10604,7 +12029,7 @@ async def reset_bot10_final_confirm(message: types.Message, state: FSMContext):
         r6 = col_bot8_settings.delete_many({})
         total = r1.deleted_count + r2.deleted_count + r3.deleted_count + r4.deleted_count + r5.deleted_count + r6.deleted_count
         await status_msg.edit_text(
-            "<b>✅ ALL BOT 10 DATA DELETED</b>\n\n"
+            "<b>✅ ALL BOT 2 DATA DELETED</b>\n\n"
             "<b>🗑️ DELETION REPORT:</b>\n\n"
             f"🗑️ bot10_broadcasts: {r1.deleted_count:,} deleted\n"
             f"🗑️ bot10_user_tracking: {r2.deleted_count:,} deleted\n"
@@ -10614,15 +12039,15 @@ async def reset_bot10_final_confirm(message: types.Message, state: FSMContext):
             f"🗑️ bot8_settings: {r6.deleted_count:,} deleted\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<b>Total Records Deleted:</b> {total:,}\n"
-            f"<b>Database Status:</b> All Bot 10 collections cleared ✅\n\n"
+            f"<b>Database Status:</b> All Bot 2 collections cleared ✅\n\n"
             f"<i>⏰ Completed at {now_local().strftime('%Y-%m-%d %H:%M:%S')}</i>",
             parse_mode="HTML"
         )
         await message.answer(
-            "<b>🔄 Bot 10 Reset Complete</b>\n\nAll Bot 10 data permanently deleted.",
+            "<b>🔄 Bot 2 Reset Complete</b>\n\nAll Bot 2 data permanently deleted.",
             parse_mode="HTML", reply_markup=await get_main_menu(message.from_user.id)
         )
-        print(f"\n🚨 BOT 10 DATA RESET by {message.from_user.id} — {total:,} records deleted at {now_local()}\n")
+        print(f"\n🚨 BOT 2 DATA RESET by {message.from_user.id} — {total:,} records deleted at {now_local()}\n")
     except Exception as e:
         await status_msg.edit_text(f"<b>❌ DELETION ERROR</b>\n\n{str(e)}", parse_mode="HTML")
         await message.answer("⚠️ Error during reset.", reply_markup=await get_main_menu(message.from_user.id))
@@ -10653,15 +12078,15 @@ async def reset_all_final_confirm(message: types.Message, state: FSMContext):
         return
     status_msg = await message.answer("<b>☢️ DELETING ALL DATA...</b>\n\n⏳ Please wait...", parse_mode="HTML")
     try:
-        # Bot 8 collections
+        # Bot 1 collections
         r1 = col_user_verification.delete_many({})
         r2 = col_msa_ids.delete_many({})
-        r3 = col_bot9_pdfs.delete_many({})
-        r4 = col_bot9_ig_content.delete_many({})
+        r3 = col_bot3_pdfs.delete_many({})
+        r4 = col_bot3_ig_content.delete_many({})
         r5 = col_support_tickets.delete_many({})
         r6 = col_banned_users.delete_many({})
         r7 = col_suspended_features.delete_many({})
-        # Bot 10 collections
+        # Bot 2 collections
         r8 = col_broadcasts.delete_many({})
         r9 = col_user_tracking.delete_many({})
         r10 = col_cleanup_backups.delete_many({})
@@ -10672,15 +12097,15 @@ async def reset_all_final_confirm(message: types.Message, state: FSMContext):
         await status_msg.edit_text(
             "<b>☢️ COMPLETE WIPE DONE</b>\n\n"
             "<b>🗑️ DELETION REPORT:</b>\n\n"
-            f"<b>— Bot 8 —</b>\n"
+            f"<b>— Bot 1 —</b>\n"
             f"🗑️ user_verification: {r1.deleted_count:,}\n"
             f"🗑️ msa_ids: {r2.deleted_count:,}\n"
-            f"🗑️ bot9_pdfs: {r3.deleted_count:,}\n"
-            f"🗑️ bot9_ig_content: {r4.deleted_count:,}\n"
+            f"🗑️ bot3_pdfs: {r3.deleted_count:,}\n"
+            f"🗑️ bot3_ig_content: {r4.deleted_count:,}\n"
             f"🗑️ support_tickets: {r5.deleted_count:,}\n"
             f"🗑️ banned_users: {r6.deleted_count:,}\n"
             f"🗑️ suspended_features: {r7.deleted_count:,}\n\n"
-            f"<b>— Bot 10 —</b>\n"
+            f"<b>— Bot 2 —</b>\n"
             f"🗑️ bot10_broadcasts: {r8.deleted_count:,}\n"
             f"🗑️ bot10_user_tracking: {r9.deleted_count:,}\n"
             f"🗑️ cleanup_backups: {r10.deleted_count:,}\n"
@@ -10703,7 +12128,7 @@ async def reset_all_final_confirm(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Error during wipe.", reply_markup=await get_main_menu(message.from_user.id))
     await state.clear()
 
-# ── Bot8 reset first confirm (original) ──
+# ── Bot1 reset first confirm (original) ──
 @dp.message(ResetDataStates.waiting_for_first_confirm)
 async def reset_data_first_confirm(message: types.Message, state: FSMContext):
     """First confirmation for reset data"""
@@ -10728,7 +12153,7 @@ async def reset_data_first_confirm(message: types.Message, state: FSMContext):
     final_warning = (
         "<b>⚠️ FINAL CONFIRMATION REQUIRED</b>\n\n"
         "<b>🚨 LAST WARNING 🚨</b>\n\n"
-        "You are about to permanently delete ALL Bot 8 data.\n\n"
+        "You are about to permanently delete ALL Bot 1 data.\n\n"
         "<b>⚠️ THIS IS IRREVERSIBLE!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>FINAL STEP:</b>\n"
@@ -10741,7 +12166,7 @@ async def reset_data_first_confirm(message: types.Message, state: FSMContext):
 
 @dp.message(ResetDataStates.waiting_for_final_confirm)
 async def reset_data_final_confirm(message: types.Message, state: FSMContext):
-    """Final confirmation - actually delete all Bot 8 data"""
+    """Final confirmation - actually delete all Bot 1 data"""
     # Strict matching for "CONFIRM"
     if message.text.strip() != "CONFIRM":
         await message.answer(
@@ -10755,7 +12180,7 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
     
     # Both confirmations passed - proceed with deletion
     status_msg = await message.answer(
-        "<b>🗑️ DELETING ALL BOT 8 DATA...</b>\n\n"
+        "<b>🗑️ DELETING ALL BOT 1 DATA...</b>\n\n"
         "⏳ Please wait...",
         parse_mode="HTML"
     )
@@ -10765,8 +12190,8 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
         counts_before = {
             "user_verification": col_user_verification.count_documents({}),
             "msa_ids": col_msa_ids.count_documents({}),
-            "bot9_pdfs": col_bot9_pdfs.count_documents({}),
-            "bot9_ig_content": col_bot9_ig_content.count_documents({}),
+            "bot3_pdfs": col_bot3_pdfs.count_documents({}),
+            "bot3_ig_content": col_bot3_ig_content.count_documents({}),
             "support_tickets": col_support_tickets.count_documents({}),
             "banned_users": col_banned_users.count_documents({}),
             "suspended_features": col_suspended_features.count_documents({})
@@ -10774,11 +12199,11 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
         
         total_before = sum(counts_before.values())
         
-        # Delete all Bot 8 data
+        # Delete all Bot 1 data
         result_user_verification = col_user_verification.delete_many({})
         result_msa_ids = col_msa_ids.delete_many({})
-        result_bot9_pdfs = col_bot9_pdfs.delete_many({})
-        result_bot9_ig_content = col_bot9_ig_content.delete_many({})
+        result_bot3_pdfs = col_bot3_pdfs.delete_many({})
+        result_bot3_ig_content = col_bot3_ig_content.delete_many({})
         result_support_tickets = col_support_tickets.delete_many({})
         result_banned_users = col_banned_users.delete_many({})
         result_suspended_features = col_suspended_features.delete_many({})
@@ -10787,8 +12212,8 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
         counts_after = {
             "user_verification": col_user_verification.count_documents({}),
             "msa_ids": col_msa_ids.count_documents({}),
-            "bot9_pdfs": col_bot9_pdfs.count_documents({}),
-            "bot9_ig_content": col_bot9_ig_content.count_documents({}),
+            "bot3_pdfs": col_bot3_pdfs.count_documents({}),
+            "bot3_ig_content": col_bot3_ig_content.count_documents({}),
             "support_tickets": col_support_tickets.count_documents({}),
             "banned_users": col_banned_users.count_documents({}),
             "suspended_features": col_suspended_features.count_documents({})
@@ -10799,33 +12224,33 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
         
         # Success message
         success_msg = (
-            "<b>✅ ALL BOT 8 DATA DELETED</b>\n\n"
+            "<b>✅ ALL BOT 1 DATA DELETED</b>\n\n"
             "<b>🗑️ DELETION REPORT:</b>\n\n"
             f"🗑️ user_verification: {result_user_verification.deleted_count:,} deleted\n"
             f"🗑️ msa_ids: {result_msa_ids.deleted_count:,} deleted\n"
-            f"🗑️ bot9_pdfs: {result_bot9_pdfs.deleted_count:,} deleted\n"
-            f"🗑️ bot9_ig_content: {result_bot9_ig_content.deleted_count:,} deleted\n"
+            f"🗑️ bot3_pdfs: {result_bot3_pdfs.deleted_count:,} deleted\n"
+            f"🗑️ bot3_ig_content: {result_bot3_ig_content.deleted_count:,} deleted\n"
             f"🗑️ support_tickets: {result_support_tickets.deleted_count:,} deleted\n"
             f"🗑️ banned_users: {result_banned_users.deleted_count:,} deleted\n"
             f"🗑️ suspended_features: {result_suspended_features.deleted_count:,} deleted\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<b>Total Records Deleted:</b> {total_deleted:,}\n"
-            f"<b>Database Status:</b> All Bot 8 collections cleared ✅\n\n"
+            f"<b>Database Status:</b> All Bot 1 collections cleared ✅\n\n"
             f"<i>⏰ Completed at {now_local().strftime('%Y-%m-%d %H:%M:%S')}</i>"
         )
         
         await status_msg.edit_text(success_msg, parse_mode="HTML")
         await message.answer(
-            "<b>🔄 Bot 8 Reset Complete</b>\n\n"
-            "All Bot 8 data has been permanently deleted.\n"
-            "Bot 8 is now in fresh state.",
+            "<b>🔄 Bot 1 Reset Complete</b>\n\n"
+            "All Bot 1 data has been permanently deleted.\n"
+            "Bot 1 is now in fresh state.",
             parse_mode="HTML",
             reply_markup=await get_main_menu(message.from_user.id)
         )
         
         # Log the reset action
         print(f"\n🚨 ═══════════════════════════════════════")
-        print(f"🚨 BOT 8 DATA RESET")
+        print(f"🚨 BOT 1 DATA RESET")
         print(f"🚨 Admin: {message.from_user.id}")
         print(f"🚨 Total Deleted: {total_deleted:,} records")
         print(f"🚨 Timestamp: {now_local().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -10854,10 +12279,9 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
 async def automated_database_cleanup():
     """
     Automated cleanup that runs daily at 3 AM
-    - Cleans resolved tickets older than 60 days
-    - Cleans broadcasts older than 90 days
+    - Cleans broadcasts older than 90 days (backed up before deletion)
+    - Support tickets are PERMANENT — never auto-deleted
     - Auto-backup to MongoDB (cloud-safe, works on Render/Heroku/Railway)
-    - Safe, conservative, no data loss
     """
     now = now_local()
     print(f"\n🧹 ═══════════════════════════════════════")
@@ -10874,34 +12298,27 @@ async def automated_database_cleanup():
     }
     
     try:
-        # === GET DATA TO BACKUP ===
-        old_resolved_tickets = list(col_support_tickets.find({
-            "status": "resolved",
-            "resolved_at": {"$lt": now - timedelta(days=60)}
-        }))
-        
+        # === GET BROADCASTS TO BACKUP BEFORE DELETION ===
+        # Tickets are permanent records — never backed-up-then-deleted here
         old_broadcasts = list(col_broadcasts.find({
             "created_at": {"$lt": now - timedelta(days=90)}
         }))
         
-        # === SAVE BACKUP TO MONGODB (Cloud-Safe!) ===
-        if old_resolved_tickets or old_broadcasts:
+        # === SAVE BROADCAST BACKUP TO MONGODB (Cloud-Safe!) ===
+        if old_broadcasts:
             backup_doc = {
                 "backup_date": now,
-                "tickets_count": len(old_resolved_tickets),
                 "broadcasts_count": len(old_broadcasts),
-                "tickets": old_resolved_tickets,
                 "broadcasts": old_broadcasts
             }
             
             col_cleanup_backups.insert_one(backup_doc)
             cleanup_stats['backup_created'] = True
             
-            print(f"💾 Backup saved to MongoDB (cloud-safe)")
-            print(f"   📄 Tickets backed up: {len(old_resolved_tickets)}")
-            print(f"   📄 Broadcasts backed up: {len(old_broadcasts)}\n")
+            print(f"💾 Broadcast backup saved to MongoDB (cloud-safe)")
+            print(f"   📢 Broadcasts backed up: {len(old_broadcasts)}\n")
         else:
-            print(f"📦 No data to backup (nothing old enough to delete)\n")
+            print(f"📦 No broadcasts old enough to delete\n")
         
         # === CLEANUP OLD BACKUPS IN MONGODB (Keep only last 30) ===
         backup_count = col_cleanup_backups.count_documents({})
@@ -10919,18 +12336,9 @@ async def automated_database_cleanup():
         else:
             print(f"📦 MongoDB backups: {backup_count}/30 (no cleanup needed)\n")
         
-        # === CLEANUP OLD RESOLVED TICKETS (60+ days) ===
-        cutoff_date_tickets = now - timedelta(days=60)
-        result_tickets = col_support_tickets.delete_many({
-            "status": "resolved",
-            "resolved_at": {"$lt": cutoff_date_tickets}
-        })
-        cleanup_stats['tickets_deleted'] = result_tickets.deleted_count
-        
-        if result_tickets.deleted_count > 0:
-            print(f"🎫 Deleted {result_tickets.deleted_count} old resolved tickets (>60 days)")
-        else:
-            print(f"🎫 No old resolved tickets to delete")
+        # === TICKETS ARE PERMANENT — no auto-deletion ever ===
+        cleanup_stats['tickets_deleted'] = 0
+        print(f"🎫 Support tickets: permanent records — no auto-deletion")
         
         # === CLEANUP OLD BROADCASTS (90+ days) ===
         cutoff_date_broadcasts = now - timedelta(days=90)
@@ -10999,11 +12407,11 @@ async def schedule_daily_cleanup():
 
 
 # ==========================================
-# BOT 8 BACKUP HANDLERS
+# BOT 1 BACKUP HANDLERS
 # ==========================================
 
 async def create_backup_bot8(backup_type="manual", admin_id=None, progress_callback=None):
-    """Create Bot 8 specific backup: msa_ids, user_verification, user_tracking, permanently_banned_msa."""
+    """Create Bot 1 specific backup: msa_ids, user_verification, user_tracking, permanently_banned_msa."""
     import json as _json
     now = now_local()
     timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -11011,7 +12419,7 @@ async def create_backup_bot8(backup_type="manual", admin_id=None, progress_callb
     collections_to_backup = [
         ("msa_ids", col_msa_ids),
         ("user_verification", col_user_verification),
-        ("user_tracking", col_user_tracking),
+        ("bot10_user_tracking", col_user_tracking),
         ("permanently_banned_msa", col_permanently_banned_msa),
     ]
     collections_data = {}
@@ -11049,8 +12457,27 @@ async def create_backup_bot8(backup_type="manual", admin_id=None, progress_callb
             "total_records": total_records,
             "collection_counts": collection_counts,
             "processing_time": processing_time,
-            "collections": collections_data,
+            # NOTE: full collections_data NOT stored here — keeps backup docs tiny
+            # Full data lives in col_bot8_restore_data (single-doc, always-replaced below)
         }
+        # === STORE FULL DATA FOR RESTORE (single always-replaced doc) ===
+        # Storing full data in every backup doc (×60) would hit the 512MB free-tier limit.
+        # Instead: one doc, always overwritten — restore reads from here, not backup history.
+        try:
+            col_bot8_restore_data.replace_one(
+                {"_id": "bot8_latest"},
+                {
+                    "_id": "bot8_latest",
+                    "backup_date": now,
+                    "timestamp": timestamp,
+                    "total_records": total_records,
+                    "collection_counts": collection_counts,
+                    "collections": collections_data,
+                },
+                upsert=True,
+            )
+        except Exception as _rs_err:
+            print(f"⚠️ Bot1 restore snapshot warning: {_rs_err}")
         result = col_bot8_backups.insert_one(backup_summary)
         # Keep max 60 backups
         backup_count = col_bot8_backups.count_documents({})
@@ -11071,26 +12498,26 @@ async def create_backup_bot8(backup_type="manual", admin_id=None, progress_callb
         return {"success": False, "error": str(e), "total_records": 0}
 
 
-@dp.message(F.text == "🤖 BOT 8 BACKUP")
+@dp.message(F.text == "🤖 BOT 1 BACKUP")
 async def bot8_backup_now_handler(message: types.Message, state: FSMContext):
-    """Create Bot 8 manual backup — msa_ids, verifications, user tracking."""
+    """Create Bot 1 manual backup — msa_ids, verifications, user tracking."""
     if not await has_permission(message.from_user.id, "backup"):
         return
-    status_msg = await message.answer("⏳ <b>Bot 8 Backup Starting...</b>", parse_mode="HTML")
+    status_msg = await message.answer("⏳ <b>Bot 1 Backup Starting...</b>", parse_mode="HTML")
     try:
         async def progress_update(status_text):
             try:
-                await status_msg.edit_text(f"⏳ <b>Bot 8 Backup in Progress...</b>\n\n{status_text}", parse_mode="HTML")
+                await status_msg.edit_text(f"⏳ <b>Bot 1 Backup in Progress...</b>\n\n{status_text}", parse_mode="HTML")
             except:
                 pass
         backup_data = await create_backup_bot8(backup_type="manual", admin_id=message.from_user.id, progress_callback=progress_update)
         if not backup_data.get("success"):
             err = backup_data.get("error", "Unknown error").replace("<", "&lt;").replace(">", "&gt;")
-            await status_msg.edit_text(f"❌ <b>BOT 8 BACKUP FAILED</b>\n\n{err}", parse_mode="HTML")
+            await status_msg.edit_text(f"❌ <b>BOT 1 BACKUP FAILED</b>\n\n{err}", parse_mode="HTML")
             return
         processing_time = backup_data.get("processing_time", 0)
         timestamp = backup_data["timestamp"]
-        await status_msg.edit_text(f"✅ <b>Bot 8 backup stored!</b> Preparing download...", parse_mode="HTML")
+        await status_msg.edit_text(f"✅ <b>Bot 1 backup stored!</b> Preparing download...", parse_mode="HTML")
         import json as _j
         complete_json = _j.dumps(backup_data, indent=2, ensure_ascii=False, default=str)
         complete_size = len(complete_json.encode("utf-8"))
@@ -11107,7 +12534,7 @@ async def bot8_backup_now_handler(message: types.Message, state: FSMContext):
         await message.answer_document(
             complete_file,
             caption=(
-                f"📦 <b>BOT 8 COMPLETE BACKUP</b>\n\n"
+                f"📦 <b>BOT 1 COMPLETE BACKUP</b>\n\n"
                 f"📅 Date: {timestamp}\n"
                 f"📊 Total Records: {backup_data['total_records']:,}\n"
                 f"💾 Size: {size_text}\n"
@@ -11115,13 +12542,13 @@ async def bot8_backup_now_handler(message: types.Message, state: FSMContext):
                 f"<b>Collections:</b>\n"
                 f"🆔 msa_ids: {cc.get('msa_ids',0):,}\n"
                 f"✅ user_verification: {cc.get('user_verification',0):,}\n"
-                f"📊 user_tracking: {cc.get('user_tracking',0):,}\n"
+                f"📊 user_tracking: {cc.get('bot10_user_tracking',0):,}\n"
                 f"🚫 permanently_banned: {cc.get('permanently_banned_msa',0):,}"
             ),
             parse_mode="HTML"
         )
         await status_msg.edit_text(
-            f"✅ <b>BOT 8 BACKUP COMPLETE</b>\n\n"
+            f"✅ <b>BOT 1 BACKUP COMPLETE</b>\n\n"
             f"📅 {timestamp}\n"
             f"📊 {backup_data['total_records']:,} records\n"
             f"⏱️ {processing_time:.2f}s\n"
@@ -11130,19 +12557,19 @@ async def bot8_backup_now_handler(message: types.Message, state: FSMContext):
         )
     except Exception as e:
         err = str(e).replace("<", "&lt;").replace(">", "&gt;")
-        await status_msg.edit_text(f"❌ <b>BOT 8 BACKUP ERROR</b>\n\n{err}", parse_mode="HTML")
+        await status_msg.edit_text(f"❌ <b>BOT 1 BACKUP ERROR</b>\n\n{err}", parse_mode="HTML")
 
 
-@dp.message(F.text == "📊 BOT 8 HISTORY")
+@dp.message(F.text == "📊 BOT 1 HISTORY")
 async def bot8_history_handler(message: types.Message):
-    """Show Bot 8 backup history grouped by month/year."""
+    """Show Bot 1 backup history grouped by month/year."""
     if not await has_permission(message.from_user.id, "backup"):
         return
     try:
         total_backups = col_bot8_backups.count_documents({})
         if total_backups == 0:
             await message.answer(
-                "📊 <b>BOT 8 BACKUP HISTORY</b>\n\nNo backups yet. Use 🤖 BOT 8 BACKUP to create one.",
+                "📊 <b>BOT 1 BACKUP HISTORY</b>\n\nNo backups yet. Use 🤖 BOT 1 BACKUP to create one.",
                 parse_mode="HTML"
             )
             return
@@ -11153,7 +12580,7 @@ async def bot8_history_handler(message: types.Message):
         for b in backups:
             key = b.get("month_year_key", b.get("month", "Unknown") + "_" + str(b.get("year", "")))
             grouped[key].append(b)
-        msg = f"📊 <b>BOT 8 BACKUP HISTORY</b> ({total_backups} total)\n\n"
+        msg = f"📊 <b>BOT 1 BACKUP HISTORY</b> ({total_backups} total)\n\n"
         for month_key, blist in grouped.items():
             label = month_key.replace("_", " ")
             msg += f"📅 <b>{label}</b>\n"
@@ -11164,7 +12591,7 @@ async def bot8_history_handler(message: types.Message):
                 cc = b.get("collection_counts", {})
                 msg += (
                     f"  • {dt} [{bt}] — {tr:,} records\n"
-                    f"    🆔 MSA IDs: {cc.get('msa_ids',0):,}  |  👤 Users: {cc.get('user_tracking',0):,}\n"
+                    f"    🆔 MSA IDs: {cc.get('msa_ids',0):,}  |  👤 Users: {cc.get('bot10_user_tracking',0):,}\n"
                 )
             msg += "\n"
         msg += "<i>Showing latest 20 backups</i>"
@@ -11173,8 +12600,206 @@ async def bot8_history_handler(message: types.Message):
         err = str(e).replace("<", "&lt;").replace(">", "&gt;")
         await message.answer(f"❌ <b>ERROR</b>\n\n{err}", parse_mode="HTML")
 
+
+# ==========================================
+# ♻️ RESTORE HANDLERS — BOT 1 & BOT 2
+# ==========================================
+
+def _upsert_docs(collection, docs: list, unique_key: str) -> tuple:
+    """Upsert a list of docs into a collection using unique_key as filter. Returns (inserted, skipped)."""
+    inserted = 0
+    skipped = 0
+    for doc in docs:
+        if "_id" in doc:
+            doc.pop("_id", None)  # remove old _id to avoid conflicts
+        if unique_key not in doc:
+            skipped += 1
+            continue
+        collection.update_one(
+            {unique_key: doc[unique_key]},
+            {"$setOnInsert": doc},  # only insert if not exists — never overwrite live data
+            upsert=True,
+        )
+        inserted += 1
+    return inserted, skipped
+
+
+@dp.message(F.text == "♻️ RESTORE BOT 1")
+async def restore_bot8_handler(message: types.Message, state: FSMContext):
+    """Confirm before restoring Bot 1 backup data to live collections."""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
+    # Read from dedicated restore snapshot (single-doc), NOT from backup history
+    backup = col_bot8_restore_data.find_one({"_id": "bot8_latest"})
+    if not backup:
+        await message.answer(
+            "❌ <b>NO BOT 1 RESTORE SNAPSHOT FOUND</b>\n\nCreate a backup first with 🤖 BOT 1 BACKUP.",
+            parse_mode="HTML", reply_markup=get_backup_menu()
+        )
+        return
+    ts = format_datetime(backup.get("backup_date", now_local()))
+    cc = backup.get("collection_counts", {})
+    # Pull current live counts for comparison
+    live_msa      = col_msa_ids.count_documents({})
+    live_verif    = col_user_verification.count_documents({})
+    live_tracking = col_user_tracking.count_documents({})
+    live_perm_ban = col_permanently_banned_msa.count_documents({})
+    await state.update_data(restore_target="bot8")
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ CONFIRM RESTORE", callback_data="restore_confirm:bot8"),
+        InlineKeyboardButton(text="❌ CANCEL",           callback_data="restore_cancel"),
+    ]])
+    await message.answer(
+        f"⚠️ <b>RESTORE BOT 1 — CONFIRMATION</b>\n\n"
+        f"📅 Backup: <b>{ts}</b>\n\n"
+        f"<b>Collection       Backup → Live Now</b>\n"
+        f"🆔 msa_ids:         {cc.get('msa_ids', 0):,} → {live_msa:,} live\n"
+        f"✅ user_verif:      {cc.get('user_verification', 0):,} → {live_verif:,} live\n"
+        f"📊 user_tracking:   {cc.get('bot10_user_tracking', 0):,} → {live_tracking:,} live\n"
+        f"🚫 perm_banned:     {cc.get('permanently_banned_msa', 0):,} → {live_perm_ban:,} live\n\n"
+        f"ℹ️ Only records <b>missing from live DB</b> will be added.\n"
+        f"✅ Existing live records are <b>never overwritten</b> (zero duplicates).\n\n"
+        f"Confirm restore?",
+        parse_mode="HTML", reply_markup=confirm_kb
+    )
+
+
+@dp.message(F.text == "♻️ RESTORE BOT 2")
+async def restore_bot10_handler(message: types.Message, state: FSMContext):
+    """Confirm before restoring Bot 2 backup data to live collections."""
+    if not await has_permission(message.from_user.id, "backup"):
+        return
+    snapshot = col_bot10_restore_data.find_one({"_id": "bot10_latest"})
+    if not snapshot:
+        await message.answer(
+            "❌ <b>NO BOT 2 RESTORE SNAPSHOT FOUND</b>\n\n"
+            "Run <b>🤖 BOT 2 BACKUP</b> first to create a restorable snapshot.",
+            parse_mode="HTML", reply_markup=get_backup_menu()
+        )
+        return
+    ts = format_datetime(snapshot.get("backup_date", now_local()))
+    cc = snapshot.get("collection_counts", {})
+    # Pull current live counts for comparison
+    live_bcast    = col_broadcasts.count_documents({})
+    live_tickets  = col_support_tickets.count_documents({})
+    live_banned   = col_banned_users.count_documents({})
+    live_susp     = col_suspended_features.count_documents({})
+    live_logs     = col_cleanup_logs.count_documents({})
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ CONFIRM RESTORE", callback_data="restore_confirm:bot10"),
+        InlineKeyboardButton(text="❌ CANCEL",           callback_data="restore_cancel"),
+    ]])
+    await message.answer(
+        f"⚠️ <b>RESTORE BOT 2 — CONFIRMATION</b>\n\n"
+        f"📅 Snapshot: <b>{ts}</b>\n\n"
+        f"<b>Collection         Backup → Live Now</b>\n"
+        f"📢 broadcasts:       {cc.get('bot10_broadcasts', 0):,} → {live_bcast:,} live\n"
+        f"🎫 support_tickets:  {cc.get('support_tickets', 0):,} → {live_tickets:,} live\n"
+        f"🚫 banned_users:     {cc.get('banned_users', 0):,} → {live_banned:,} live\n"
+        f"⏸ suspended:        {cc.get('suspended_features', 0):,} → {live_susp:,} live\n"
+        f"🧹 cleanup_logs:     {cc.get('cleanup_logs', 0):,} → {live_logs:,} live\n\n"
+        f"ℹ️ Only records <b>missing from live DB</b> will be added.\n"
+        f"✅ Existing live records are <b>never overwritten</b> (zero duplicates).\n\n"
+        f"Confirm restore?",
+        parse_mode="HTML", reply_markup=confirm_kb
+    )
+
+
+@dp.callback_query(F.data.startswith("restore_confirm:"))
+async def restore_confirm_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Execute the restore after admin confirmation."""
+    if not await has_permission(callback.from_user.id, "backup"):
+        await callback.answer("⛔ No permission.", show_alert=True)
+        return
+
+    target = callback.data.split(":")[1]
+    await callback.message.edit_text(f"⏳ <b>Restoring {target.upper()} data…</b>", parse_mode="HTML")
+    await callback.answer()
+
+    try:
+        if target == "bot8":
+            backup = col_bot8_restore_data.find_one({"_id": "bot8_latest"})
+            if not backup:
+                await callback.message.edit_text("❌ No Bot 1 restore snapshot found. Run 🤖 BOT 1 BACKUP first.", parse_mode="HTML")
+                return
+            cols_data = backup.get("collections", {})
+            # Bot 1 collections with their unique fields
+            restore_map = [
+                (col_msa_ids,               cols_data.get("msa_ids", []),                   "user_id"),
+                (col_user_verification,      cols_data.get("user_verification", []),         "user_id"),
+                (col_user_tracking,          cols_data.get("bot10_user_tracking", []),       "user_id"),
+                (col_permanently_banned_msa, cols_data.get("permanently_banned_msa", []),   "msa_id"),
+            ]
+        else:  # bot10
+            snapshot = col_bot10_restore_data.find_one({"_id": "bot10_latest"})
+            if not snapshot:
+                await callback.message.edit_text("❌ No Bot 2 restore snapshot found.", parse_mode="HTML")
+                return
+            cols_data = snapshot.get("collections", {})
+            # Bot 2 collections with their unique fields
+            restore_map = [
+                (col_broadcasts,         cols_data.get("bot10_broadcasts", []),  "broadcast_id"),
+                (col_support_tickets,    cols_data.get("support_tickets", []),   "user_id"),
+                (col_banned_users,       cols_data.get("banned_users", []),      "user_id"),
+                (col_suspended_features, cols_data.get("suspended_features", []), "user_id"),
+            ]
+            # cleanup_logs — use cleanup_date as unique key if available, else skip
+            for doc in cols_data.get("cleanup_logs", []):
+                doc.pop("_id", None)
+                if doc.get("cleanup_date"):
+                    col_cleanup_logs.update_one(
+                        {"cleanup_date": doc["cleanup_date"]},
+                        {"$setOnInsert": doc}, upsert=True
+                    )
+
+        # human-friendly labels for each collection entry
+        if target == "bot8":
+            col_labels = ["🆔 msa_ids", "✅ user_verification", "📊 user_tracking", "🚫 perm_banned"]
+        else:
+            col_labels = ["📢 broadcasts", "🎫 support_tickets", "🚫 banned_users", "⏸ suspended_features"]
+
+        report_lines = [f"✅ <b>RESTORE {target.upper()} COMPLETE</b>\n\n"]
+        total_restored = 0
+        total_skipped  = 0
+        for (collection, docs, key), label in zip(restore_map, col_labels):
+            if not docs:
+                live_now = collection.count_documents({})
+                report_lines.append(f"  {label}: <i>backup was empty</i> (live: {live_now:,})\n")
+                continue
+            ins, skp = _upsert_docs(collection, docs, key)
+            live_now = collection.count_documents({})
+            total_restored += ins
+            total_skipped  += skp
+            report_lines.append(
+                f"  {label}: +{ins:,} added, {skp:,} existed  (live now: {live_now:,})\n"
+            )
+
+        # cleanup_logs handled separately for bot10 — report live count
+        if target == "bot10":
+            live_logs_now = col_cleanup_logs.count_documents({})
+            report_lines.append(f"  🧹 cleanup_logs: handled  (live now: {live_logs_now:,})\n")
+
+        report_lines.append(f"\n📊 <b>Restored: {total_restored:,} new records</b>  |  {total_skipped:,} already existed")
+        report_lines.append(f"\n✅ Zero duplicates — existing live records untouched.")
+        log_action(f"♻️ RESTORE {target.upper()}", callback.from_user.id, f"Restored {total_restored} records")
+        await callback.message.edit_text("".join(report_lines), parse_mode="HTML")
+        await callback.message.answer("✅ Restore complete.", reply_markup=get_backup_menu())
+
+    except Exception as e:
+        err = str(e).replace("<", "&lt;").replace(">", "&gt;")
+        await callback.message.edit_text(f"❌ <b>RESTORE ERROR</b>\n\n{err}", parse_mode="HTML")
+        await state.clear()
+
+
+@dp.callback_query(F.data == "restore_cancel")
+async def restore_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Restore cancelled.")
+    await callback.answer()
+
+
 async def schedule_monthly_backup():
-    """Run automatic Bot 10 backup every 12 hours into bot10_backups collection."""
+    """Run automatic Bot 2 backup every 12 hours into bot10_backups collection."""
     while True:
         try:
             now = now_local()
@@ -11185,31 +12810,31 @@ async def schedule_monthly_backup():
 
             # ✅ Dedup: skip if a backup for this 12 h window already exists
             if col_bot10_backups.count_documents({"window_key": window_key}) > 0:
-                print(f"⚠️  Bot10 auto-backup SKIPPED — window {window_key} already stored")
+                print(f"⚠️  Bot2 auto-backup SKIPPED — window {window_key} already stored")
                 # Still run bot8 auto-backup if not already done
                 if col_bot8_backups.count_documents({"window_key": window_key, "bot": "bot8"}) == 0:
                     try:
                         b8_data = await create_backup_bot8(backup_type="automatic_12h")
                         if b8_data.get("success"):
-                            print(f"✅ Bot 8 auto-backup OK — {b8_data['total_records']:,} records")
+                            print(f"✅ Bot 1 auto-backup OK — {b8_data['total_records']:,} records")
                     except Exception as b8e:
-                        print(f"❌ Bot 8 auto-backup error: {b8e}")
+                        print(f"❌ Bot 1 auto-backup error: {b8e}")
                 await asyncio.sleep(12 * 3600)
                 continue
 
             print(f"\n💾 ═══════════════════════════════════════")
-            print(f"💾 BOT 10 AUTO-BACKUP STARTING")
+            print(f"💾 BOT 2 AUTO-BACKUP STARTING")
             print(f"💾 Time: {timestamp_label}")
             print(f"💾 ═══════════════════════════════════════\n")
 
-            # Bot 8 auto-backup (separate)
+            # Bot 1 auto-backup (separate)
             try:
                 if col_bot8_backups.count_documents({"window_key": window_key, "bot": "bot8"}) == 0:
                     b8r = await create_backup_bot8(backup_type="automatic_12h")
                     if b8r.get("success"):
-                        print(f"✅ Bot 8 auto-backup — {b8r['total_records']:,} records")
+                        print(f"✅ Bot 1 auto-backup — {b8r['total_records']:,} records")
             except Exception as b8e:
-                print(f"❌ Bot 8 auto-backup error: {b8e}")
+                print(f"❌ Bot 1 auto-backup error: {b8e}")
 
             try:
                 backup_data = await create_backup_mongodb_scalable(backup_type="automatic_12h")
@@ -11229,13 +12854,13 @@ async def schedule_monthly_backup():
                             "day":             now.day,
                         }}
                     )
-                    print(f"✅ Bot 10 auto-backup complete — {backup_data['total_records']:,} records | {backup_data.get('processing_time', 0):.2f}s | {period}")
+                    print(f"✅ Bot 2 auto-backup complete — {backup_data['total_records']:,} records | {backup_data.get('processing_time', 0):.2f}s | {period}")
 
             except Exception as inner_e:
                 print(f"❌ 12h backup inner error: {str(inner_e)}")
 
             print(f"\n💾 ═══════════════════════════════════════")
-            print(f"💾 BOT 10 AUTO-BACKUP FINISHED")
+            print(f"💾 BOT 2 AUTO-BACKUP FINISHED")
             print(f"💾 ═══════════════════════════════════════\n")
 
         except asyncio.CancelledError:
@@ -11259,7 +12884,7 @@ def check_backup_storage():
         print(f"💾 BACKUP STORAGE STATUS (Cloud-Safe)")
         print(f"💾 ═══════════════════════════════════════")
         print(f"📦 Storage: MongoDB Atlas")
-        print(f"🗄️ Bot10 backups: {backup_count}/60 (auto-limited, 12h × 30 days)")
+        print(f"🗄️ Bot2 backups: {backup_count}/60 (auto-limited, 12h × 30 days)")
         print(f"🗄️ Cleanup backups: {cleanup_backup_count}/30 (auto-limited)")
         print(f"📋 Cleanup logs: {log_count}/30 (auto-limited)")
 
@@ -11268,9 +12893,9 @@ def check_backup_storage():
             if isinstance(backup_date, datetime):
                 backup_date = format_datetime(backup_date)
             total_records = latest_backup.get('total_records', 0)
-            print(f"\n📍 Latest Bot10 Backup: {backup_date} | Records: {total_records}")
+            print(f"\n📍 Latest Bot2 Backup: {backup_date} | Records: {total_records}")
         else:
-            print(f"\n📍 No Bot10 backups yet (create with 📥 BACKUP NOW)")
+            print(f"\n📍 No Bot2 backups yet (create with 📥 BACKUP NOW)")
 
         if latest_log:
             last_cleanup = latest_log.get('cleanup_date', 'Unknown')
@@ -11287,7 +12912,7 @@ def check_backup_storage():
 
 
 # ==========================================
-# ENTERPRISE AUTO-HEALER SYSTEM (BOT 10)
+# ENTERPRISE AUTO-HEALER SYSTEM (BOT 2)
 # ==========================================
 # (bot10_health dict is defined near top of file, after bot/dp initialization)
 
@@ -11305,7 +12930,7 @@ async def notify_master_admin(error_type: str, error_msg: str, severity: str = "
         if last_sent:
             elapsed = (now_local() - last_sent).total_seconds()
             if elapsed < cooldown:
-                print(f"[BOT10] Suppressing {severity} alert '{error_type}' (cooldown {cooldown - elapsed:.0f}s left)")
+                print(f"[BOT2] Suppressing {severity} alert '{error_type}' (cooldown {cooldown - elapsed:.0f}s left)")
                 return
         _bot10_last_alert[alert_key] = now_local()
         # --- end cooldown ---
@@ -11318,7 +12943,7 @@ async def notify_master_admin(error_type: str, error_msg: str, severity: str = "
         m = int((uptime.total_seconds() % 3600) // 60)
 
         msg = (
-            f"{emoji} **BOT 10 ALERT — {severity}**\n"
+            f"{emoji} **BOT 2 ALERT — {severity}**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"**Type:** `{error_type}`\n"
             f"**Status:** {heal_status}\n\n"
@@ -11330,7 +12955,7 @@ async def notify_master_admin(error_type: str, error_msg: str, severity: str = "
             f"• Alerts Sent: {bot10_health['owner_notified']}\n\n"
             f"**Time:** {now_local().strftime('%B %d, %Y — %I:%M:%S %p')}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"_Bot 10 Enterprise Auto-Healer_"
+            f"_Bot 2 Enterprise Auto-Healer_"
         )
 
         await bot.send_message(MASTER_ADMIN_ID, msg, parse_mode="Markdown")
@@ -11462,17 +13087,17 @@ async def bot10_global_error_handler(event: types.ErrorEvent):
         if (not healed or severity == "CRITICAL") and not is_silent:
             await notify_master_admin(err_type, err_msg, severity, healed)
         elif is_silent:
-            print(f"🔕 [BOT10] Silent error suppressed (no owner alert): {err_type}")
+            print(f"🔕 [BOT2] Silent error suppressed (no owner alert): {err_type}")
 
-        print(f"🏥 [BOT10] Error handled. Auto-healed: {healed}")
+        print(f"🏥 [BOT2] Error handled. Auto-healed: {healed}")
         return True
 
     except Exception as handler_err:
-        print(f"💥 CRITICAL: Bot10 error handler crashed: {handler_err}")
+        print(f"💥 CRITICAL: Bot2 error handler crashed: {handler_err}")
         try:
             await bot.send_message(
                 MASTER_ADMIN_ID,
-                f"🔴🔴🔴 **BOT 10 CRITICAL FAILURE**\n\n"
+                f"🔴🔴🔴 **BOT 2 CRITICAL FAILURE**\n\n"
                 f"The error handler itself crashed!\n```{str(handler_err)[:300]}```",
                 parse_mode="Markdown"
             )
@@ -11510,10 +13135,180 @@ async def bot10_health_monitor():
                 await notify_master_admin("Bot Connection Check", str(e), "CRITICAL", False)
 
         except asyncio.CancelledError:
-            print("💊 [HEALTH] Bot10 health monitor stopping...")
+            print("💊 [HEALTH] Bot2 health monitor stopping...")
             break
         except Exception as e:
             print(f"❌ [HEALTH MONITOR ERROR] {e}")
+
+
+# ==========================================
+# 📦 MONTHLY JSON BACKUP DELIVERY — Bot 2
+# Runs on the 1st of every month, 09:30–11:59 AM local time (30 min after Bot 1)
+# Dumps EVERY collection in MSANodeDB — complete cluster backup
+# Each collection → separate gzip-compressed JSON delivered to master admin
+# JSON format: {collection, exported_at, total_records, restore_unique_key, records:[...]}
+# ==========================================
+
+_MONTHLY_RESTORE_KEYS = {
+    "user_verification":      "user_id",
+    "msa_ids":                "user_id",
+    "support_tickets":        "user_id",
+    "banned_users":           "user_id",
+    "suspended_features":     "user_id",
+    "permanently_banned_msa": "msa_id",
+    "bot10_broadcasts":       "broadcast_id",
+    "bot10_admins":           "user_id",
+    "bot10_user_tracking":    "user_id",
+    "bot8_offline_log":       "_id",
+    "bot8_state_persistence": "key",
+    "bot10_runtime_state":    "state_key",
+    "bot3_pdfs":              "msa_code",
+    "bot3_ig_content":        "cc_code",
+    "bot3_admins":            "user_id",
+    "bot3_banned_users":      "user_id",
+    "bot3_logs":              "_id",
+    "bot3_user_activity":     "_id",
+    "bot3_backups":           "_id",
+    "bot10_backups":          "_id",
+    "bot10_access_attempts":  "_id",
+    "cleanup_backups":        "_id",
+    "cleanup_logs":           "_id",
+    "live_terminal_logs":     "_id",
+    "bot8_backups":           "_id",
+    "bot8_restore_data":      "_id",
+    "bot10_restore_data":     "_id",
+}
+
+
+def _mongo_json_encoder_b2(obj):
+    """Serialize MongoDB-specific types (ObjectId, datetime, bytes) for json.dumps."""
+    import datetime as _dt
+    try:
+        from bson import ObjectId
+        if isinstance(obj, ObjectId):
+            return str(obj)
+    except ImportError:
+        pass
+    if isinstance(obj, (_dt.datetime, _dt.date)):
+        return obj.isoformat()
+    if isinstance(obj, bytes):
+        return obj.hex()
+    return str(obj)
+
+
+async def _send_col_json_bot2(col_name: str, unique_key: str, now) -> tuple:
+    """Dump one collection to gzip JSON and deliver to master admin. Returns (count, bytes)."""
+    import json, gzip, io
+    from aiogram.types import BufferedInputFile
+
+    period    = "AM" if now.hour < 12 else "PM"
+    ts_label  = now.strftime(f"%B %d, %Y \u2014 %I:%M {period}")
+    month_str = now.strftime("%B_%Y")
+    date_str  = now.strftime("%Y-%m-%d_%I%M")
+
+    records = []
+    for doc in db[col_name].find({}):
+        doc["_id"] = str(doc.get("_id", ""))
+        records.append(doc)
+
+    CHUNK  = 50_000  # split >50k records to stay within Telegram's 50 MB file limit
+    chunks = [records[i:i+CHUNK] for i in range(0, len(records), CHUNK)] if records else [[]]
+    total_bytes = 0
+
+    for idx, chunk in enumerate(chunks, 1):
+        payload = {
+            "collection":         col_name,
+            "exported_at":        ts_label,
+            "month":              now.strftime("%B %Y"),
+            "total_records":      len(records),
+            "part":               idx,
+            "total_parts":        len(chunks),
+            "restore_unique_key": unique_key,
+            "records":            chunk,
+        }
+        raw  = json.dumps(payload, default=_mongo_json_encoder_b2, ensure_ascii=False, indent=2).encode()
+        buf  = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            gz.write(raw)
+        data   = buf.getvalue()
+        suffix = f"_part{idx}of{len(chunks)}" if len(chunks) > 1 else ""
+        fname  = f"{col_name}_{month_str}_{date_str}_{period}{suffix}.json.gz"
+        cap    = (
+            f"\U0001f4e6 <b>{col_name}</b>"
+            + (f" [{idx}/{len(chunks)}]" if len(chunks) > 1 else "")
+            + f"\n{len(chunk):,} records \u00b7 {len(data)/1024:.1f} KB compressed"
+        )
+        await bot.send_document(
+            MASTER_ADMIN_ID,
+            BufferedInputFile(data, filename=fname),
+            caption=cap,
+            parse_mode="HTML",
+        )
+        total_bytes += len(data)
+        await asyncio.sleep(0.5)
+
+    return len(records), total_bytes
+
+
+async def monthly_json_delivery_bot2():
+    """Background task: 1st of every month, 09:30\u201311:59 AM \u2014 full JSON backup of ALL collections."""
+    while True:
+        try:
+            now = now_local()
+            is_window = (
+                now.day == 1
+                and ((now.hour == 9 and now.minute >= 30) or (10 <= now.hour <= 11))
+            )
+            if is_window:
+                month_key = now.strftime("%Y-%m")
+                track_key = f"monthly_json_{month_key}"
+                if not db["bot10_runtime_state"].find_one({"state_key": track_key}):
+                    db["bot10_runtime_state"].update_one(
+                        {"state_key": track_key},
+                        {"$set": {"state_key": track_key, "run_at": now.isoformat()}},
+                        upsert=True,
+                    )
+                    all_cols = sorted(db.list_collection_names())
+                    period   = "AM" if now.hour < 12 else "PM"
+                    ts_label = now.strftime(f"%B %d, %Y \u2014 %I:%M {period}")
+                    await bot.send_message(
+                        MASTER_ADMIN_ID,
+                        f"\U0001f4e6 <b>BOT 2 \u2014 MONTHLY FULL JSON BACKUP</b>\n\n"
+                        f"\U0001f5d3 <b>{now.strftime('%B %Y')}</b>\n"
+                        f"\U0001f558 {ts_label}\n\n"
+                        f"Delivering <b>{len(all_cols)}</b> collections \u2014 complete MSANodeDB snapshot.\n"
+                        f"Every file is independently restorable with zero duplicates.",
+                        parse_mode="HTML",
+                    )
+                    total_records = 0
+                    total_bytes   = 0
+                    errors: list  = []
+                    for col_name in all_cols:
+                        unique_key = _MONTHLY_RESTORE_KEYS.get(col_name, "_id")
+                        try:
+                            cnt, nb = await _send_col_json_bot2(col_name, unique_key, now)
+                            total_records += cnt
+                            total_bytes   += nb
+                        except Exception as e:
+                            errors.append(f"{col_name}: {e}")
+                            print(f"\u274c Monthly JSON bot2 \u2014 {col_name}: {e}")
+                    summary = (
+                        f"\u2705 <b>BOT 2 MONTHLY BACKUP COMPLETE</b>\n\n"
+                        f"\U0001f5d3 {now.strftime('%B %Y')}\n"
+                        f"\U0001f4ca Total records: <b>{total_records:,}</b>\n"
+                        f"\U0001f4be Compressed: <b>{total_bytes/1024:.1f} KB</b>\n"
+                        f"\U0001f4c1 Collections: <b>{len(all_cols)-len(errors)}/{len(all_cols)}</b>"
+                    )
+                    if errors:
+                        summary += "\n\n\u26a0\ufe0f Errors:\n" + "\n".join(f"\u2022 {e}" for e in errors)
+                    await bot.send_message(MASTER_ADMIN_ID, summary, parse_mode="HTML")
+                    print(f"\u2705 Bot 2 monthly JSON backup done \u2014 {total_records:,} records, {total_bytes/1024:.1f} KB")
+            await asyncio.sleep(1800)   # check every 30 minutes
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"\u274c monthly_json_delivery_bot2: {e}")
+            await asyncio.sleep(300)
 
 
 # ==========================================
@@ -11687,12 +13482,12 @@ async def generate_daily_report() -> str:
     report_time = now.strftime("%B %d, %Y — %I:%M %p")
 
     report = (
-        f"📊 **BOT 10 — DAILY {period} REPORT**\n"
+        f"📊 **BOT 2 — DAILY {period} REPORT**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🗓️ **{report_time}**\n\n"
 
         f"⚡ **SYSTEM STATUS**\n"
-        f"• Bot 10: ✅ Online\n"
+        f"• Bot 2: ✅ Online\n"
         f"• Database: {db_status}\n"
         f"• Uptime: {h}h {m}m\n"
         f"• Auto-Healer: ✅ Active\n"
@@ -11726,11 +13521,71 @@ async def generate_daily_report() -> str:
 
         f"💾 **BACKUPS**\n"
         f"• Last Backup: {last_bk_time}\n\n"
+    )
 
+    # === MONGODB STORAGE ===
+    _st = get_mongo_storage_stats()
+    if _st["ok"]:
+        report += (
+            f"🗄️ **MONGODB STORAGE**\n"
+            f"• Used: `{_st['used_mb']:.1f}MB` / `{_st['cap_mb']:.0f}MB`  ({_st['pct']:.1f}%)\n"
+            f"• Bar: `[{_st['bar']}]`\n"
+            f"• Status: {_st['risk_icon']} {_st['risk_label']}\n\n"
+        )
+        if _st["pct"] >= 75:
+            report += f"⚠️ *Storage at {_st['pct']:.0f}% — consider cleanup or plan upgrade*\n\n"
+
+    report += (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"_Auto-report by Bot 10 Enterprise | Next: 12h_"
+        f"_Auto-report by Bot 2 Enterprise | Next: 12h_"
     )
     return report
+
+
+async def schedule_storage_alerts():
+    """
+    Check MongoDB storage every 6 hours.
+    Sends Telegram alert to master admin when storage crosses 60 / 75 / 85 / 95%.
+    Alerts reset daily so you get one reminder per threshold per day.
+    """
+    _alerted: set = set()
+    _alerted_date = None
+
+    while True:
+        try:
+            today = now_local().date()
+            if _alerted_date != today:
+                _alerted.clear()
+                _alerted_date = today
+
+            _st = get_mongo_storage_stats()
+            if _st["ok"]:
+                pct = _st["pct"]
+                for threshold, emoji, action in [
+                    (95, "🔴", "UPGRADE NOW — bot may stop storing data soon"),
+                    (85, "🟠", "Start cleaning up old records or upgrade MongoDB plan"),
+                    (75, "🟡", "Plan ahead — delete old data or upgrade soon"),
+                    (60, "📊", "MongoDB is over half full — keep an eye on it"),
+                ]:
+                    if pct >= threshold and threshold not in _alerted:
+                        _alerted.add(threshold)
+                        await bot.send_message(
+                            MASTER_ADMIN_ID,
+                            f"{emoji} *MONGODB STORAGE ALERT — {pct:.0f}% USED*\n\n"
+                            f"`[{_st['bar']}]`\n"
+                            f"*Used:* `{_st['used_mb']:.1f}MB` / `{_st['cap_mb']:.0f}MB`\n\n"
+                            f"*Action:* {action}\n\n"
+                            f"*Data breakdown:*\n"
+                            f"• Documents: `{_st['data_mb']:.1f}MB`\n"
+                            f"• Indexes: `{_st['index_mb']:.1f}MB`\n\n"
+                            f"Upgrade at: https://cloud.mongodb.com",
+                            parse_mode="Markdown"
+                        )
+                        break  # Only alert highest triggered threshold once
+        except Exception as _e:
+            print(f"⚠️ [STORAGE ALERT] Check failed: {_e}")
+
+        await asyncio.sleep(6 * 3600)  # Check every 6 hours
 
 
 async def schedule_daily_reports():
@@ -11780,13 +13635,13 @@ async def schedule_daily_reports():
 # ==========================================
 
 async def _health_handler_bot10(request: aiohttp_web.Request) -> aiohttp_web.Response:
-    """Health check endpoint for Render — confirms Bot 10 is alive."""
+    """Health check endpoint for Render — confirms Bot 2 is alive."""
     uptime = now_local() - bot10_health["bot_start_time"]
     h = int(uptime.total_seconds() // 3600)
     m = int((uptime.total_seconds() % 3600) // 60)
     return aiohttp_web.json_response({
         "status": "ok",
-        "bot": "MSA NODE Bot 10",
+        "bot": "MSA NODE Bot 2",
         "uptime": f"{h}h {m}m",
         "errors_caught": bot10_health["errors_caught"],
         "auto_healed": bot10_health["auto_healed"],
@@ -11827,10 +13682,11 @@ async def main():
     daily_report_task = None
     cleanup_task = None
     monthly_backup_task = None
+    storage_alert_task = None
     web_runner = None
 
     print("\n🚀 ═══════════════════════════════════════")
-    print("🚀  BOT 10 — ENTERPRISE STARTUP")
+    print("🚀  BOT 2 — ENTERPRISE STARTUP")
     print("🚀 ═══════════════════════════════════════\n")
 
     # ── 1. Load previous state for continuity ──
@@ -11841,8 +13697,8 @@ async def main():
     # ── 2. Check backup storage status ──
     check_backup_storage()
 
-    # ── 2b. Migrate old bot10-triggered bans to have scope="bot10" ──
-    # This ensures auto-bans and admin-panel bans don't block Bot 8 users
+    # ── 2b. Migrate old bot2-triggered bans to have scope="bot2" ──
+    # This ensures auto-bans and admin-panel bans don't block Bot 1 users
     try:
         migrated = col_banned_users.update_many(
             {
@@ -11852,10 +13708,10 @@ async def main():
                     {"reason": "Banned by master admin"}
                 ]
             },
-            {"$set": {"scope": "bot10"}}
+            {"$set": {"scope": "bot2"}}
         )
         if migrated.modified_count > 0:
-            print(f"🔧 Ban migration: {migrated.modified_count} bot10-scoped ban(s) patched (no longer affect Bot 8)")
+            print(f"🔧 Ban migration: {migrated.modified_count} bot2-scoped ban(s) patched (no longer affect Bot 1)")
     except Exception as _e:
         print(f"⚠️ Ban migration skipped: {_e}")
 
@@ -11875,10 +13731,16 @@ async def main():
         print("🧹 Daily cleanup scheduler started (runs at 3:00 AM)")
 
         monthly_backup_task = asyncio.create_task(schedule_monthly_backup())
-        print("� 12h auto-backup scheduler started (Bot 10 → bot10_backups | every 12h AM & PM)")
+        print("💾 12h auto-backup scheduler started (Bot 2 → bot10_backups | every 12h AM & PM)")
+
+        monthly_json_task = asyncio.create_task(monthly_json_delivery_bot2())
+        print("📦 Monthly JSON backup started (1st of every month, 09:30 AM → all collections via Telegram)")
 
         daily_report_task = asyncio.create_task(schedule_daily_reports())
         print("📊 Daily report scheduler started (8:40 AM & 8:40 PM)")
+
+        storage_alert_task = asyncio.create_task(schedule_storage_alerts())
+        print("🗄️ Storage alert scheduler started (checks every 6h — alerts at 60/75/85/95%)")
 
         state_save_task = asyncio.create_task(state_auto_save_loop())
         print("💾 State auto-save started (every 5 minutes)")
@@ -11892,7 +13754,7 @@ async def main():
 
             await bot.send_message(
                 MASTER_ADMIN_ID,
-                f"✅ <b>BOT 10 STARTED SUCCESSFULLY</b>\n"
+                f"✅ <b>BOT 2 STARTED SUCCESSFULLY</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"🏥 Auto-Healer: ✅ Active\n"
                 f"💊 Health Monitor: ✅ Running\n"
@@ -11900,10 +13762,11 @@ async def main():
                 f"💾 State Persistence: ✅ Active\n"
                 f"🧹 Auto-Cleanup: ✅ 3 AM daily\n"
                 f"💿 Auto-Backup: ✅ Every 12h (AM &amp; PM) — bot10_backups\n"
+                f"🗄️ Storage Alerts: ✅ Every 6h (alerts at 60/75/85/95%)\n"
                 f"{prev_info}\n\n"
                 f"<b>Started:</b> {now_local().strftime('%B %d, %Y — %I:%M:%S %p')}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<i>Bot 10 Enterprise — All systems operational</i>",
+                f"<i>Bot 2 Enterprise — All systems operational</i>",
                 parse_mode="HTML"
             )
         except Exception as e:
@@ -11941,7 +13804,7 @@ async def main():
 
     finally:
         # ── 7. Graceful shutdown ──
-        print("\n🛑 Bot 10 shutting down gracefully...")
+        print("\n🛑 Bot 2 shutting down gracefully...")
 
         # Save final state
         save_bot10_state()
@@ -11953,6 +13816,7 @@ async def main():
             ("Daily Report", daily_report_task),
             ("Cleanup", cleanup_task),
             ("Monthly Backup", monthly_backup_task),
+            ("Storage Alerts", storage_alert_task),
         ]:
             if task and not task.done():
                 task.cancel()
@@ -11969,7 +13833,7 @@ async def main():
 
             await bot.send_message(
                 MASTER_ADMIN_ID,
-                f"🛑 **BOT 10 SHUTDOWN**\n\n"
+                f"🛑 **BOT 2 SHUTDOWN**\n\n"
                 f"**Uptime:** {h}h {m}m\n"
                 f"**Errors Caught:** {bot10_health['errors_caught']}\n"
                 f"**Auto-Healed:** {bot10_health['auto_healed']}\n"
@@ -11995,14 +13859,14 @@ async def main():
             except Exception:
                 pass
 
-        print("✅ Bot 10 shutdown complete")
+        print("✅ Bot 2 shutdown complete")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n⚠️ Bot 10 stopped by user (Ctrl+C)")
+        print("\n⚠️ Bot 2 stopped by user (Ctrl+C)")
     except Exception as e:
         print(f"\n💥 Critical error: {e}")
         sys.exit(1)
