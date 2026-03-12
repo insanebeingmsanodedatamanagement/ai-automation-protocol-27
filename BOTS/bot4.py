@@ -58,7 +58,7 @@ if sys.platform == 'win32':
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
-# Load environment variables from bot4.env
+
 
 # Timezone support
 try:
@@ -291,28 +291,7 @@ _WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 _WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 _WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
 
-async def handle_health(request):
-    return web.Response(text="CORE 4 (PDF INFRASTRUCTURE) IS ACTIVE")
-
-async def start_web_server(dp_ref, bot_ref):
-    """Start aiohttp server with health check + optional webhook route."""
-    app = web.Application()
-    app.router.add_get('/', handle_health)
-    app.router.add_get('/health', handle_health)
-
-    if _WEBHOOK_URL:
-        # Register Telegram webhook route
-        SimpleRequestHandler(dispatcher=dp_ref, bot=bot_ref).register(app, path=_WEBHOOK_PATH)
-        setup_application(app, dp_ref, bot=bot_ref)
-        print(f"✅ Webhook route registered: {_WEBHOOK_PATH}")
-
-    port = int(os.environ.get("PORT", 10004))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 Web server running on port {port}")
-    return runner
+# NOTE: start_web_server is defined once near the bottom of this file (canonical version).
 
 def connect_db():
     global col_pdfs, col_trash, col_locked, col_trash_locked, col_admins, col_banned, col_bot4_state, db_client
@@ -5551,7 +5530,34 @@ async def start_web_server(dp: Dispatcher, bot: Bot):
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+
+    # ── Free the port if a stale process is holding it (Windows-safe) ──────
+    import socket as _socket
+    _test_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    _test_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    try:
+        _test_sock.bind(("0.0.0.0", PORT))
+        _test_sock.close()
+    except OSError:
+        # Port is held by a stale process — kill it via netstat/taskkill (Windows)
+        import subprocess as _sp
+        try:
+            _result = _sp.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True
+            )
+            for _line in _result.stdout.splitlines():
+                if f":{PORT}" in _line and "LISTENING" in _line:
+                    _pid = _line.strip().split()[-1]
+                    _sp.run(["taskkill", "/F", "/PID", _pid],
+                            capture_output=True)
+                    print(f"⚠️ Freed stale process PID {_pid} holding port {PORT}")
+        except Exception as _ke:
+            print(f"⚠️ Could not auto-free port {PORT}: {_ke}")
+        _test_sock.close()
+        await asyncio.sleep(1)   # give OS time to release the port
+
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT, reuse_address=True)
     await site.start()
     print(f"✅ Web server listening on port {PORT}")
     return runner
