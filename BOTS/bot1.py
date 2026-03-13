@@ -26,7 +26,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
@@ -154,7 +154,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # ==========================================
-# 🖥️ BOT 1 LIVE TERMINAL MIDDLEWARE
+# 🖥️ BOT 1(8) LIVE TERMINAL MIDDLEWARE
 # Logs every user interaction to MongoDB — visible in Bot 2 Terminal from Render
 # ==========================================
 from aiogram import BaseMiddleware
@@ -199,7 +199,7 @@ health_stats = {
 }
 
 # ==========================================
-# 📊 DATABASE CONNECTION  (Enterprise Pool)
+# 📊 DATABASE CONNECTION  
 # ==========================================
 try:
     client = pymongo.MongoClient(
@@ -259,6 +259,8 @@ try:
         db["bot8_state_persistence"].create_index("key", unique=True)
         col_bot8_backups.create_index([("backup_date", -1)])
         col_bot8_backups.create_index([("backup_type", 1)])
+        col_broadcasts.create_index([("index", -1)])
+        col_broadcasts.create_index("broadcast_id")
         # ── Unique dedup index: prevents duplicate click-tracking rows even under concurrent load
         db["bot3_user_activity"].create_index(
             [("user_id", 1), ("item_id", 1), ("click_type", 1)],
@@ -760,7 +762,7 @@ def is_spam_or_gibberish(text: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # RATE LIMITING for support tickets — 24-hour cooldown, DB-backed (survives restarts)
 # ---------------------------------------------------------------------------
-TICKET_COOLDOWN_HOURS = 24 # User must wait 24 hours between ticket submissions
+TICKET_COOLDOWN_HOURS = 24# User must wait 24 hours between ticket submissions
 
 def check_ticket_rate_limit(user_id: int, user_name: str = "You") -> tuple[bool, str]:
     """
@@ -3225,6 +3227,14 @@ _ANN_CAP             = 3     # show only the N most recent broadcasts
 _ANN_PAGE_MAX_CHARS  = 800   # max chars for a single announcement's text in the dashboard
 
 
+def _escape_dashboard_md(text: str) -> str:
+    if not text:
+        return ""
+    for char in ["_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
 def _fetch_deduplicated_broadcasts() -> list:
     """
     Fetch the _ANN_CAP most-recent broadcasts from DB, deduplicated by broadcast_id.
@@ -3232,14 +3242,32 @@ def _fetch_deduplicated_broadcasts() -> list:
     """
     seen_ids: set = set()
     result = []
-    for b in col_broadcasts.find({}).sort("index", -1).limit(_ANN_CAP * 3):
-        bid = b.get("broadcast_id") or str(b.get("_id", ""))
-        if bid in seen_ids:
-            continue
-        seen_ids.add(bid)
-        result.append(b)
-        if len(result) >= _ANN_CAP:
-            break
+    try:
+        cursor = (
+            col_broadcasts.find(
+                {},
+                {
+                    "broadcast_id": 1,
+                    "created_at": 1,
+                    "message_text": 1,
+                    "media_type": 1,
+                    "index": 1,
+                },
+            )
+            .sort("index", -1)
+            .limit(_ANN_CAP * 3)
+            .max_time_ms(4000)
+        )
+        for b in cursor:
+            bid = b.get("broadcast_id") or str(b.get("_id", ""))
+            if bid in seen_ids:
+                continue
+            seen_ids.add(bid)
+            result.append(b)
+            if len(result) >= _ANN_CAP:
+                break
+    except Exception as bc_err:
+        logger.error(f"Dashboard broadcast fetch failed: {bc_err}")
     return result
 
 
@@ -3263,19 +3291,19 @@ def _build_ann_page(broadcasts: list, page: int) -> str:
     b     = broadcasts[page]
 
     created_at = b.get("created_at")
-    raw_text   = (b.get("message_text") or "").strip()
+    raw_text_value = b.get("message_text")
+    raw_text   = str(raw_text_value).strip() if raw_text_value is not None else ""
     media_type = b.get("media_type", "")
     b_index    = b.get("index", page + 1)
 
-    date_str = (
-        created_at.strftime("%b %d, %Y  ·  %I:%M %p")
-        if created_at else "—"
-    )
+    date_str = "—"
+    if isinstance(created_at, datetime):
+        date_str = created_at.strftime("%b %d, %Y  ·  %I:%M %p")
 
     if raw_text:
         if len(raw_text) > _ANN_PAGE_MAX_CHARS:
             raw_text = raw_text[:_ANN_PAGE_MAX_CHARS].rsplit(" ", 1)[0] + "…"
-        preview = raw_text
+        preview = _escape_dashboard_md(raw_text)
     elif media_type:
         preview = f"📎 _[{media_type.capitalize()} content]_"
     else:
@@ -3299,12 +3327,10 @@ def _build_ann_page(broadcasts: list, page: int) -> str:
 
     # NEW badge for broadcasts within last 48 h
     is_new = False
-    if created_at:
+    if isinstance(created_at, datetime):
         try:
-            from datetime import timezone as _tz
-            age = now_local() - created_at.replace(
-                tzinfo=created_at.tzinfo or _tz.utc
-            )
+            created_local = created_at.astimezone(TZ).replace(tzinfo=None) if created_at.tzinfo else created_at
+            age = now_local() - created_local
             is_new = age.total_seconds() < 172800   # 48 h
         except Exception:
             pass
@@ -3322,14 +3348,17 @@ def _build_ann_page(broadcasts: list, page: int) -> str:
 
 def _build_dashboard_text(user_name, display_msa_id, member_since, ann_text) -> str:
     """Assemble the full dashboard message."""
+    safe_user_name = _escape_dashboard_md(str(user_name or "User"))
+    safe_member_since = _escape_dashboard_md(str(member_since or "Unknown"))
+    safe_msa_id = str(display_msa_id or "Not Assigned").replace("`", "'")
     return (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"   📊 **YOUR DASHBOARD**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"**PROFILE INFORMATION**\n\n"
-        f"👤 **Name:** {user_name}\n"
-        f"🆔 **MSA+ ID:** `{display_msa_id}`\n"
-        f"📅 **Member Since:** {member_since}\n\n"
+        f"👤 **Name:** {safe_user_name}\n"
+        f"🆔 **MSA+ ID:** `{safe_msa_id}`\n"
+        f"📅 **Member Since:** {safe_member_since}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"**ACCOUNT STATUS**\n\n"
         f"✅ **Verification:** Confirmed\n"
@@ -3413,6 +3442,10 @@ async def dashboard(message: types.Message):
     user_id   = message.from_user.id
     user_name = message.from_user.first_name or "User"
     msa_id    = get_user_msa_id(user_id)
+    display_msa_id = msa_id.replace("+", "") if msa_id else 'Not Assigned'
+    member_since = "Unknown"
+    dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, _build_ann_page([], 0))
+    ann_kb = None
 
     # 🎬 DASHBOARD ANIMATION
     msg = await message.answer("⏳ Accessing User Database...")
@@ -3429,48 +3462,40 @@ async def dashboard(message: types.Message):
     await msg.edit_text("📊 Loading Profile Stats...")
     await asyncio.sleep(ANIM_MEDIUM)
 
-    # Get Member Since date
-    member_since = "Unknown"
-    msa_record = col_msa_ids.find_one({"user_id": user_id})
-    if msa_record and "assigned_at" in msa_record:
-        member_since = msa_record["assigned_at"].strftime("%B %Y")
-    else:
-        user_data = col_user_verification.find_one({"user_id": user_id})
-        if user_data and "first_start" in user_data:
-            member_since = user_data["first_start"].strftime("%B %Y")
+    try:
+        msa_record = col_msa_ids.find_one({"user_id": user_id})
+        if msa_record and "assigned_at" in msa_record:
+            member_since = msa_record["assigned_at"].strftime("%B %Y")
+        else:
+            user_data = col_user_verification.find_one({"user_id": user_id})
+            if user_data and "first_start" in user_data:
+                member_since = user_data["first_start"].strftime("%B %Y")
 
-    display_msa_id = msa_id.replace("+", "") if msa_id else 'Not Assigned'
+        all_broadcasts = _fetch_deduplicated_broadcasts()
+        total_bc = len(all_broadcasts)
+        page = 0
 
-    # ── Fetch up to _ANN_CAP newest broadcasts, deduplicated ────────────────────
-    all_broadcasts = _fetch_deduplicated_broadcasts()
-    total_bc = len(all_broadcasts)
-    page = 0
-
-    ann_text = _build_ann_page(all_broadcasts, page)
-
-    # Guard: if combined text still exceeds limit, trim ann_text hard
-    dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
-    if len(dashboard_text) > _DASH_CHAR_LIMIT:
-        excess = len(dashboard_text) - _DASH_CHAR_LIMIT + 5
-        ann_text = ann_text[:-excess].rsplit(" ", 1)[0] + "…"
+        ann_text = _build_ann_page(all_broadcasts, page)
         dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
-    # ─────────────────────────────────────────────────────────
+        if len(dashboard_text) > _DASH_CHAR_LIMIT:
+            excess = len(dashboard_text) - _DASH_CHAR_LIMIT + 5
+            ann_text = ann_text[:-excess].rsplit(" ", 1)[0] + "…"
+            dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
 
-    # Build inline nav keyboard (only when more than 1 broadcast in cap)
-    ann_kb = None
-    if total_bc > 1:
-        next_pg = 1
-        prev_pg = total_bc - 1
-        ann_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="◀️",                   callback_data=f"ann_pg:{user_id}:{prev_pg}"),
-            InlineKeyboardButton(text=f"📢 1/{total_bc}",   callback_data="ann_noop"),
-            InlineKeyboardButton(text="▶️",                   callback_data=f"ann_pg:{user_id}:{next_pg}"),
-        ]])
-    elif total_bc == 1:
-        # Single broadcast — show page indicator only (no nav arrows)
-        ann_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📢 1/1", callback_data="ann_noop"),
-        ]])
+        if total_bc > 1:
+            next_pg = 1
+            prev_pg = total_bc - 1
+            ann_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀️",                 callback_data=f"ann_pg:{user_id}:{prev_pg}"),
+                InlineKeyboardButton(text=f"📢 1/{total_bc}", callback_data="ann_noop"),
+                InlineKeyboardButton(text="▶️",                 callback_data=f"ann_pg:{user_id}:{next_pg}"),
+            ]])
+        elif total_bc == 1:
+            ann_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📢 1/1", callback_data="ann_noop"),
+            ]])
+    except Exception as dash_err:
+        logger.exception(f"Dashboard build failed for user {user_id}: {dash_err}")
 
     _final_dash_msg = None
     try:
@@ -3481,13 +3506,19 @@ async def dashboard(message: types.Message):
         )
         _final_dash_msg = msg
     except Exception as edit_err:
-        # Fallback: send as new message if edit fails (e.g. message too old)
         logger.warning(f"Dashboard edit_text failed: {edit_err}")
-        _final_dash_msg = await message.answer(
-            dashboard_text,
-            reply_markup=ann_kb,
-            parse_mode=ParseMode.MARKDOWN
-        )
+        try:
+            _final_dash_msg = await message.answer(
+                dashboard_text,
+                reply_markup=ann_kb,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as send_err:
+            logger.error(f"Dashboard fallback send failed: {send_err}")
+            _final_dash_msg = await message.answer(
+                dashboard_text,
+                reply_markup=ann_kb,
+            )
     # Register session for live broadcast sync (bot2 edits/deletes reflect instantly)
     if _final_dash_msg:
         _DASHBOARD_ACTIVE_MSGS[message.chat.id] = {
@@ -3545,7 +3576,13 @@ async def ann_page_callback(callback: types.CallbackQuery):
                     parse_mode=ParseMode.MARKDOWN
                 )
             except Exception:
-                pass
+                try:
+                    await callback.message.edit_text(
+                        dashboard_text,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
             await callback.answer("No announcements available.", show_alert=False)
             return
 
@@ -3574,11 +3611,17 @@ async def ann_page_callback(callback: types.CallbackQuery):
                 InlineKeyboardButton(text="▶️",                      callback_data=f"ann_pg:{uid}:{next_pg}"),
             ]])
 
-        await callback.message.edit_text(
-            dashboard_text,
-            reply_markup=ann_kb,
-            parse_mode=ParseMode.MARKDOWN
-        )
+        try:
+            await callback.message.edit_text(
+                dashboard_text,
+                reply_markup=ann_kb,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            await callback.message.edit_text(
+                dashboard_text,
+                reply_markup=ann_kb,
+            )
         # Keep live-sync session up-to-date with latest page
         _DASHBOARD_ACTIVE_MSGS[callback.message.chat.id] = {
             "message_id":  callback.message.message_id,
@@ -7667,6 +7710,16 @@ async def main():
         log_to_terminal("STARTUP", 0, "Bot 1 online — live terminal active")
         logger.info("🖥️ Live terminal middleware registered (logs visible in Bot 2)")
 
+        # ── Fail fast if BOT_8_TOKEN is invalid/revoked ──────────
+        try:
+            me = await bot.get_me()
+            logger.info(f"🤖 Telegram auth OK: @{me.username or me.id}")
+        except TelegramUnauthorizedError:
+            logger.critical(
+                "❌ BOT_8_TOKEN is unauthorized. Update BOT_8_TOKEN in bot8.env and restart."
+            )
+            raise
+
         # ── Start Render health check web server ─────────────────
         health_runner = await start_health_server()
 
@@ -7719,6 +7772,10 @@ async def main():
             # ── POLLING MODE (local dev fallback) ──────────────────────────
             logger.info("ℹ️ No RENDER_EXTERNAL_URL — using polling (local dev mode)")
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+    except TelegramUnauthorizedError as e:
+        logger.critical(f"💥 Fatal startup error: {e}")
+        raise
 
     except Exception as e:
         logger.critical(f"💥 Fatal startup error: {e}\n{traceback.format_exc()}")
@@ -7794,6 +7851,7 @@ async def main():
 
 if __name__ == "__main__":
     _restart_delay = 5  # seconds between restarts
+    _script_path = os.path.abspath(__file__)
     while True:
         try:
             asyncio.run(main())
@@ -7806,11 +7864,15 @@ if __name__ == "__main__":
         except SystemExit:
             logger.info("⚠️ SystemExit received. Stopping.")
             break
+        except TelegramUnauthorizedError:
+            logger.critical(
+                "🛑 Restart disabled: Telegram Unauthorized. Fix BOT_8_TOKEN in bot8.env, then start again."
+            )
+            break
         except Exception as e:
             logger.critical(f"💥 Unhandled top-level crash: {e}\n{traceback.format_exc()}")
             logger.info(f"♻️ Auto-restarting in {_restart_delay} seconds...")
             time.sleep(_restart_delay)
             _restart_delay = min(_restart_delay * 2, 60)
             # Replace the entire process to get a clean event loop
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
+            os.execv(sys.executable, [sys.executable, _script_path])
