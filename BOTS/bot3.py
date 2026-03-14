@@ -21,7 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import pymongo
 from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure
+from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, DuplicateKeyError
 import re
 import string
 import random
@@ -33,13 +33,25 @@ from aiohttp import web
 import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+# Load environment variables.
+# Priority:
+# 1) Explicit BOT3_ENV_FILE override
+# 2) Backward-compatible default files used in existing deployments
+_explicit_env_file = os.environ.get("BOT3_ENV_FILE", "").strip()
+if _explicit_env_file:
+    ENV_FILE_CANDIDATES = (_explicit_env_file, "BOT9.env", "BOT3.env.txt", "BOT3.env", ".env")
+else:
+    ENV_FILE_CANDIDATES = ("BOT9.env", "BOT3.env.txt", "BOT3.env", ".env")
+
+ACTIVE_ENV_FILE = next((p for p in ENV_FILE_CANDIDATES if os.path.exists(p)), "BOT9.env")
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
 
 # Bot Configuration
-BOT_TOKEN = os.environ.get("BOT_9_TOKEN", os.environ.get("BOT_TOKEN"))
+# Prefer bot-specific tokens first; generic BOT_TOKEN is last fallback.
+BOT_TOKEN = os.environ.get("BOT_3_TOKEN") or os.environ.get("BOT_9_TOKEN") or os.environ.get("BOT_TOKEN")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "msanodebot")  # Bot's @username for generating t.me links
 MONGO_URI = os.environ.get("MONGO_URI")
 MASTER_ADMIN_ID = int(os.environ.get("MASTER_ADMIN_ID", 0))
@@ -60,6 +72,7 @@ MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "MSANodeDB")  # Single database 
 MONGO_MAX_POOL_SIZE = int(os.environ.get("MONGO_MAX_POOL_SIZE", 100))
 MONGO_MIN_POOL_SIZE = int(os.environ.get("MONGO_MIN_POOL_SIZE", 10))
 MONGO_CONNECT_TIMEOUT_MS = int(os.environ.get("MONGO_CONNECT_TIMEOUT_MS", 10000))
+ALLOW_DB_FINGERPRINT_CHANGE = os.environ.get("ALLOW_DB_FINGERPRINT_CHANGE", "false").lower() == "true"
 
 # Security Configuration
 RATE_LIMIT_SPAM_THRESHOLD = int(os.environ.get("RATE_LIMIT_SPAM_THRESHOLD", 10))
@@ -850,6 +863,57 @@ try:
     print("   ✅ Database name verified: MSANodeDB")
     # ── END DB GUARD ─────────────────────────────────────────────────────────
 
+    # ── STARTUP DB FINGERPRINT GUARD ────────────────────────────────────────
+    # Prevents silent connection drift to another cluster/URI, which looks like
+    # "data loss" after restart even when data still exists elsewhere.
+    try:
+        def _mongo_host_from_uri(uri: str) -> str:
+            if not uri:
+                return "unknown"
+            s = uri.split("://", 1)[-1]
+            if "@" in s:
+                s = s.split("@", 1)[1]
+            s = s.split("/", 1)[0]
+            s = s.split("?", 1)[0]
+            return s or "unknown"
+
+        current_fingerprint = f"{_mongo_host_from_uri(MONGO_URI)}|{MONGO_DB_NAME}"
+        fp_doc = col_settings.find_one({"key": "db_fingerprint"})
+        saved_fingerprint = fp_doc.get("value") if fp_doc else None
+
+        if not saved_fingerprint:
+            col_settings.update_one(
+                {"key": "db_fingerprint"},
+                {"$set": {
+                    "key": "db_fingerprint",
+                    "value": current_fingerprint,
+                    "updated_at": now_local()
+                }},
+                upsert=True
+            )
+            print("   ✅ DB fingerprint initialized")
+        elif saved_fingerprint != current_fingerprint:
+            if ALLOW_DB_FINGERPRINT_CHANGE:
+                col_settings.update_one(
+                    {"key": "db_fingerprint"},
+                    {"$set": {"value": current_fingerprint, "updated_at": now_local()}}
+                )
+                print("   ⚠️ DB fingerprint changed (allowed by ALLOW_DB_FINGERPRINT_CHANGE=true)")
+            else:
+                print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                print("CRITICAL: Database fingerprint mismatch detected")
+                print(f"Saved:   {saved_fingerprint}")
+                print(f"Current: {current_fingerprint}")
+                print("Refusing startup to prevent silent cross-cluster data drift.")
+                print("Set ALLOW_DB_FINGERPRINT_CHANGE=true only if this change is intentional.")
+                print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                sys.exit(1)
+        else:
+            print("   ✅ DB fingerprint verified")
+    except Exception as _fp_err:
+        print(f"⚠️ DB fingerprint guard warning: {_fp_err}")
+    # ── END DB FINGERPRINT GUARD ────────────────────────────────────────────
+
     # Create indexes for better performance (idempotent - skips if exists)
     def create_index_safe(collection, keys, **kwargs):
         """Helper to create index safely, ignoring if already exists"""
@@ -981,7 +1045,7 @@ except Exception as e:
     print(f"MongoDB URI: {MONGO_URI[:20]}..." if MONGO_URI else "MONGO_URI not set!")
     print("\n⚠️ Please check:")
     print("  1. MongoDB is running")
-    print("  2. MONGO_URI in BOT9.env is correct")
+    print(f"  2. MONGO_URI in {ACTIVE_ENV_FILE} is correct")
     print("  3. Network connectivity")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     sys.exit(1)
@@ -1062,9 +1126,11 @@ class IGAffiliateDeleteStates(StatesGroup):
     waiting_for_confirm = State()        # Confirm deletion
 
 class TutorialPKStates(StatesGroup):
-    waiting_for_link = State()           # ADD: waiting for YT link to save
-    waiting_for_edit_link = State()      # EDIT: waiting for new/updated YT link
-    waiting_for_delete_confirm = State() # DELETE: waiting for CONFIRM keyword
+    waiting_for_link = State()            # ADD step 1: waiting for URL input
+    waiting_for_link_confirm = State()    # ADD step 2: waiting for reply-KB confirm
+    waiting_for_edit_link = State()       # EDIT step 1: waiting for new URL input
+    waiting_for_edit_confirm = State()    # EDIT step 2: waiting for reply-KB confirm
+    waiting_for_delete_confirm = State()  # DELETE: waiting for reply-KB confirm
 
 
 class ListStates(StatesGroup):
@@ -1085,6 +1151,10 @@ class ResetStates(StatesGroup):
     waiting_for_confirm_button = State()
     waiting_for_confirm_text = State()
     waiting_for_final_wipe_code = State()
+
+class BackupResetStates(StatesGroup):
+    waiting_for_confirm_button = State()
+    waiting_for_confirm_text = State()
 
 class AnalyticsStates(StatesGroup):
     viewing_analytics = State()
@@ -1185,17 +1255,15 @@ async def get_next_pdf_index():
 
 def validate_msa_code(code):
     """
-    Validates MSA code format: MSA12345 (MSA + exactly 5 digits)
+    Validates MSA code format: MSA + exactly 4 digits.
     Returns (is_valid: bool, error_msg: str)
     """
-    import re
+    code = (code or "").strip().upper()
     if not code:
         return False, "⚠️ Code cannot be empty."
     
-    # Check format: MSA followed by exactly 4 digits
-    pattern = r'^MSA\d{4}$'
-    if not re.match(pattern, code):
-        return False, "⚠️ Invalid format. Use: MSA1234 (MSA + 4 digits)"
+    if not re.fullmatch(r'^MSA\d{4}$', code):
+        return False, "⚠️ Invalid format. Use exactly 4 digits, e.g. MSA1234"
     
     return True, ""
 
@@ -1212,12 +1280,80 @@ def is_msa_code_duplicate(code, exclude_pdf_id=None):
     return col_pdfs.find_one(query) is not None
 
 def generate_unique_msa_code():
-    """Generates a random MSAXXXX code and ensures it's completely unique in the DB."""
-    import random
-    while True:
-        code = f"MSA{random.randint(1000, 9999)}"
+    """Generate a random unique MSA code (non-sequential, no repeats)."""
+    rng = random.SystemRandom()
+
+    # Strict pool: 4-digit auto IDs (MSA1000..MSA9999).
+    for _ in range(30000):
+        code = f"MSA{rng.randint(1000, 9999)}"
         if not is_msa_code_duplicate(code):
             return code
+
+    raise RuntimeError("MSA code pool exhausted (MSA1000-MSA9999)")
+
+def repair_missing_duplicate_msa_codes():
+    """Backfill missing/invalid/duplicate MSA codes at startup."""
+    repaired = 0
+    seen = set()
+
+    docs = list(col_pdfs.find({}, {"_id": 1, "msa_code": 1}))
+    for doc in docs:
+        code = (doc.get("msa_code") or "").strip().upper()
+        valid = bool(re.fullmatch(r"^MSA\d{4}$", code))
+
+        if valid and code not in seen:
+            seen.add(code)
+            continue
+
+        for _ in range(20):
+            new_code = generate_unique_msa_code()
+            try:
+                res = col_pdfs.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"msa_code": new_code}}
+                )
+                if res.modified_count:
+                    repaired += 1
+                seen.add(new_code)
+                break
+            except DuplicateKeyError:
+                continue
+
+    return repaired
+
+def randomize_non_4_digit_msa_codes():
+    """Replace non-4-digit legacy MSA IDs with strict random 4-digit IDs."""
+    migrated = 0
+    docs = list(col_pdfs.find({"msa_code": {"$exists": True, "$not": {"$regex": r"^MSA\d{4}$"}}}, {"_id": 1, "msa_code": 1}))
+    for doc in docs:
+        for _ in range(20):
+            new_code = generate_unique_msa_code()
+            try:
+                res = col_pdfs.update_one({"_id": doc["_id"]}, {"$set": {"msa_code": new_code}})
+                if res.modified_count:
+                    migrated += 1
+                break
+            except DuplicateKeyError:
+                continue
+    return migrated
+
+def ensure_unique_msa_code_index():
+    """Ensure DB-level uniqueness for msa_code so duplicates can never persist."""
+    try:
+        col_pdfs.create_index("msa_code", unique=True, sparse=True, name="pdf_msa_code_unique")
+        return
+    except Exception as first_err:
+        msg = str(first_err).lower()
+        if "already exists" not in msg and "indexkeyspecsconflict" not in msg and "equivalent" not in msg:
+            raise
+
+    for idx_name in ("pdf_msa_code", "pdf_msa_code_1", "pdf_msa_code_unique"):
+        try:
+            col_pdfs.drop_index(idx_name)
+        except Exception:
+            pass
+
+    col_pdfs.create_index("msa_code", unique=True, sparse=True, name="pdf_msa_code_unique")
 
 def get_next_cc_code():
     """
@@ -1246,6 +1382,53 @@ def is_ig_name_duplicate(name, exclude_id=None):
         query["_id"] = {"$ne": ObjectId(exclude_id)}
     
     return col_ig_content.find_one(query) is not None
+
+def split_text_chunks(text: str, chunk_size: int = 3800):
+    """Split text into Telegram-safe chunks, preferring line boundaries."""
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    for line in text.splitlines(keepends=True):
+        if len(line) > chunk_size:
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(line), chunk_size):
+                chunks.append(line[i:i + chunk_size])
+            continue
+
+        if len(current) + len(line) > chunk_size:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+async def send_chunked_message(
+    message: types.Message,
+    text: str,
+    reply_markup=None,
+    parse_mode: str = "HTML",
+    disable_web_page_preview: bool = False,
+    chunk_size: int = 3800,
+):
+    """Send long text safely; only the final chunk keeps the reply keyboard."""
+    parts = split_text_chunks(text, chunk_size=chunk_size)
+    for i, part in enumerate(parts):
+        kb = reply_markup if i == len(parts) - 1 else None
+        await message.answer(
+            part,
+            reply_markup=kb,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
 
 async def send_ig_list_view(message: types.Message, page=0, mode="list"):
     """
@@ -1332,12 +1515,13 @@ async def send_ig_list_view(message: types.Message, page=0, mode="list"):
     if buttons: keyboard.append(buttons)
     keyboard.append([cancel_btn])
     
-    if len(text) > 4000:
-        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for part in parts:
-             await message.answer(part, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
-    else:
-        await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML")
+    await send_chunked_message(
+        message,
+        text,
+        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 async def send_pdf_list_view(message: types.Message, page=0, mode="list"):
     """
@@ -1516,7 +1700,13 @@ async def send_pdf_list_view(message: types.Message, page=0, mode="list"):
     if buttons: keyboard.append(buttons)
     keyboard.append([cancel_btn])
     
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML", disable_web_page_preview=True)
+    await send_chunked_message(
+        message,
+        text,
+        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 
@@ -1594,7 +1784,7 @@ def get_add_menu():
     keyboard = [
         [KeyboardButton(text="📄 PDF"), KeyboardButton(text="💸 AFFILIATE")],
         [KeyboardButton(text="🔑 CODE"), KeyboardButton(text="▶️ YT")],
-        [KeyboardButton(text="📸 IG"), KeyboardButton(text="🎬 TUTORIAL")],
+        [KeyboardButton(text="📸 IGCC"), KeyboardButton(text="🎬 TUTORIAL")],
         [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -1692,7 +1882,8 @@ def get_backup_menu():
     keyboard = [
         [KeyboardButton(text="💾 FULL BACKUP")],
         [KeyboardButton(text="📋 VIEW AS JSON"), KeyboardButton(text="📊 BACKUP STATS")],
-        [KeyboardButton(text="📤 JSON RESTORE"), KeyboardButton(text="📜 BACKUP HISTORY")],
+        [KeyboardButton(text="📤 JSON RESTORE"), KeyboardButton(text="� BACKUP HISTORY")],
+        [KeyboardButton(text="🗑️ RESET BACKUPS")],
         [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -1700,27 +1891,56 @@ def get_backup_menu():
 # --- Helpers for Deep Linking ---
 def generate_alphanumeric(length=8):
     chars = string.ascii_letters + string.digits
-    return "".join(random.choice(chars) for _ in range(length))
+    return "".join(random.SystemRandom().choice(chars) for _ in range(length))
 
 def generate_digits(length=8):
-    return "".join(random.choice(string.digits) for _ in range(length))
+    return "".join(random.SystemRandom().choice(string.digits) for _ in range(length))
+
+def generate_unique_pdf_start_code(field_name: str, length: int = 8, alphanumeric: bool = False) -> str:
+    """Generate a DB-unique start code for a specific PDF code field."""
+    chars = (string.ascii_letters + string.digits) if alphanumeric else string.digits
+    rng = random.SystemRandom()
+    for _ in range(5000):
+        candidate = "".join(rng.choice(chars) for _ in range(length))
+        exists = col_pdfs.find_one({field_name: candidate}, {"_id": 1})
+        if not exists:
+            return candidate
+    raise RuntimeError(f"Unable to allocate unique code for field '{field_name}'")
 
 async def ensure_pdf_codes(pdf):
     """Ensure PDF has all start codes"""
     updates = {}
     if not pdf.get("ig_start_code"):
-        updates["ig_start_code"] = generate_alphanumeric(8)
+        updates["ig_start_code"] = generate_unique_pdf_start_code("ig_start_code", length=8, alphanumeric=True)
     if not pdf.get("yt_start_code"):
-        updates["yt_start_code"] = generate_digits(8)
+        updates["yt_start_code"] = generate_unique_pdf_start_code("yt_start_code", length=8, alphanumeric=False)
     if not pdf.get("aff_start_code"):
-        updates["aff_start_code"] = generate_digits(8)
+        updates["aff_start_code"] = generate_unique_pdf_start_code("aff_start_code", length=8, alphanumeric=False)
     if not pdf.get("orig_start_code"):
-        updates["orig_start_code"] = generate_digits(8)
+        updates["orig_start_code"] = generate_unique_pdf_start_code("orig_start_code", length=8, alphanumeric=False)
     
     if updates:
         col_pdfs.update_one({"_id": pdf["_id"]}, {"$set": updates})
         return {**pdf, **updates}
     return pdf
+
+async def ensure_pdf_msa_code(pdf) -> str:
+    """Ensure a PDF has a valid unique MSA code and return it."""
+    code = (pdf.get("msa_code") or "").strip().upper()
+    is_valid = bool(re.fullmatch(r"^MSA\d{4}$", code))
+
+    if is_valid and not is_msa_code_duplicate(code, exclude_pdf_id=str(pdf.get("_id"))):
+        return code
+
+    for _ in range(20):
+        candidate = generate_unique_msa_code()
+        try:
+            col_pdfs.update_one({"_id": pdf["_id"]}, {"$set": {"msa_code": candidate}})
+            return candidate
+        except DuplicateKeyError:
+            continue
+
+    raise RuntimeError("Unable to allocate unique MSA code for PDF")
 
 async def ensure_ig_cc_code(content):
     """Ensure IG content has start_code"""
@@ -1765,6 +1985,14 @@ def get_tutorial_pk_menu():
         [KeyboardButton(text="⬅️ BACK TO ADD MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+def _get_tutorial_confirm_kb(confirm_text: str) -> ReplyKeyboardMarkup:
+    """One-shot confirm/cancel reply keyboard for tutorial confirmation prompts."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=confirm_text), KeyboardButton(text="❌ CANCEL")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
 
 
 # --- Handlers ---
@@ -2252,9 +2480,9 @@ async def process_add_pdf_link(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Invalid Link. Please enter a valid URL.", reply_markup=get_cancel_keyboard())
         return
 
-    # Save to DB
+    # Save to DB (MSA code is generated immediately and guaranteed unique)
     idx = await get_next_pdf_index()
-    doc = {
+    base_doc = {
         "index": idx,
         "name": name,
         "link": link,
@@ -2271,15 +2499,41 @@ async def process_add_pdf_link(message: types.Message, state: FSMContext):
         "last_ig_click": None,
         "last_yt_click": None,
         "last_yt_code_click": None,
-        "msa_code": generate_unique_msa_code()
     }
-    col_pdfs.insert_one(doc)
+
+    assigned_msa_code = None
+    for _ in range(20):
+        candidate_code = generate_unique_msa_code()
+        try:
+            doc = {**base_doc, "msa_code": candidate_code}
+            col_pdfs.insert_one(doc)
+            assigned_msa_code = candidate_code
+            break
+        except DuplicateKeyError:
+            continue
+
+    if not assigned_msa_code:
+        await state.clear()
+        await message.answer(
+            "❌ <b>Failed to allocate unique MSA code.</b>\nPlease try again.",
+            reply_markup=get_pdf_menu(),
+            parse_mode="HTML"
+        )
+        return
     
     # Log Action
-    log_user_action(message.from_user, "Added PDF", f"Name: {name}, Index: {idx}")
+    log_user_action(message.from_user, "Added PDF", f"Name: {name}, Index: {idx}, MSA: {assigned_msa_code}")
 
     await state.clear()
-    await message.answer(f"✅ <b>PDF Added!</b>\n\n🆔 Index: `{idx}`\n📄 Name: `{name}`\n🔗 Link: `{link}`", reply_markup=get_pdf_menu(), parse_mode="HTML")
+    await message.answer(
+        f"✅ <b>PDF Added!</b>\n\n"
+        f"🆔 Index: `{idx}`\n"
+        f"📄 Name: `{name}`\n"
+        f"🔗 Link: `{link}`\n"
+        "🔑 MSA Code: `Generated` (locked/hidden until affiliate is assigned)",
+        reply_markup=get_pdf_menu(),
+        parse_mode="HTML"
+    )
 
 # 2. LIST PDF
 @dp.message(F.text == "📋 LIST PDF")
@@ -3050,7 +3304,7 @@ async def process_msa_edit_select(message: types.Message, state: FSMContext):
         f"✏️ <b>EDITING MSA CODE</b>\n"
         f"📄 PDF: {pdf['name']}\n"
         f"🔑 Current Code: `{pdf['msa_code']}`\n\n"
-        "⌨️ <b>Enter New MSA Code</b> (Format: MSA12345):",
+        "⌨️ <b>Enter New MSA Code</b> (Format: MSA1234):",
         reply_markup=get_cancel_keyboard(),
         parse_mode="HTML"
     )
@@ -3084,10 +3338,18 @@ async def process_msa_edit_new_code(message: types.Message, state: FSMContext):
 
     from bson.objectid import ObjectId
     
-    col_pdfs.update_one(
-        {"_id": ObjectId(data['pdf_id'])},
-        {"$set": {"msa_code": code}}
-    )
+    try:
+        col_pdfs.update_one(
+            {"_id": ObjectId(data['pdf_id'])},
+            {"$set": {"msa_code": code}}
+        )
+    except DuplicateKeyError:
+        await message.answer(
+            "⚠️ <b>MSA Code Already Exists.</b> Please enter a different code.",
+            reply_markup=get_cancel_keyboard(),
+            parse_mode="HTML"
+        )
+        return
     
     old_code = data['old_code']
     pdf_name = data['pdf_name']
@@ -3716,39 +3978,85 @@ async def all_pdf_links_handler(message: types.Message, page=0):
     username = BOT_USERNAME
 
     entries = []
+    ready_count = 0
     for pdf in pdfs:
-        # Always ensure start codes exist (generates if missing)
-        pdf = await ensure_pdf_codes(pdf)
+        idx = pdf.get("index", "?")
+        raw_name = pdf.get("name") or "Unnamed"
+        safe_name = _html.escape(raw_name)
 
-        idx      = pdf.get("index", "?")
-        name     = pdf.get("name") or "⚠️ Unnamed"
-        has_link = bool(pdf.get("link"))
+        has_pdf_link = bool((pdf.get("link") or "").strip())
+        has_affiliate = bool((pdf.get("affiliate_link") or "").strip())
 
-        sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', pdf.get("name", "unknown"))
-        sanitized_name = re.sub(r'_+', '_', sanitized_name).strip('_')
+        msa_code = ""
+        msa_ready = False
+        try:
+            msa_code = await ensure_pdf_msa_code(pdf)
+            msa_ready = bool(msa_code)
+        except Exception:
+            msa_ready = False
 
-        ig_code = pdf["ig_start_code"]
-        yt_code = pdf["yt_start_code"]
+        block = f"🆔 <b>{idx}.</b> <b>{safe_name}</b>\n"
 
-        ig_link = f"https://t.me/{username}?start={ig_code}_ig_{sanitized_name}"
-        yt_link = f"https://t.me/{username}?start={yt_code}_yt_{sanitized_name}"
+        if has_pdf_link and has_affiliate and msa_ready:
+            # Generate deep links only for fully configured PDFs.
+            pdf = await ensure_pdf_codes(pdf)
 
-        block = f"🆔 <b>{idx}.</b> <b>{name}</b>\n"
+            sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', raw_name or "unknown")
+            sanitized_name = re.sub(r'_+', '_', sanitized_name).strip('_') or "unknown"
 
-        if not has_link:
-            block += "⚠️ <i>PDF file not uploaded — add via 📄 PDF menu</i>\n"
+            ig_code = pdf["ig_start_code"]
+            yt_code = pdf["yt_start_code"]
 
-        block += (
-            f"📸 <b>IG Link</b>: <code>{ig_link}</code>\n"
-            f"   └ 🎟️ <code>{ig_code}</code>\n"
-            f"▶️ <b>YT Link</b>: <code>{yt_link}</code>\n"
-            f"   └ 🎟️ <code>{yt_code}</code>\n"
-        )
+            ig_link = f"https://t.me/{username}?start={ig_code}_ig_{sanitized_name}"
+            yt_link = f"https://t.me/{username}?start={yt_code}_yt_{sanitized_name}"
+
+            block += (
+                f"📸 <b>IG Link</b>: <code>{ig_link}</code>\n"
+                f"   └ 🎟️ <code>{ig_code}</code>\n"
+                f"▶️ <b>YT Link</b>: <code>{yt_link}</code>\n"
+                f"   └ 🎟️ <code>{yt_code}</code>\n"
+                f"🔑 <b>MSA Code</b>: <code>{_html.escape(msa_code)}</code>\n"
+            )
+            ready_count += 1
+        else:
+            missing = []
+            if not has_pdf_link:
+                missing.append("PDF link")
+            if not has_affiliate:
+                missing.append("Affiliate link")
+            if not msa_ready:
+                missing.append("MSA code")
+
+            block += "⚠️ <b>Link generation blocked</b>\n"
+            block += "🧩 <b>Missing:</b>\n"
+            for item in missing:
+                block += f"• {item}\n"
+
+            block += "✅ <b>Needed to generate this PDF link:</b>\n"
+            if not has_pdf_link:
+                block += "• Add PDF link in ➕ ADD → ➕ ADD PDF\n"
+            if not has_affiliate:
+                block += "• Add affiliate in ➕ ADD → 💸 AFFILIATE → ➕ ADD AFFILIATE\n"
+            if not msa_ready:
+                block += "• Retry add/edit flow so system can allocate a valid MSA code\n"
+
+            if msa_ready and not has_affiliate:
+                block += "🔒 <b>MSA Code Status:</b> Generated and locked until affiliate link is added.\n"
+            elif msa_ready:
+                block += "🔒 <b>MSA Code Status:</b> Generated (hidden while link requirements are incomplete).\n"
+            else:
+                block += "ℹ️ <b>MSA Code Status:</b> Allocation pending/fix required.\n"
 
         block += "────────────────────\n"
         entries.append(block)
 
-    header = f"📑 <b>ALL PDF LINKS</b> (Page {page+1} / {((total-1)//limit)+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    page_total = len(pdfs)
+    blocked_count = page_total - ready_count
+    header = (
+        f"📑 <b>ALL PDF LINKS</b> (Page {page+1} / {((total-1)//limit)+1})\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Ready: <b>{ready_count}</b> | ⚠️ Blocked: <b>{blocked_count}</b>\n\n"
+    )
 
     # Pagination nav keyboard
     buttons = []
@@ -3786,6 +4094,7 @@ async def pdf_link_pagination(message: types.Message):
     except Exception:
         await message.answer("❌ Error navigating.")
 
+@dp.message(F.text == "📸 IGCC")
 @dp.message(F.text == "📸 IG")
 async def ig_menu_handler(message: types.Message):
     if not await check_authorization(message, "IG Menu", "can_add"):
@@ -4434,7 +4743,7 @@ async def send_search_pdf_list(message: types.Message, page=0):
         text += f"{pdf['index']}. {pdf['name']}\n"
         text += f"🔗 {pdf['link']}\n\n"
     
-    text += "━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter PDF Index or Name:</b>"
+    text += "━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter PDF Index, Name, or MSA Code:</b>"
     
     # Pagination buttons
     buttons = []
@@ -4487,6 +4796,9 @@ async def process_pdf_search(message: types.Message, state: FSMContext):
     # Try by index
     if query.isdigit():
         pdf = col_pdfs.find_one({"index": int(query)})
+    # Try by MSA code
+    elif re.fullmatch(r"^MSA\d{4}$", query.upper()):
+        pdf = col_pdfs.find_one({"msa_code": query.upper()})
     # Try by name
     else:
         pdf = col_pdfs.find_one({"name": {"$regex": f"^{query}$", "$options": "i"}})
@@ -4517,7 +4829,7 @@ async def process_pdf_search(message: types.Message, state: FSMContext):
     await state.set_state(SearchStates.waiting_for_pdf_input)
     
     # Add input prompt
-    text += "\n\n━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter another PDF Index or Name to Search:</b>"
+    text += "\n\n━━━━━━━━━━━━━━━━━━━━\n⌨️ <b>Enter another PDF Index, Name, or MSA Code:</b>"
     
     # Auto-split if message exceeds Telegram's 4096 character limit
     if len(text) > 4000:
@@ -4656,8 +4968,22 @@ async def process_ig_search(message: types.Message, state: FSMContext):
         await message.answer(text, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
 
 
+def get_diagnosis_nav_keyboard(page: int, total_pages: int) -> ReplyKeyboardMarkup:
+    """Reply keyboard for diagnosis long-report pagination."""
+    row = []
+    if page > 0:
+        row.append(KeyboardButton(text="⬅️ PREV_DIAG"))
+    if page < total_pages - 1:
+        row.append(KeyboardButton(text="➡️ NEXT_DIAG"))
+    keyboard = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([KeyboardButton(text="⬅️ BACK TO ANALYTICS")])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
 @dp.message(F.text == "🩺 DIAGNOSIS")
-async def diagnosis_handler(message: types.Message):
+async def diagnosis_handler(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "System Diagnosis", "can_view_analytics"):
         return
     """Comprehensive System Health Check & Diagnosis"""
@@ -4732,6 +5058,15 @@ async def diagnosis_handler(message: types.Message):
     # --- 4. DUPLICATE DETECTION ---
     total_checks += 1
     try:
+        migrated_legacy_msa = await asyncio.to_thread(randomize_non_4_digit_msa_codes)
+        if migrated_legacy_msa > 0:
+            warnings.append(f"ℹ️ Migrated {migrated_legacy_msa} non-4-digit MSA code(s) to strict random MSA1234 format")
+
+        repaired_msa = await asyncio.to_thread(repair_missing_duplicate_msa_codes)
+        await asyncio.to_thread(ensure_unique_msa_code_index)
+        if repaired_msa > 0:
+            warnings.append(f"ℹ️ Auto-repaired {repaired_msa} invalid/duplicate MSA code(s)")
+
         # Check for duplicate MSA codes
         pipeline = [
             {"$match": {"msa_code": {"$exists": True, "$ne": None, "$ne": ""}}},
@@ -4753,18 +5088,37 @@ async def diagnosis_handler(message: types.Message):
     # --- 5. INDEX VERIFICATION ---
     total_checks += 1
     try:
-        indexes = col_pdfs.list_indexes()
-        index_names = [idx['name'] for idx in indexes]
-        
-        # These are the explicit named indexes created in init_db()
-        required_indexes = ['pdf_index_unique', 'pdf_created_at', 'pdf_msa_code']
-        missing_indexes = [idx for idx in required_indexes if idx not in index_names]
-        
+        required_indexes = {
+            "pdf_index_unique": (col_pdfs, "index", {"unique": True, "name": "pdf_index_unique"}),
+            "pdf_created_at": (col_pdfs, "created_at", {"name": "pdf_created_at"}),
+            "pdf_msa_code": (col_pdfs, "msa_code", {"sparse": True, "name": "pdf_msa_code"}),
+        }
+
+        current_names = [idx["name"] for idx in col_pdfs.list_indexes()]
+        missing_indexes = [name for name in required_indexes if name not in current_names]
+
         if missing_indexes:
-            warnings.append(f"⚠️ Named indexes missing (will be created on restart): {', '.join(missing_indexes)}")
-            checks_passed += 1
-        else:
-            checks_passed += 1
+            created = []
+            failed = []
+            for idx_name in missing_indexes:
+                coll, key_spec, kwargs = required_indexes[idx_name]
+                try:
+                    coll.create_index(key_spec, **kwargs)
+                    created.append(idx_name)
+                except Exception as ie:
+                    failed.append(f"{idx_name} ({ie})")
+
+            if created:
+                warnings.append(f"ℹ️ Auto-created missing indexes: {', '.join(created)}")
+
+            current_names = [idx["name"] for idx in col_pdfs.list_indexes()]
+            still_missing = [name for name in required_indexes if name not in current_names]
+            if still_missing:
+                warnings.append(f"⚠️ Named indexes still missing: {', '.join(still_missing)}")
+            if failed:
+                warnings.append(f"⚠️ Index create errors: {len(failed)}")
+
+        checks_passed += 1
             
     except Exception as e:
         warnings.append(f"⚠️ Index Check: {str(e)}")
@@ -4865,13 +5219,29 @@ async def diagnosis_handler(message: types.Message):
     # --- 11. CLICK TRACKING FIELDS CHECK ---
     total_checks += 1
     try:
-        # Check for PDFs missing click tracking fields
-        pdfs_no_ig_clicks = col_pdfs.count_documents({"ig_start_clicks": {"$exists": False}})
-        pdfs_no_yt_clicks = col_pdfs.count_documents({"yt_start_clicks": {"$exists": False}})
-        pdfs_no_total_clicks = col_pdfs.count_documents({"clicks": {"$exists": False}})
-        
-        if pdfs_no_ig_clicks > 0 or pdfs_no_yt_clicks > 0 or pdfs_no_total_clicks > 0:
-            warnings.append(f"⚠️ {max(pdfs_no_ig_clicks, pdfs_no_yt_clicks, pdfs_no_total_clicks)} PDFs missing click tracking fields")
+        # Auto-fill missing tracking fields live.
+        click_defaults = {
+            "clicks": 0,
+            "affiliate_clicks": 0,
+            "ig_start_clicks": 0,
+            "yt_start_clicks": 0,
+            "yt_code_clicks": 0,
+            "last_clicked_at": None,
+            "last_affiliate_click": None,
+            "last_ig_click": None,
+            "last_yt_click": None,
+            "last_yt_code_click": None,
+        }
+        click_missing_query = {
+            "$or": [{k: {"$exists": False}} for k in click_defaults.keys()]
+        }
+        fix_res = col_pdfs.update_many(click_missing_query, {"$set": click_defaults})
+        if fix_res.modified_count > 0:
+            warnings.append(f"ℹ️ Auto-filled click tracking fields for {fix_res.modified_count} PDF(s)")
+
+        remaining_missing = col_pdfs.count_documents(click_missing_query)
+        if remaining_missing > 0:
+            warnings.append(f"⚠️ {remaining_missing} PDFs still missing click tracking fields")
         else:
             checks_passed += 1
             
@@ -4881,32 +5251,67 @@ async def diagnosis_handler(message: types.Message):
     # --- 12. DEEP LINK START CODES CHECK ---
     total_checks += 1
     try:
-        # Check for missing start codes
-        pdfs_no_ig_code = col_pdfs.count_documents({"ig_start_code": {"$exists": False}})
-        pdfs_no_yt_code = col_pdfs.count_documents({"yt_start_code": {"$exists": False}})
-        
-        # Check for duplicate start codes
-        ig_code_pipeline = [
+        missing_code_query = {
+            "$or": [
+                {"ig_start_code": {"$exists": False}},
+                {"ig_start_code": None},
+                {"ig_start_code": ""},
+                {"yt_start_code": {"$exists": False}},
+                {"yt_start_code": None},
+                {"yt_start_code": ""},
+            ]
+        }
+        missing_docs = list(col_pdfs.find(missing_code_query, {"_id": 1, "ig_start_code": 1, "yt_start_code": 1}))
+        if missing_docs:
+            for pdf_doc in missing_docs:
+                await ensure_pdf_codes(pdf_doc)
+            warnings.append(f"ℹ️ Auto-generated deep-link codes for {len(missing_docs)} PDF(s)")
+
+        # Repair duplicate start codes by reassigning all but one occurrence per duplicate value.
+        repaired_ig_dups = 0
+        repaired_yt_dups = 0
+        for field_name, is_alpha in (("ig_start_code", True), ("yt_start_code", False)):
+            dup_pipeline = [
+                {"$match": {field_name: {"$exists": True, "$ne": None, "$ne": ""}}},
+                {"$group": {"_id": f"${field_name}", "ids": {"$push": "$_id"}, "count": {"$sum": 1}}},
+                {"$match": {"count": {"$gt": 1}}},
+            ]
+            dup_docs = list(col_pdfs.aggregate(dup_pipeline))
+            for dup in dup_docs:
+                for dup_id in dup["ids"][1:]:
+                    new_code = generate_unique_pdf_start_code(field_name, length=8, alphanumeric=is_alpha)
+                    col_pdfs.update_one({"_id": dup_id}, {"$set": {field_name: new_code}})
+                    if field_name == "ig_start_code":
+                        repaired_ig_dups += 1
+                    else:
+                        repaired_yt_dups += 1
+
+        if repaired_ig_dups > 0:
+            warnings.append(f"ℹ️ Repaired {repaired_ig_dups} duplicate IG start code assignment(s)")
+        if repaired_yt_dups > 0:
+            warnings.append(f"ℹ️ Repaired {repaired_yt_dups} duplicate YT start code assignment(s)")
+
+        pdfs_no_ig_code = col_pdfs.count_documents({"$or": [{"ig_start_code": {"$exists": False}}, {"ig_start_code": None}, {"ig_start_code": ""}]})
+        pdfs_no_yt_code = col_pdfs.count_documents({"$or": [{"yt_start_code": {"$exists": False}}, {"yt_start_code": None}, {"yt_start_code": ""}]})
+
+        dup_ig_codes = list(col_pdfs.aggregate([
             {"$match": {"ig_start_code": {"$exists": True, "$ne": None, "$ne": ""}}},
             {"$group": {"_id": "$ig_start_code", "count": {"$sum": 1}}},
-            {"$match": {"count": {"$gt": 1}}}
-        ]
-        yt_code_pipeline = [
+            {"$match": {"count": {"$gt": 1}}},
+        ]))
+        dup_yt_codes = list(col_pdfs.aggregate([
             {"$match": {"yt_start_code": {"$exists": True, "$ne": None, "$ne": ""}}},
             {"$group": {"_id": "$yt_start_code", "count": {"$sum": 1}}},
-            {"$match": {"count": {"$gt": 1}}}
-        ]
-        
-        dup_ig_codes = list(col_pdfs.aggregate(ig_code_pipeline))
-        dup_yt_codes = list(col_pdfs.aggregate(yt_code_pipeline))
-        
+            {"$match": {"count": {"$gt": 1}}},
+        ]))
+
         if pdfs_no_ig_code > 0 or pdfs_no_yt_code > 0:
-            warnings.append(f"⚠️ {max(pdfs_no_ig_code, pdfs_no_yt_code)} PDFs missing deep link codes")
+            warnings.append(f"⚠️ {max(pdfs_no_ig_code, pdfs_no_yt_code)} PDFs still missing deep link codes")
         if len(dup_ig_codes) > 0:
             issues.append(f"❌ Found {len(dup_ig_codes)} duplicate IG start codes")
         if len(dup_yt_codes) > 0:
             issues.append(f"❌ Found {len(dup_yt_codes)} duplicate YT start codes")
-            
+
         if pdfs_no_ig_code == 0 and pdfs_no_yt_code == 0 and len(dup_ig_codes) == 0 and len(dup_yt_codes) == 0:
             checks_passed += 1
             
@@ -4986,6 +5391,13 @@ async def diagnosis_handler(message: types.Message):
         last_backup = col_backups.find_one(sort=[("created_at", -1)])
         if last_backup:
             last_bk_time = last_backup.get("created_at")
+            if not last_bk_time:
+                obj_id = last_backup.get("_id")
+                if hasattr(obj_id, "generation_time"):
+                    inferred_time = obj_id.generation_time.replace(tzinfo=None)
+                    col_backups.update_one({"_id": obj_id}, {"$set": {"created_at": inferred_time}})
+                    last_bk_time = inferred_time
+                    warnings.append("ℹ️ Auto-filled missing backup timestamp from record metadata")
             if last_bk_time:
                 delta = now_local() - last_bk_time
                 days_ago = delta.days
@@ -5117,9 +5529,58 @@ async def diagnosis_handler(message: types.Message):
     
     report += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     report += f"_Diagnostic completed at {now_local().strftime('%I:%M:%S %p')}_"
-    
-    await status_msg.edit_text(report, parse_mode="HTML")
+
+    diag_pages = split_text_chunks(report, chunk_size=3800)
+    if len(diag_pages) == 1:
+        await state.update_data(diagnosis_pages=[], diagnosis_page=0)
+        await status_msg.edit_text(diag_pages[0], parse_mode="HTML")
+    else:
+        await state.update_data(diagnosis_pages=diag_pages, diagnosis_page=0)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.answer(
+            diag_pages[0],
+            parse_mode="HTML",
+            reply_markup=get_diagnosis_nav_keyboard(0, len(diag_pages)),
+        )
+
     log_user_action(message.from_user, "Ran System Diagnosis", f"Score: {health_score:.1f}%")
+
+
+@dp.message(F.text == "➡️ NEXT_DIAG")
+async def diagnosis_next_page_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pages = data.get("diagnosis_pages") or []
+    if not pages:
+        return
+
+    page = int(data.get("diagnosis_page", 0))
+    page = min(page + 1, len(pages) - 1)
+    await state.update_data(diagnosis_page=page)
+    await message.answer(
+        pages[page],
+        reply_markup=get_diagnosis_nav_keyboard(page, len(pages)),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(F.text == "⬅️ PREV_DIAG")
+async def diagnosis_prev_page_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pages = data.get("diagnosis_pages") or []
+    if not pages:
+        return
+
+    page = int(data.get("diagnosis_page", 0))
+    page = max(page - 1, 0)
+    await state.update_data(diagnosis_page=page)
+    await message.answer(
+        pages[page],
+        reply_markup=get_diagnosis_nav_keyboard(page, len(pages)),
+        parse_mode="HTML",
+    )
 
 def get_recent_logs(lines_count=30):
     """Refactored log reader"""
@@ -5267,9 +5728,11 @@ GUIDE_PAGES = [
 
         "💾 <b>BACKUP MENU</b> *(Data safety tools)*\n"
         "├ 💾 FULL BACKUP      — Export entire DB to JSON file\n"
-        "├ 📋 VIEW AS JSON     — Preview backup in chat\n"
+        "├ 📋 VIEW AS JSON     — Export each collection JSON file\n"
+        "├ 📤 JSON RESTORE     — Restore Bot3 data: single/multi JSON or ZIP\n"
         "├ 📊 BACKUP STATS     — Show DB collection sizes\n"
-        "└ 📜 BACKUP HISTORY   — View past backup records\n\n"
+        "├ 📜 BACKUP HISTORY   — View past backup records\n"
+        "└ 🗑️ RESET BACKUPS    — Backup-only wipe (double confirm)\n\n"
 
         "🖥️ <b>TERMINAL</b> *(Master Admin only)*\n"
         "├ Run any shell command directly from Telegram\n"
@@ -5534,10 +5997,12 @@ async def analytics_overview_handler(message: types.Message):
     text += "\n═══════════════════════\n"
     text += "💡 Select a category below for detailed analytics."
     
-    await message.answer(
+    await send_chunked_message(
+        message,
         text,
         reply_markup=get_analytics_menu(),
-        parse_mode="HTML"
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )
 
 async def send_analytics_view(message: types.Message, category: str, page: int = 0):
@@ -5803,6 +6268,7 @@ async def analytics_next_handler(message: types.Message, state: FSMContext):
 @dp.message(F.text == "⬅️ BACK TO ANALYTICS")
 async def back_to_analytics_handler(message: types.Message, state: FSMContext):
     """Return to analytics menu"""
+    await state.update_data(diagnosis_pages=[], diagnosis_page=0)
     await state.set_state(AnalyticsStates.viewing_analytics)
     await message.answer(
         "📊 <b>ANALYTICS DASHBOARD</b>",
@@ -5812,19 +6278,38 @@ async def back_to_analytics_handler(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "🆔 MSA ID POOL")
 async def msa_id_pool_handler(message: types.Message):
-    """Show MSA Node ID pool usage with progress bar"""
+    """Show live MSA code integrity and auto-ID pool usage from bot3_pdfs."""
     if not await check_authorization(message, "MSA ID Pool", "can_view_analytics"):
         return
     try:
-        # MSA IDs live in MSANodeDB (shared with bot8/bot10)
-        msa_col = client[MONGO_DB_NAME]["msa_ids"]
-        total_allocated = msa_col.count_documents({})
-        total_retired = msa_col.count_documents({"retired": True})
-        active_members = total_allocated - total_retired
+        msa_exists_query = {"msa_code": {"$exists": True, "$ne": None, "$ne": ""}}
+        total_pdfs = col_pdfs.count_documents({})
+        with_code = col_pdfs.count_documents(msa_exists_query)
 
-        TOTAL_POOL = 900_000_000  # 100,000,000 – 999,999,999
-        available = TOTAL_POOL - total_allocated
-        pct_used = total_allocated / TOTAL_POOL * 100
+        unique_count_docs = list(col_pdfs.aggregate([
+            {"$match": msa_exists_query},
+            {"$group": {"_id": "$msa_code"}},
+            {"$count": "n"},
+        ]))
+        unique_codes = unique_count_docs[0]["n"] if unique_count_docs else 0
+        duplicate_assignments = max(0, with_code - unique_codes)
+
+        valid_format_count = col_pdfs.count_documents({"msa_code": {"$regex": r"^MSA\d{4}$"}})
+        invalid_format_count = max(0, with_code - valid_format_count)
+
+        # Auto-generated pool uses strict 4-digit IDs: MSA1000..MSA9999
+        auto_unique_docs = list(col_pdfs.aggregate([
+            {"$match": {"msa_code": {"$regex": r"^MSA\d{4}$"}}},
+            {"$group": {"_id": "$msa_code"}},
+            {"$count": "n"},
+        ]))
+        auto_unique_used = auto_unique_docs[0]["n"] if auto_unique_docs else 0
+
+        non_4_digit_count = col_pdfs.count_documents({"msa_code": {"$exists": True, "$not": {"$regex": r"^MSA\d{4}$"}}})
+
+        AUTO_POOL_SIZE = 9_000
+        available = max(0, AUTO_POOL_SIZE - auto_unique_used)
+        pct_used = (auto_unique_used / AUTO_POOL_SIZE * 100) if AUTO_POOL_SIZE else 0
         filled = round(pct_used / 5)  # 20-block bar (each block = 5%)
         bar = "█" * filled + "░" * (20 - filled)
 
@@ -5837,20 +6322,33 @@ async def msa_id_pool_handler(message: types.Message):
         else:
             risk = "🟢 ABUNDANT"
 
+        integrity = "✅ CLEAN" if duplicate_assignments == 0 and invalid_format_count == 0 else "⚠️ REVIEW NEEDED"
+
         text = (
             "🆔 <b>MSA NODE ID POOL STATUS</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊 <b>Total Pool:</b> 900,000,000 IDs\n"
-            f"✅ <b>Active Members:</b> {active_members:,}\n"
-            f"🗄️ <b>Retired IDs (reserved):</b> {total_retired:,}\n"
-            f"🔢 <b>Total Used (active+retired):</b> {total_allocated:,}\n"
-            f"🟢 <b>Available:</b> {available:,}\n\n"
-            f"📈 <b>Usage Bar:</b>\n<code>[{bar}]</code>\n"
-            f"<code>{pct_used:.6f}%</code> used \u2014 {risk}\n\n"
+            f"📚 <b>Total PDFs:</b> {total_pdfs:,}\n"
+            f"🔑 <b>PDFs With MSA Code:</b> {with_code:,}\n"
+            f"🧬 <b>Unique MSA Codes:</b> {unique_codes:,}\n"
+            f"🟢 <b>Code Integrity:</b> {integrity}\n"
+            f"⚠️ <b>Duplicate Assignments:</b> {duplicate_assignments:,}\n"
+            f"⚠️ <b>Invalid Format Codes:</b> {invalid_format_count:,}\n\n"
+            f"📊 <b>Auto-ID Pool (MSA1000-MSA9999):</b> {AUTO_POOL_SIZE:,}\n"
+            f"🔢 <b>Unique Auto IDs Used:</b> {auto_unique_used:,}\n"
+            f"🟢 <b>Available Auto IDs:</b> {available:,}\n"
+            f"🧹 <b>Non-4-digit Legacy IDs:</b> {non_4_digit_count:,}\n"
+            f"📈 <b>Pool Usage:</b>\n<code>[{bar}]</code>\n"
+            f"<code>{pct_used:.6f}%</code> used — {risk}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🕒 {now_local().strftime('%B %d, %Y  %I:%M:%S %p')}"
         )
-        await message.answer(text, parse_mode="HTML", reply_markup=get_analytics_menu())
+        await send_chunked_message(
+            message,
+            text,
+            reply_markup=get_analytics_menu(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
     except Exception as e:
         await message.answer(
             f"❌ MSA Pool check failed: `{str(e)[:150]}`",
@@ -5873,18 +6371,19 @@ async def start_reset_data(message: types.Message, state: FSMContext):
         [KeyboardButton(text="❌ CANCEL")]
     ]
     await message.answer(
-        "⚠️ <b>DANGER ZONE — FULL SYSTEM WIPE</b> ⚠️\n\n"
-        "You have requested to <b>RESET ALL BOT DATA</b>.\n\n"
-        "This will permanently delete <b>EVERY SINGLE THING</b> from the database:\n"
+        "⚠️ <b>DANGER ZONE — BOT3 DATA RESET</b> ⚠️\n\n"
+        "You requested to reset <b>Bot3 operational data</b> only.\n\n"
+        "This will permanently delete these Bot3 collections:\n"
         "• All PDFs and Links\n"
         "• All IG Content\n"
         "• All Logs and Settings\n"
         "• All Admins (except your master account)\n"
         "• All Banned Users\n"
-        "• All User Activity & Click Dedup Records\n"
-        "• All Backup Records\n\n"
+        "• All User Activity & Click Dedup Records\n\n"
+        "✅ <b>Backups are NOT touched here.</b>\n"
+        "Use <b>🗑️ RESET BACKUPS</b> in Backup menu for backup wipe.\n\n"
         "🔴 <b>THIS ACTION CANNOT BE UNDONE.</b>\n\n"
-        "<b>STEP 1 OF 3 — Click the button to proceed:</b>",
+        "<b>STEP 1 OF 2 — Click the button to proceed:</b>",
         reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
         parse_mode="HTML"
     )
@@ -5903,8 +6402,8 @@ async def process_reset_step1(message: types.Message, state: FSMContext):
 
     keyboard = [[KeyboardButton(text="❌ CANCEL")]]
     await message.answer(
-        "🛑 <b>STEP 2 OF 3 — ENTER THE SECURITY PIN</b> 🛑\n\n"
-        "This is a <b>one-time security PIN</b> that proves you are intentionally erasing all data.\n\n"
+        "🛑 <b>STEP 2 OF 2 — ENTER THE SECURITY PIN</b> 🛑\n\n"
+        "This one-time PIN confirms intentional Bot3 data reset.\n\n"
         f"Type this PIN exactly (no spaces):\n\n"
         f"<code>{reset_pin}</code>\n\n"
         "⚠️ This PIN is valid for this session only.\n"
@@ -5927,37 +6426,9 @@ async def process_reset_final(message: types.Message, state: FSMContext):
             reply_markup=get_main_menu(message.from_user.id)
         )
 
-    # PIN matched — ask for the final typed word as a last safeguard
-    new_pin = "".join(str(random.randint(0, 9)) for _ in range(6))
-    await state.update_data(reset_final_word=new_pin)
-
-    keyboard = [[KeyboardButton(text="❌ CANCEL")]]
-    await message.answer(
-        "🚨 <b>STEP 3 OF 3 — ABSOLUTE FINAL CONFIRMATION</b> 🚨\n\n"
-        "You are about to permanently wipe <b>ALL data</b>.\n\n"
-        f"Type this final code to execute the wipe:\n\n"
-        f"<code>WIPE-{new_pin}</code>\n\n"
-        "❌ Anything else cancels immediately.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="HTML"
-    )
-    await state.set_state(ResetStates.waiting_for_final_wipe_code)
-
-@dp.message(ResetStates.waiting_for_final_wipe_code)
-async def process_reset_execute(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    expected_word = f"WIPE-{data.get('reset_final_word', '')}"
-
-    if message.text.strip() != expected_word:
-        await state.clear()
-        return await message.answer(
-            "✅ Reset Cancelled. Code did not match — no data was erased.",
-            reply_markup=get_main_menu(message.from_user.id)
-        )
-
-    # All 3 confirmations passed — execute the wipe
+    # PIN matched — execute Bot3 data reset (2-step confirm complete)
     await state.clear()
-    await message.answer("🧨 <b>INITIATING COMPLETE SYSTEM WIPE...</b>", reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
+    await message.answer("🧨 <b>INITIATING BOT3 DATA RESET...</b>", reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
 
     try:
         collections_to_wipe = [
@@ -5965,7 +6436,6 @@ async def process_reset_execute(message: types.Message, state: FSMContext):
             "bot3_ig_content",
             "bot3_logs",
             "bot3_settings",
-            "bot3_backups",
             "bot3_admins",
             "bot3_banned_users",
             "bot3_user_activity",
@@ -5981,12 +6451,6 @@ async def process_reset_execute(message: types.Message, state: FSMContext):
             if os.path.exists(log_file):
                 with open(log_file, "w"):
                     pass
-
-        # Delete local backup files
-        backup_dir = "backups"
-        if os.path.exists(backup_dir):
-            import shutil
-            shutil.rmtree(backup_dir)
 
         # Re-seed master admin so the bot stays usable after wipe
         col_admins.update_one(
@@ -6005,14 +6469,15 @@ async def process_reset_execute(message: types.Message, state: FSMContext):
 
         wiped_str = "\n".join([f"• <code>{c}</code>" for c in wiped])
         await message.answer(
-            f"✅ <b>SYSTEM RESET COMPLETE</b>\n\n"
+            f"✅ <b>BOT3 DATA RESET COMPLETE</b>\n\n"
             f"🗑 <b>Wiped collections:</b>\n{wiped_str}\n\n"
+            f"💾 <b>Backups preserved:</b> bot3_backups + local backup files were not deleted.\n"
             f"🔄 Master Admin account re-seeded.\n"
             f"🤖 System is clean and ready.",
             reply_markup=get_main_menu(message.from_user.id),
             parse_mode="HTML"
         )
-        logger.warning(f"⚠️ FULL SYSTEM RESET executed by MASTER_ADMIN {message.from_user.id}")
+        logger.warning(f"⚠️ BOT3 DATA RESET executed by MASTER_ADMIN {message.from_user.id} (backups preserved)")
     except Exception as e:
         await message.answer(f"❌ <b>RESET FAILED:</b> <code>{e}</code>", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
 
@@ -6577,16 +7042,33 @@ async def create_backup_file(auto=False):
 # NOTE: All backups are kept permanently — never auto-deleted for data integrity.
 
 async def auto_backup_task():
-    """Background task — creates + delivers monthly backup on the 1st at 2 AM."""
+    """Background task — runs monthly auto-backup with catch-up if schedule was missed."""
+    last_successful_month_key = None
+
     while True:
         try:
             now = now_local()
+            month_key = f"{now.year}-{now.month:02d}"
+            scheduled_window = (now.day == 1 and now.hour == 2)
 
-            if now.day == 1 and now.hour == 2:
-                logger.info("🔄 Starting scheduled monthly auto-backup...")
+            auto_exists_this_month = col_backups.count_documents({
+                "backup_type": "auto",
+                "year": now.year,
+                "month_num": now.month,
+            }) > 0
+
+            # Catch-up mode ensures a monthly backup still happens even if bot was offline at 2 AM.
+            needs_catchup = (now.day >= 1) and (not auto_exists_this_month)
+            should_run_now = scheduled_window or needs_catchup
+
+            if should_run_now and month_key != last_successful_month_key:
+                trigger_reason = "scheduled (1st day at 2 AM)" if scheduled_window else "catch-up (missed schedule window)"
+                logger.info(f"🔄 Starting monthly auto-backup: {trigger_reason}")
+
                 success, filepath, metadata = await create_backup_file(auto=True)
 
                 if success and metadata:
+                    last_successful_month_key = month_key
                     logger.info(f"✅ Auto-backup completed: {metadata['filename']}")
                     caption = (
                         f"✅ <b>MONTHLY AUTO-BACKUP</b>\n\n"
@@ -6606,7 +7088,7 @@ async def auto_backup_task():
                         f"├ ▶️ YT: {metadata['total_yt_clicks']:,}\n"
                         f"├ 📸 IGCC: {metadata['total_igcc_clicks']:,}\n"
                         f"└ 🔑 YT Code: {metadata['total_ytcode_clicks']:,}\n\n"
-                        f"🔄 Auto-backup — delivered on schedule."
+                        f"🔄 Trigger: {trigger_reason}."
                     )
                     try:
                         await bot.send_document(
@@ -6629,7 +7111,8 @@ async def auto_backup_task():
                         await bot.send_message(
                             MASTER_ADMIN_ID,
                             f"🚨 <b>AUTO-BACKUP FAILED!</b>\n\n"
-                            f"⚠️ The scheduled monthly backup could not be created.\n"
+                            f"⚠️ The monthly backup could not be created.\n"
+                            f"📌 Trigger: <b>{trigger_reason}</b>\n"
                             f"📅 Date: {now.strftime('%B %d, %Y')}\n"
                             f"🕐 Time: {now.strftime('%I:%M %p')}\n\n"
                             f"Please check the system immediately!",
@@ -6671,11 +7154,105 @@ async def backup_menu_handler(message: types.Message, state: FSMContext):
         "💾 <b>FULL BACKUP</b> — Create ZIP with all collections + receive file\n"
         "📋 <b>VIEW AS JSON</b> — Send each collection as a separate JSON file\n"
         "📊 <b>BACKUP STATS</b> — View database collection statistics\n"
-        "📜 <b>BACKUP HISTORY</b> — View all monthly backup records\n\n"
+        "� <b>JSON RESTORE</b> — Import single/multi JSON files or a ZIP archive\n"
+        "📜 <b>BACKUP HISTORY</b> — View all monthly backup records\n"
+        "🗑️ <b>RESET BACKUPS</b> — Wipe backup records/files only (Master Admin, double confirm)\n\n"
         "Select an option:",
         reply_markup=get_backup_menu(),
         parse_mode="HTML"
     )
+
+
+@dp.message(F.text == "🗑️ RESET BACKUPS", StateFilter(None, BackupStates.viewing_backup_menu))
+async def start_reset_backups(message: types.Message, state: FSMContext):
+    """Start separate backup-only reset flow (does not touch operational bot data)."""
+    if message.from_user.id != MASTER_ADMIN_ID:
+        await message.answer("⛔ <b>ACCESS DENIED.</b> Only the Master Admin can reset backups.", parse_mode="HTML")
+        return
+
+    await state.set_state(BackupResetStates.waiting_for_confirm_button)
+    keyboard = [
+        [KeyboardButton(text="🔴 CONFIRM BACKUP RESET")],
+        [KeyboardButton(text="❌ CANCEL")],
+    ]
+    await message.answer(
+        "⚠️ <b>DANGER ZONE — BACKUP RESET ONLY</b> ⚠️\n\n"
+        "This action will wipe <b>backup data only</b>:\n"
+        "• Mongo backup records (<code>bot3_backups</code>)\n"
+        "• Local backup files in <code>backups/</code> (except <code>backups/state</code>)\n\n"
+        "✅ Operational Bot3 data (PDFs, IG, admins, links) will remain untouched.\n\n"
+        "<b>STEP 1 OF 2 — Click confirm to continue:</b>",
+        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(BackupResetStates.waiting_for_confirm_button)
+async def process_backup_reset_step1(message: types.Message, state: FSMContext):
+    if message.text != "🔴 CONFIRM BACKUP RESET":
+        await state.clear()
+        return await message.answer("✅ Backup reset cancelled.", reply_markup=get_backup_menu(), parse_mode="HTML")
+
+    reset_pin = "".join(str(random.randint(0, 9)) for _ in range(8))
+    await state.update_data(backup_reset_pin=reset_pin)
+    await state.set_state(BackupResetStates.waiting_for_confirm_text)
+
+    await message.answer(
+        "🛑 <b>STEP 2 OF 2 — ENTER SECURITY PIN</b> 🛑\n\n"
+        "Type this PIN exactly to execute backup reset:\n\n"
+        f"<code>{reset_pin}</code>\n\n"
+        "Any other input or ❌ CANCEL aborts the action.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(BackupResetStates.waiting_for_confirm_text)
+async def process_backup_reset_execute(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    expected_pin = data.get("backup_reset_pin", "")
+
+    if message.text.strip() != expected_pin:
+        await state.clear()
+        return await message.answer(
+            "✅ Backup reset cancelled. PIN did not match — no backup data was erased.",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML",
+        )
+
+    await state.clear()
+
+    try:
+        db_deleted = col_backups.delete_many({}).deleted_count
+
+        local_deleted = 0
+        backup_dir = "backups"
+        if os.path.exists(backup_dir):
+            for item in os.listdir(backup_dir):
+                item_path = os.path.join(backup_dir, item)
+                if os.path.isfile(item_path):
+                    os.remove(item_path)
+                    local_deleted += 1
+                elif os.path.isdir(item_path) and item.lower() != "state":
+                    import shutil
+                    shutil.rmtree(item_path, ignore_errors=True)
+                    local_deleted += 1
+
+        await message.answer(
+            "✅ <b>BACKUP RESET COMPLETE</b>\n\n"
+            f"🗑 Mongo backup records deleted: <b>{db_deleted}</b>\n"
+            f"🗑 Local backup items deleted: <b>{local_deleted}</b>\n\n"
+            "ℹ️ Operational Bot3 data remains untouched.",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML",
+        )
+        logger.warning(f"⚠️ BACKUP RESET executed by MASTER_ADMIN {message.from_user.id}: mongo={db_deleted}, local={local_deleted}")
+    except Exception as e:
+        await message.answer(
+            f"❌ <b>BACKUP RESET FAILED:</b> <code>{e}</code>",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML",
+        )
 
 @dp.message(F.text == "💾 FULL BACKUP")
 async def full_backup_handler(message: types.Message):
@@ -7042,19 +7619,32 @@ async def bot3_json_restore_start(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "JSON Restore", "can_manage_admins"):
         return
     await state.set_state(BackupStates.waiting_for_json_file)
+    await state.update_data(json_restore_session={
+        "files": 0,
+        "upserted": 0,
+        "errors": 0,
+        "skipped_collections": [],
+    })
     known = "\n".join(f"  • <code>{c}</code>" for c in sorted(set(_BOT3_RESTORE_COLLECTIONS)) if not c in ("pdfs","ig_content","admins","banned_users","settings","logs"))
     await message.answer(
         "📤 <b>JSON RESTORE — Bot 3</b>\n\n"
-        "Send a <b>.json</b> file to restore Bot 3 data.\n\n"
+        "Send <b>.json</b> files one-by-one, or send one <b>.zip</b> containing multiple JSON files.\n\n"
         "<b>Accepted formats:</b>\n"
         "• Multi-collection — <code>{\"bot3_pdfs\": [{...}], ...}</code>\n"
         "• Single-collection array — <code>[{...}, ...]</code> (filename used as key)\n\n"
+        "<b>Session controls:</b>\n"
+        "• Send multiple files continuously\n"
+        "• Tap <b>✅ FINISH RESTORE</b> when done\n"
+        "• Tap <b>❌ CANCEL</b> to abort\n\n"
         "<b>Known collections:</b>\n"
         + known + "\n\n"
         "⚠️ All inserts use <b>upsert</b> — no duplicates.\n"
-        "Press <b>❌ CANCEL</b> to abort.",
+        "⚠️ Records missing a safe unique key are skipped (to prevent accidental duplicate inserts).",
         reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+            keyboard=[
+                [KeyboardButton(text="✅ FINISH RESTORE")],
+                [KeyboardButton(text="❌ CANCEL")],
+            ],
             resize_keyboard=True
         ),
         parse_mode="HTML"
@@ -7068,7 +7658,25 @@ async def bot3_json_restore_receive(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Cancel
+    # Cancel/finish session
+    if message.text and message.text.strip().upper() == "✅ FINISH RESTORE":
+        data = await state.get_data()
+        session = data.get("json_restore_session", {})
+        files = int(session.get("files", 0))
+        upserted = int(session.get("upserted", 0))
+        errors = int(session.get("errors", 0))
+        await state.clear()
+        await message.answer(
+            "✅ <b>JSON RESTORE SESSION CLOSED</b>\n\n"
+            f"📁 Files processed: <b>{files}</b>\n"
+            f"📊 Total upserted: <b>{upserted:,}</b>\n"
+            f"⚠️ Total errors/skips: <b>{errors:,}</b>\n\n"
+            "Backup menu restored.",
+            reply_markup=get_backup_menu(),
+            parse_mode="HTML",
+        )
+        return
+
     if message.text and "CANCEL" in message.text.upper():
         await state.clear()
         await message.answer("✅ JSON restore cancelled.",
@@ -7076,62 +7684,94 @@ async def bot3_json_restore_receive(message: types.Message, state: FSMContext):
         return
 
     if not message.document:
-        await message.answer("❌ Please send a <b>.json</b> file or press ❌ CANCEL.",
+        await message.answer("❌ Please send a <b>.json</b> / <b>.zip</b> file, or tap ✅ FINISH RESTORE / ❌ CANCEL.",
                              parse_mode="HTML")
         return
 
     doc = message.document
     fname = (doc.file_name or "").lower()
-    if not fname.endswith(".json"):
-        await message.answer("❌ Only <b>.json</b> files are accepted for Bot 3 restore.",
+    if not (fname.endswith(".json") or fname.endswith(".zip")):
+        await message.answer("❌ Only <b>.json</b> or <b>.zip</b> files are accepted for Bot 3 restore.",
                              parse_mode="HTML")
         return
 
-    await state.clear()
     status_msg = await message.answer("⏳ <b>Downloading file...</b>", parse_mode="HTML")
 
     import io as _io
     import json as _json
+    import os as _os
     import re as _re
+    import zipfile as _zipfile
     from bson import ObjectId as _ObjId
+
+    def _normalize_payload(payload_obj, source_name):
+        """Return (col_map, ignored_non_list_fields, error_text)."""
+        if isinstance(payload_obj, dict):
+            col_map_local = {}
+            ignored_fields = []
+            for k, v in payload_obj.items():
+                if not isinstance(v, list):
+                    ignored_fields.append(k)
+                    continue
+                resolved = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', str(k))
+                col_map_local.setdefault(resolved, []).extend(v)
+            return col_map_local, ignored_fields, None
+
+        if isinstance(payload_obj, list):
+            stem = _os.path.basename(source_name or "unknown")
+            for ext in (".json.gz", ".json"):
+                if stem.lower().endswith(ext):
+                    stem = stem[:-len(ext)]
+                    break
+            stem = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', stem)
+            return {stem: payload_obj}, [], None
+
+        return {}, [], "❌ <b>Invalid JSON structure.</b>\n\nExpected <code>{collection: [...]}</code> or <code>[...]</code>."
 
     try:
         file_info = await bot.get_file(doc.file_id)
         buf = _io.BytesIO()
         await bot.download_file(file_info.file_path, buf)
-        payload = _json.loads(buf.getvalue().decode("utf-8"))
+        raw_bytes = buf.getvalue()
+
+        col_map = {}
+        ignored_non_list = []
+        parsed_json_parts = 0
+
+        if fname.endswith(".zip"):
+            with _zipfile.ZipFile(_io.BytesIO(raw_bytes), "r") as zf:
+                json_members = [n for n in zf.namelist() if not n.endswith("/") and n.lower().endswith(".json")]
+                if not json_members:
+                    raise ValueError("ZIP contains no .json files")
+
+                for member_name in json_members:
+                    with zf.open(member_name) as fp:
+                        member_bytes = fp.read()
+                    member_payload = _json.loads(member_bytes.decode("utf-8-sig"))
+                    part_map, part_ignored, part_err = _normalize_payload(member_payload, member_name)
+                    if part_err:
+                        raise ValueError(f"{member_name}: invalid JSON structure")
+                    for k, v in part_map.items():
+                        col_map.setdefault(k, []).extend(v)
+                    ignored_non_list.extend([f"{member_name}:{field}" for field in part_ignored])
+                    parsed_json_parts += 1
+        else:
+            payload = _json.loads(raw_bytes.decode("utf-8-sig"))
+            part_map, part_ignored, part_err = _normalize_payload(payload, doc.file_name or "uploaded.json")
+            if part_err:
+                await status_msg.edit_text(part_err, parse_mode="HTML")
+                return
+            for k, v in part_map.items():
+                col_map.setdefault(k, []).extend(v)
+            ignored_non_list.extend(part_ignored)
+            parsed_json_parts = 1
+
     except Exception as parse_err:
         await status_msg.edit_text(
             f"❌ <b>Failed to read file</b>\n\n<code>{str(parse_err)[:300]}</code>",
             parse_mode="HTML"
         )
-        await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
-        return
-
-    # Normalise payload → {col_name: [docs]}
-    if isinstance(payload, dict):
-        # Silently drop non-list metadata fields, resolve aliases
-        col_map = {}
-        for k, v in payload.items():
-            if not isinstance(v, list):
-                continue
-            # strip timestamp suffix from key if present (e.g. "bot3_pdfs_2026-03-12...")
-            resolved = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', k)
-            col_map[resolved] = v
-    elif isinstance(payload, list):
-        stem = doc.file_name or "unknown"
-        for ext in (".json.gz", ".json"):
-            if stem.lower().endswith(ext):
-                stem = stem[: -len(ext)]
-                break
-        stem = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', stem)
-        col_map = {stem: payload}
-    else:
-        await status_msg.edit_text(
-            "❌ <b>Invalid JSON structure.</b>\n\nExpected <code>{collection: [...]}</code> or <code>[...]</code>.",
-            parse_mode="HTML"
-        )
-        await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
+        await message.answer("Please send another file, or tap ✅ FINISH RESTORE.")
         return
 
     await status_msg.edit_text("⏳ <b>Processing collections...</b>", parse_mode="HTML")
@@ -7139,6 +7779,7 @@ async def bot3_json_restore_receive(message: types.Message, state: FSMContext):
     results = {}
     skipped = []
     total_upserted = 0
+    total_errors = 0
 
     def _coerce_id(d):
         raw = d.get("_id")
@@ -7171,18 +7812,29 @@ async def bot3_json_restore_receive(message: types.Message, state: FSMContext):
                 continue
             try:
                 d = _coerce_id(dict(raw_doc))
+
+                # Normalize common unique keys to avoid accidental type-based duplicates.
+                if unique_key in ("cc_number", "user_id"):
+                    key_candidate = d.get(unique_key)
+                    if isinstance(key_candidate, str) and key_candidate.strip().isdigit():
+                        d[unique_key] = int(key_candidate.strip())
+                if unique_key == "msa_code" and isinstance(d.get("msa_code"), str):
+                    d["msa_code"] = d["msa_code"].strip().upper()
+
                 if unique_key == "_id":
                     if "_id" in d:
                         collection.replace_one({"_id": d["_id"]}, d, upsert=True)
                     else:
-                        collection.insert_one(d)
+                        errors += 1
+                        continue
                 else:
                     key_val = d.get(unique_key)
                     if key_val is None:
                         if "_id" in d:
                             collection.replace_one({"_id": d["_id"]}, d, upsert=True)
                         else:
-                            collection.insert_one(d)
+                            errors += 1
+                            continue
                     else:
                         collection.update_one(
                             {unique_key: key_val},
@@ -7195,9 +7847,12 @@ async def bot3_json_restore_receive(message: types.Message, state: FSMContext):
 
         results[real_col_name] = {"upserted": upserted, "errors": errors}
         total_upserted += upserted
+        total_errors += errors
 
     # Build result message
-    lines = ["✅ <b>JSON RESTORE COMPLETE (Bot 3)</b>\n"]
+    lines = ["✅ <b>JSON FILE PROCESSED (Bot 3)</b>\n"]
+    lines.append(f"📦 Source: <code>{doc.file_name or 'uploaded_file'}</code>")
+    lines.append(f"🧩 JSON parts parsed: <b>{parsed_json_parts}</b>\n")
     for cn, r in results.items():
         emoji = "✅" if r["errors"] == 0 else "⚠️"
         lines.append(
@@ -7208,14 +7863,37 @@ async def bot3_json_restore_receive(message: types.Message, state: FSMContext):
         lines.append("\n⚠️ <b>Skipped (not Bot 3 collections):</b>")
         for s in skipped:
             lines.append(f"  • {s}")
-    lines.append(f"\n📊 <b>Total upserted: {total_upserted:,}</b>")
-    lines.append("\nAll inserts used upsert — zero duplicates created.")
+    if ignored_non_list:
+        lines.append("\nℹ️ <b>Ignored non-list fields:</b>")
+        for fld in ignored_non_list[:20]:
+            lines.append(f"  • {fld}")
+        if len(ignored_non_list) > 20:
+            lines.append(f"  • ... and {len(ignored_non_list) - 20} more")
+
+    lines.append(f"\n📊 <b>File upserted: {total_upserted:,}</b>")
+    lines.append(f"⚠️ <b>File errors/skips: {total_errors + len(skipped):,}</b>")
+    lines.append("\nAll writes used upsert against unique keys to prevent duplicates.")
+
+    data = await state.get_data()
+    session = data.get("json_restore_session", {
+        "files": 0,
+        "upserted": 0,
+        "errors": 0,
+        "skipped_collections": [],
+    })
+    session["files"] = int(session.get("files", 0)) + 1
+    session["upserted"] = int(session.get("upserted", 0)) + total_upserted
+    session["errors"] = int(session.get("errors", 0)) + total_errors + len(skipped)
+    merged_skipped = list(dict.fromkeys((session.get("skipped_collections", []) or []) + skipped))
+    session["skipped_collections"] = merged_skipped
+    await state.update_data(json_restore_session=session)
+
+    lines.append("\n🔁 Send next file, or tap <b>✅ FINISH RESTORE</b>.")
 
     await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
-    await message.answer("Returning to backup menu.", reply_markup=get_backup_menu())
 
     log_user_action(message.from_user, "JSON_RESTORE_BOT3",
-                    f"Restored {total_upserted} records from {doc.file_name}")
+                    f"Restored {total_upserted} records from {doc.file_name} (errors={total_errors}, skipped_cols={len(skipped)})")
 
 
 # ==========================================
@@ -7944,20 +8622,20 @@ async def process_owner_second_confirm(message: types.Message, state: FSMContext
                 }}
             )
         
-        # 3. Update Global Cache & .env permanently
+        # 3. Update Global Cache & env file permanently
         MASTER_ADMIN_ID = target_admin_id
         try:
-            with open("BOT9.env", "r", encoding="utf-8") as f:
+            with open(ACTIVE_ENV_FILE, "r", encoding="utf-8") as f:
                 env_data = f.read()
             # Replace MASTER_ADMIN_ID correctly
             if "MASTER_ADMIN_ID=" in env_data:
                 env_data = re.sub(r"MASTER_ADMIN_ID=.*", f"MASTER_ADMIN_ID={target_admin_id}", env_data)
             else:
                 env_data += f"\\nMASTER_ADMIN_ID={target_admin_id}\\n"
-            with open("BOT9.env", "w", encoding="utf-8") as f:
+            with open(ACTIVE_ENV_FILE, "w", encoding="utf-8") as f:
                 f.write(env_data)
         except Exception as e:
-            logger.error(f"Failed to update BOT9.env: {e}")
+            logger.error(f"Failed to update {ACTIVE_ENV_FILE}: {e}")
             
         # Log
         log_user_action(message.from_user, "OWNERSHIP TRANSFER", f"New Owner: {target_admin_id}")
@@ -8478,6 +9156,35 @@ async def tutorial_pk_menu_handler(message: types.Message, state: FSMContext):
     )
 
 
+async def _route_tutorial_pk_menu_action(message: types.Message, state: FSMContext, text: str) -> bool:
+    """Allow fast switching between tutorial submenu actions even during active tutorial states."""
+    if text == "❌ CANCEL":
+        await state.clear()
+        await message.answer("❌ Cancelled.", reply_markup=get_tutorial_pk_menu(), parse_mode="HTML")
+        return True
+    if text == "➕ ADD TUTORIAL":
+        await state.clear()
+        await tutorial_pk_add(message, state)
+        return True
+    if text == "✏️ EDIT TUTORIAL":
+        await state.clear()
+        await tutorial_pk_edit(message, state)
+        return True
+    if text == "🗑️ DELETE TUTORIAL":
+        await state.clear()
+        await tutorial_pk_delete(message, state)
+        return True
+    if text == "📋 LIST TUTORIAL":
+        await state.clear()
+        await tutorial_pk_list(message, state)
+        return True
+    if text == "⬅️ BACK TO ADD MENU":
+        await state.clear()
+        await back_to_add_handler(message, state)
+        return True
+    return False
+
+
 @dp.message(F.text == "➕ ADD TUTORIAL")
 async def tutorial_pk_add(message: types.Message, state: FSMContext):
     """Start ADD flow — ask admin for the YouTube tutorial link."""
@@ -8501,21 +9208,19 @@ async def tutorial_pk_add(message: types.Message, state: FSMContext):
         "with no referral — as a premium tutorial message with an inline button.\n\n"
         "• Must be a valid URL starting with <code>https://</code>\n"
         "• Shown as a button — never as raw text\n\n"
-        "Send the link now, or type <code>CANCEL</code> to abort.",
+        "Send the link now.",
         parse_mode="HTML"
     )
 
 
 @dp.message(TutorialPKStates.waiting_for_link)
 async def tutorial_pk_save_link(message: types.Message, state: FSMContext):
-    """Save the new PK tutorial link to the database."""
+    """Validate URL and show confirm keyboard before saving."""
     if not await check_authorization(message, "Save Tutorial PK", "can_add"):
         await state.clear()
         return
     text = message.text.strip()
-    if text.upper() == "CANCEL":
-        await state.clear()
-        await message.answer("❌ Cancelled.", reply_markup=get_tutorial_pk_menu(), parse_mode="HTML")
+    if await _route_tutorial_pk_menu_action(message, state, text):
         return
     if not re.match(r"^https?://", text):
         await message.answer(
@@ -8523,20 +9228,50 @@ async def tutorial_pk_save_link(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
         return
-    db["bot3_tutorials"].update_one(
-        {"type": "PK"},
-        {"$set": {"type": "PK", "link": text, "updated_at": datetime.now()}},
-        upsert=True
-    )
     safe_link = _html.escape(text)
-    await state.clear()
+    await state.update_data(pending_link=text)
+    await state.set_state(TutorialPKStates.waiting_for_link_confirm)
     await message.answer(
-        f"✅ <b>TUTORIAL SAVED</b>\n\n"
-        f"<b>Link:</b> <code>{safe_link}</code>\n\n"
-        "All Bot1 users will now see this tutorial on their next empty start and in the Agent Guide.",
-        reply_markup=get_tutorial_pk_menu(),
+        f"🔗 <b>CONFIRM ADD TUTORIAL</b>\n\n"
+        f"<b>Link to save:</b>\n<code>{safe_link}</code>\n\n"
+        "Tap <b>✅ CONFIRM ADD</b> to save, or <b>❌ CANCEL</b> to abort.",
+        reply_markup=_get_tutorial_confirm_kb("✅ CONFIRM ADD"),
         parse_mode="HTML"
     )
+
+
+@dp.message(TutorialPKStates.waiting_for_link_confirm)
+async def tutorial_pk_confirm_add(message: types.Message, state: FSMContext):
+    """Save the tutorial link after admin taps confirm button."""
+    if not await check_authorization(message, "Confirm Add Tutorial PK", "can_add"):
+        await state.clear()
+        return
+    text = message.text.strip()
+    if await _route_tutorial_pk_menu_action(message, state, text):
+        return
+    if text == "✅ CONFIRM ADD":
+        data = await state.get_data()
+        link = data.get("pending_link", "")
+        db["bot3_tutorials"].update_one(
+            {"type": "PK"},
+            {"$set": {"type": "PK", "link": link, "updated_at": datetime.now()}},
+            upsert=True
+        )
+        safe_link = _html.escape(link)
+        await state.clear()
+        await message.answer(
+            f"✅ <b>TUTORIAL SAVED</b>\n\n"
+            f"<b>Link:</b> <code>{safe_link}</code>\n\n"
+            "All Bot1 users will now see this tutorial on their next empty start and in the Agent Guide.",
+            reply_markup=get_tutorial_pk_menu(),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "⚠️ Tap <b>✅ CONFIRM ADD</b> to save or <b>❌ CANCEL</b> to abort.",
+            reply_markup=_get_tutorial_confirm_kb("✅ CONFIRM ADD"),
+            parse_mode="HTML"
+        )
 
 
 @dp.message(F.text == "✏️ EDIT TUTORIAL")
@@ -8553,25 +9288,24 @@ async def tutorial_pk_edit(message: types.Message, state: FSMContext):
         )
         return
     safe_link = _html.escape(existing["link"])
+    await state.update_data(old_link=existing["link"])
     await state.set_state(TutorialPKStates.waiting_for_edit_link)
     await message.answer(
         f"✏️ <b>EDIT TUTORIAL LINK</b>\n\n"
         f"<b>Current link:</b>\n<code>{safe_link}</code>\n\n"
-        "Send the new YouTube link, or type <code>CANCEL</code> to abort.",
+        "Send the new YouTube link now.",
         parse_mode="HTML"
     )
 
 
 @dp.message(TutorialPKStates.waiting_for_edit_link)
 async def tutorial_pk_save_edit(message: types.Message, state: FSMContext):
-    """Apply the updated PK tutorial link."""
+    """Validate new URL and show confirm keyboard before applying."""
     if not await check_authorization(message, "Save Edit Tutorial PK", "can_add"):
         await state.clear()
         return
     text = message.text.strip()
-    if text.upper() == "CANCEL":
-        await state.clear()
-        await message.answer("❌ Cancelled.", reply_markup=get_tutorial_pk_menu(), parse_mode="HTML")
+    if await _route_tutorial_pk_menu_action(message, state, text):
         return
     if not re.match(r"^https?://", text):
         await message.answer(
@@ -8579,25 +9313,59 @@ async def tutorial_pk_save_edit(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
         return
-    db["bot3_tutorials"].update_one(
-        {"type": "PK"},
-        {"$set": {"link": text, "updated_at": datetime.now()}},
-        upsert=True
-    )
-    safe_link = _html.escape(text)
-    await state.clear()
+    data = await state.get_data()
+    old_link = data.get("old_link", "")
+    safe_old = _html.escape(old_link)
+    safe_new = _html.escape(text)
+    await state.update_data(pending_link=text)
+    await state.set_state(TutorialPKStates.waiting_for_edit_confirm)
     await message.answer(
-        f"✅ <b>TUTORIAL UPDATED</b>\n\n"
-        f"<b>New link:</b> <code>{safe_link}</code>\n\n"
-        "All Bot1 users will now receive this updated tutorial on their next empty start and in the Agent Guide.",
-        reply_markup=get_tutorial_pk_menu(),
+        f"✏️ <b>CONFIRM EDIT TUTORIAL</b>\n\n"
+        f"<b>Old link:</b>\n<code>{safe_old}</code>\n\n"
+        f"<b>New link:</b>\n<code>{safe_new}</code>\n\n"
+        "Tap <b>✅ CONFIRM EDIT</b> to apply, or <b>❌ CANCEL</b> to abort.",
+        reply_markup=_get_tutorial_confirm_kb("✅ CONFIRM EDIT"),
         parse_mode="HTML"
     )
 
 
+@dp.message(TutorialPKStates.waiting_for_edit_confirm)
+async def tutorial_pk_confirm_edit(message: types.Message, state: FSMContext):
+    """Apply the updated tutorial link after admin taps confirm button."""
+    if not await check_authorization(message, "Confirm Edit Tutorial PK", "can_add"):
+        await state.clear()
+        return
+    text = message.text.strip()
+    if await _route_tutorial_pk_menu_action(message, state, text):
+        return
+    if text == "✅ CONFIRM EDIT":
+        data = await state.get_data()
+        link = data.get("pending_link", "")
+        db["bot3_tutorials"].update_one(
+            {"type": "PK"},
+            {"$set": {"link": link, "updated_at": datetime.now()}},
+            upsert=True
+        )
+        safe_link = _html.escape(link)
+        await state.clear()
+        await message.answer(
+            f"✅ <b>TUTORIAL UPDATED</b>\n\n"
+            f"<b>New link:</b> <code>{safe_link}</code>\n\n"
+            "All Bot1 users will now receive this updated tutorial on their next empty start and in the Agent Guide.",
+            reply_markup=get_tutorial_pk_menu(),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "⚠️ Tap <b>✅ CONFIRM EDIT</b> to apply or <b>❌ CANCEL</b> to abort.",
+            reply_markup=_get_tutorial_confirm_kb("✅ CONFIRM EDIT"),
+            parse_mode="HTML"
+        )
+
+
 @dp.message(F.text == "🗑️ DELETE TUTORIAL")
 async def tutorial_pk_delete(message: types.Message, state: FSMContext):
-    """Ask for confirmation before deleting tutorial link."""
+    """Show current link with confirm keyboard to delete."""
     if not await check_authorization(message, "Delete Tutorial", "can_add"):
         return
     existing = db["bot3_tutorials"].find_one({"type": "PK"})
@@ -8613,19 +9381,22 @@ async def tutorial_pk_delete(message: types.Message, state: FSMContext):
     await message.answer(
         f"🗑️ <b>DELETE TUTORIAL?</b>\n\n"
         f"<b>Current link:</b>\n<code>{safe_link}</code>\n\n"
-        "Type <code>CONFIRM</code> to delete permanently, or <code>CANCEL</code> to abort.",
+        "Tap <b>✅ CONFIRM DELETE</b> to permanently remove, or <b>❌ CANCEL</b> to abort.",
+        reply_markup=_get_tutorial_confirm_kb("✅ CONFIRM DELETE"),
         parse_mode="HTML"
     )
 
 
 @dp.message(TutorialPKStates.waiting_for_delete_confirm)
 async def tutorial_pk_confirm_delete(message: types.Message, state: FSMContext):
-    """Execute deletion after CONFIRM keyword received."""
+    """Execute deletion after admin taps confirm button."""
     if not await check_authorization(message, "Confirm Delete Tutorial PK", "can_add"):
         await state.clear()
         return
-    text = message.text.strip().upper()
-    if text == "CONFIRM":
+    text = message.text.strip()
+    if await _route_tutorial_pk_menu_action(message, state, text):
+        return
+    if text == "✅ CONFIRM DELETE":
         db["bot3_tutorials"].delete_one({"type": "PK"})
         await state.clear()
         await message.answer(
@@ -8635,12 +9406,10 @@ async def tutorial_pk_confirm_delete(message: types.Message, state: FSMContext):
             reply_markup=get_tutorial_pk_menu(),
             parse_mode="HTML"
         )
-    elif text == "CANCEL":
-        await state.clear()
-        await message.answer("❌ Deletion cancelled.", reply_markup=get_tutorial_pk_menu(), parse_mode="HTML")
     else:
         await message.answer(
-            "⚠️ Type exactly <code>CONFIRM</code> to delete or <code>CANCEL</code> to abort.",
+            "⚠️ Tap <b>✅ CONFIRM DELETE</b> to delete or <b>❌ CANCEL</b> to abort.",
+            reply_markup=_get_tutorial_confirm_kb("✅ CONFIRM DELETE"),
             parse_mode="HTML"
         )
 
@@ -8875,12 +9644,21 @@ async def main():
             print(f"✅ State restored from {state_data['timestamp']}")
         else:
             print("ℹ️ No previous state found (fresh start)")
+
+    print("\n🔑 Verifying MSA code integrity...")
+    try:
+        repaired_count = await asyncio.to_thread(repair_missing_duplicate_msa_codes)
+        await asyncio.to_thread(ensure_unique_msa_code_index)
+        print(f"  ✅ MSA integrity ready (repaired: {repaired_count})")
+    except Exception as msa_err:
+        logger.error(f"MSA integrity check failed: {msa_err}")
+        print(f"  ⚠️ MSA integrity warning: {msa_err}")
     
     # Start background tasks
     print("\n🔧 Starting background services...")
     
     asyncio.create_task(auto_backup_task())
-    print("  ✅ Auto-backup task (Monthly at 2 AM)")
+    print("  ✅ Auto-backup task (Monthly at 2 AM + catch-up)")
     
     asyncio.create_task(health_monitoring_task())
     print(f"  ✅ Health monitoring ({HEALTH_CHECK_INTERVAL}s interval)")
@@ -8988,7 +9766,7 @@ async def main():
         except Exception as e:
             logger.error(f"Failed to send startup notification: {e}")
     else:
-        print("⚠️  WARNING: MASTER_ADMIN_ID is 0 - update BOT9.env with your Telegram user ID")
+        print(f"⚠️  WARNING: MASTER_ADMIN_ID is 0 - update {ACTIVE_ENV_FILE} with your Telegram user ID")
         print("   Get your ID from: @userinfobot on Telegram")
     
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -9020,15 +9798,17 @@ async def main():
 if __name__ == "__main__":
     try:
         # Validate required environment variables before starting
-        required_vars = ["BOT_9_TOKEN", "MONGO_URI", "MASTER_ADMIN_ID"]
+        required_vars = ["MONGO_URI", "MASTER_ADMIN_ID"]
         missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if not BOT_TOKEN:
+            missing_vars.insert(0, "BOT_3_TOKEN (or BOT_9_TOKEN or BOT_TOKEN)")
         
         if missing_vars:
             print("❌ ERROR: Missing required environment variables:")
             for var in missing_vars:
                 print(f"   - {var}")
             print("\n📝 Please set these variables in:")
-            print("   - Local: Create .env file (copy from BOT9.env)")
+            print(f"   - Local: Use {ACTIVE_ENV_FILE} (or .env)")
             print("   - Render: Add in Environment section")
             print("   - See RENDER_ENV_VARIABLES.txt for details")
             sys.exit(1)
