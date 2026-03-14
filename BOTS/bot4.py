@@ -60,6 +60,33 @@ sys.stderr = StreamLogger(sys.stderr)
 
 
 
+# ── Render secret-file restore ────────────────────────────────────────────────
+# On Render the disk is ephemeral (wiped on every redeploy).
+# Store credentials.json and token.pickle as base64 env vars so the bot can
+# reconstruct them on every cold start without a manual file upload.
+#
+# How to set them (one-time, on your local machine):
+#   python -c "import base64; print(base64.b64encode(open('credentials.json','rb').read()).decode())"
+#   python -c "import base64; print(base64.b64encode(open('token.pickle','rb').read()).decode())"
+# Paste the output into Render → Environment → GOOGLE_CREDENTIALS_B64 / GOOGLE_TOKEN_B64.
+_creds_b64 = os.getenv("GOOGLE_CREDENTIALS_B64", "")
+_token_b64 = os.getenv("GOOGLE_TOKEN_B64", "")
+if _creds_b64 and not os.path.exists("credentials.json"):
+    try:
+        with open("credentials.json", "wb") as _f:
+            _f.write(base64.b64decode(_creds_b64))
+        print("✅ credentials.json restored from GOOGLE_CREDENTIALS_B64 env var")
+    except Exception as _e:
+        print(f"⚠️ Failed to restore credentials.json: {_e}")
+if _token_b64 and not os.path.exists("token.pickle"):
+    try:
+        with open("token.pickle", "wb") as _f:
+            _f.write(base64.b64decode(_token_b64))
+        print("✅ token.pickle restored from GOOGLE_TOKEN_B64 env var")
+    except Exception as _e:
+        print(f"⚠️ Failed to restore token.pickle: {_e}")
+# ── END secret-file restore ───────────────────────────────────────────────────
+
 # Timezone support
 try:
     import pytz as _pytz
@@ -316,6 +343,78 @@ def connect_db():
         col_admins = db["admins_bot4"]
         col_banned = db["banned_list"]
         col_bot4_state = db["bot4_state"]
+
+        # Startup DB hygiene: dedupe records while preserving data (move duplicates to recycle_bin)
+        try:
+            raw_docs = list(col_pdfs.find().sort("timestamp", -1))
+            seen_codes = set()
+            seen_drive_ids = set()
+            deduped = 0
+            normalized = 0
+            for doc in raw_docs:
+                _id = doc.get("_id")
+                raw_code = (doc.get("code") or "")
+                code = raw_code.strip().upper()
+                link = (doc.get("link") or "").strip()
+                fid = (doc.get("drive_file_id") or "").strip()
+                if not fid and link:
+                    m = re.search(r'/file/d/([^/?\s]+)', link) or re.search(r'[?&]id=([^&\s]+)', link)
+                    if m:
+                        fid = m.group(1)
+
+                if code and code != raw_code:
+                    col_pdfs.update_one({"_id": _id}, {"$set": {"code": code}})
+                    normalized += 1
+                if fid and not doc.get("drive_file_id"):
+                    col_pdfs.update_one({"_id": _id}, {"$set": {"drive_file_id": fid}})
+
+                dup_code = bool(code and code in seen_codes)
+                dup_drive = bool(fid and fid in seen_drive_ids)
+
+                if dup_code or dup_drive:
+                    doc["deleted_at"] = datetime.now()
+                    doc["dedupe_reason"] = "startup_cleanup"
+                    col_trash.insert_one(doc)
+                    col_pdfs.delete_one({"_id": _id})
+                    deduped += 1
+                    continue
+
+                if code:
+                    seen_codes.add(code)
+                if fid:
+                    seen_drive_ids.add(fid)
+
+            if deduped or normalized:
+                print(f"🧹 PDF library cleanup: normalized={normalized}, deduped={deduped}")
+        except Exception as clean_err:
+            logging.warning(f"Startup PDF dedupe cleanup failed: {clean_err}")
+
+        try:
+            col_pdfs.create_index("code", unique=True, name="uniq_code")
+        except Exception as idx_err:
+            logging.warning(f"Index uniq_code not enforced (likely duplicates exist): {idx_err}")
+        col_pdfs.create_index("timestamp", name="idx_timestamp")
+        col_pdfs.create_index("drive_file_id", sparse=True, name="idx_drive_file_id")
+        col_trash.create_index("code", name="idx_trash_code")
+
+        # Admin / ban / backup integrity indexes (warn-only if legacy conflicts exist)
+        try:
+            col_admins.create_index("user_id", unique=True, name="uniq_admin_user_id")
+        except Exception as idx_err:
+            logging.warning(f"Index uniq_admin_user_id not enforced: {idx_err}")
+        try:
+            col_banned.create_index("user_id", unique=True, name="uniq_banned_user_id")
+        except Exception as idx_err:
+            logging.warning(f"Index uniq_banned_user_id not enforced: {idx_err}")
+        try:
+            db["bot4_backups"].create_index([("date", 1), ("type", 1)], unique=True, name="uniq_backup_date_type")
+        except Exception as idx_err:
+            logging.warning(f"Index uniq_backup_date_type not enforced: {idx_err}")
+        try:
+            db["bot4_monthly_backups"].create_index("month_key", unique=True, name="uniq_backup_month_key")
+        except Exception as idx_err:
+            logging.warning(f"Index uniq_backup_month_key not enforced: {idx_err}")
+
         db_client.server_info()
         print("✅ Connected to MongoDB successfully")
         return True
@@ -497,6 +596,7 @@ class BotState(StatesGroup):
     choosing_retrieval_method = State() # NEW: Single vs Bulk
     choosing_delete_mode = State()
     confirm_delete = State()
+    waiting_delete_final = State()
     choosing_edit_mode = State()
     waiting_for_edit_target = State()
     waiting_for_new_code = State()
@@ -531,7 +631,14 @@ class BotState(StatesGroup):
     viewing_elite_help = State()
     # Paginated admin list
     viewing_admin_list = State()
+    # add links flow
+    adding_pdf_names = State()
+    adding_pdf_links = State()
+    # backup reset flow
+    backup_reset_confirm1 = State()
+    backup_reset_confirm2 = State()
 
+    waiting_for_backup_restore_file = State()
 
 def get_main_menu(user_id=None):
     # Determine Permissions
@@ -628,6 +735,114 @@ def _get_unique_docs():
             seen.add(c)
             unique_docs.append(d)
     return unique_docs
+
+
+def _sanitize_code(raw: str) -> str:
+    return (raw or "").strip().upper()
+
+
+def _is_valid_drive_link(link: str) -> bool:
+    return bool(_extract_drive_id((link or "").strip()))
+
+
+def _fetch_drive_pdf_meta(service, link: str):
+    """Return PDF metadata for a Drive link, or None if invalid/not a PDF."""
+    file_id = _extract_drive_id(link)
+    if not file_id:
+        return None
+    meta = service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,webViewLink,modifiedTime",
+        supportsAllDrives=True,
+    ).execute()
+    if meta.get("mimeType") != "application/pdf":
+        return None
+    return meta
+
+
+def _sync_drive_folder_to_db(limit: int = 2000) -> dict:
+    """
+    Import PDFs from Google Drive folder tree into MongoDB (upsert by code).
+    Code is derived from file name without .pdf.
+    """
+    if col_pdfs is None:
+        return {"added": 0, "updated": 0, "skipped": 0, "reason": "db_unavailable"}
+    if not PARENT_FOLDER_ID:
+        return {"added": 0, "updated": 0, "skipped": 0, "reason": "parent_folder_missing"}
+
+    service = get_drive_service()
+    added = 0
+    updated = 0
+    skipped = 0
+    queue = [PARENT_FOLDER_ID]
+    seen_folders = set()
+
+    while queue and (added + updated) < limit:
+        folder_id = queue.pop(0)
+        if folder_id in seen_folders:
+            continue
+        seen_folders.add(folder_id)
+
+        page_token = None
+        while True:
+            resp = service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                pageSize=200,
+                pageToken=page_token,
+                fields="nextPageToken, files(id,name,mimeType,webViewLink,modifiedTime)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+
+            for f in resp.get("files", []):
+                mime = f.get("mimeType", "")
+                if mime == "application/vnd.google-apps.folder":
+                    queue.append(f.get("id"))
+                    continue
+
+                if mime != "application/pdf":
+                    skipped += 1
+                    continue
+
+                name = (f.get("name") or "").strip()
+                if not name.lower().endswith(".pdf"):
+                    skipped += 1
+                    continue
+
+                code = _sanitize_code(name[:-4])
+                if not code:
+                    skipped += 1
+                    continue
+
+                payload = {
+                    "code": code,
+                    "link": (f.get("webViewLink") or "").strip(),
+                    "drive_file_id": f.get("id"),
+                    "drive_name": name,
+                    "drive_modified": f.get("modifiedTime"),
+                    "timestamp": now_local(),
+                    "source": "drive_sync",
+                }
+
+                existing = col_pdfs.find_one({"code": code})
+                if existing:
+                    col_pdfs.update_one({"_id": existing["_id"]}, {"$set": payload})
+                    updated += 1
+                else:
+                    col_pdfs.insert_one(payload)
+                    added += 1
+
+                if (added + updated) >= limit:
+                    break
+
+            if (added + updated) >= limit:
+                break
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    return {"added": added, "updated": updated, "skipped": skipped, "reason": "done"}
 
 def get_formatted_file_list(docs, limit=30, start_index=1):
     """Generates a clean, consistent HTML list of files with indices and hyperlinks."""
@@ -1225,9 +1440,17 @@ async def finalize_pdf(user_id, state):
         else:
             logging.warning("credentials.json not found — skipping Drive upload.")
 
-        # Save to MongoDB
-        col_pdfs.delete_many({"code": code})
-        col_pdfs.insert_one({"code": code, "link": link, "timestamp": datetime.now()})
+        # Save to MongoDB atomically (no delete/insert loss window)
+        col_pdfs.update_one(
+            {"code": code},
+            {"$set": {
+                "code": code,
+                "link": link,
+                "timestamp": datetime.now(),
+                "source": "generated"
+            }},
+            upsert=True
+        )
         DAILY_STATS_BOT4["pdfs_generated"] += 1
         asyncio.create_task(_persist_stats())
 
@@ -1278,6 +1501,17 @@ async def finalize_pdf(user_id, state):
 @dp.message(F.text == "📋 Show Library")
 async def show_library(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
+
+    try:
+        if col_pdfs is not None and col_pdfs.count_documents({}) == 0:
+            sync_result = await asyncio.to_thread(_sync_drive_folder_to_db)
+            if sync_result.get("added", 0) or sync_result.get("updated", 0):
+                await message.answer(
+                    f"🔄 Drive sync complete: +{sync_result.get('added',0)} / ~{sync_result.get('updated',0)}"
+                )
+    except Exception as sync_err:
+        logging.warning(f"Show Library sync failed: {sync_err}")
+
     await message.answer(
         "📚 <b>VAULT LIBRARY ACCESS</b>\nSelect your preferred viewing mode:",
         reply_markup=ReplyKeyboardMarkup(
@@ -1301,7 +1535,7 @@ async def handle_library_logic(message: types.Message, state: FSMContext):
             await state.update_data(lib_mode="display", page=0)
             await render_library_page(message, state, page=0)
         elif text == "🔍 SEARCH":
-            docs = sorted(list(col_pdfs.find()), key=_natural_sort_key)  # natural sort by code
+            docs = sorted(_get_unique_docs(), key=_natural_sort_key)  # natural sort by code
             list_lines = get_formatted_file_list(docs, limit=30)
             # Truncate at whole-line boundaries to avoid cutting through HTML tags
             safe_lines = []
@@ -1338,7 +1572,7 @@ async def handle_library_logic(message: types.Message, state: FSMContext):
 
 async def render_library_page(message, state, page):
     limit = 20
-    docs = sorted(list(col_pdfs.find()), key=_natural_sort_key)
+    docs = sorted(_get_unique_docs(), key=_natural_sort_key)
     total_docs = len(docs)
     max_page = max(0, (total_docs - 1) // limit)
     page = max(0, min(page, max_page))
@@ -1376,7 +1610,7 @@ async def handle_library_search(message: types.Message, state: FSMContext):
     if text == "⬅️ BACK":
         await show_library(message, state)
         return
-    all_docs = sorted(list(col_pdfs.find()), key=_natural_sort_key)  # natural sort = consistent index
+    all_docs = sorted(_get_unique_docs(), key=_natural_sort_key)  # natural sort = consistent index
     doc = None
     if text.isdigit():
         idx = int(text)
@@ -1484,7 +1718,8 @@ async def backup_menu_btn(message: types.Message, state: FSMContext):
 
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="📄 Text Report"), KeyboardButton(text="💾 JSON Dump"))
-    builder.row(KeyboardButton(text="📅 Backup History"))
+    builder.row(KeyboardButton(text="📥 JSON Restore"), KeyboardButton(text="📅 Backup History"))
+    builder.row(KeyboardButton(text="🧨 Reset Backup Data"))
     builder.row(KeyboardButton(text="🔙 Back to Menu"))
 
     await message.answer(
@@ -1498,7 +1733,10 @@ async def backup_menu_btn(message: types.Message, state: FSMContext):
         f"• 🚫 Banned: <code>{banned_count}</code>\n\n"
         f"📄 <b>Text Report</b> — Human-readable summary.\n"
         f"💾 <b>JSON Dump</b> — Full export for restore.\n"
-        f"📅 <b>Backup History</b> — View all past backup records.\n\n"
+        f"📥 <b>JSON Restore</b> — Import JSON/ZIP safely with upsert (no duplicates).\n"
+        f"📅 <b>Backup History</b> — View all past backup records.\n"
+        f"🧨 <b>Reset Backup Data</b> — Permanently delete backup records only.\n\n"
+        f"☁️ <b>Google Drive files are never touched by Backup Reset.</b>\n"
         f"<i>All backups stored in MongoDB + sent to Owner.</i>",
         reply_markup=builder.as_markup(resize_keyboard=True),
         parse_mode="HTML"
@@ -1601,6 +1839,319 @@ async def handle_backup_json(message: types.Message):
         await msg.edit_text(f"❌ <b>Export Failed:</b> <code>{e}</code>", parse_mode="HTML")
 
 
+def _normalize_restore_user_id(raw_value):
+    """Normalize user_id to int when possible, else stripped string."""
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, int):
+        return raw_value
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    return text
+
+
+def _resolve_restore_section_name(raw_name):
+    """Map incoming section/collection names to canonical restore section names."""
+    key = str(raw_name or "").strip().lower()
+    aliases = {
+        "pdfs": "pdfs",
+        "pdf_library": "pdfs",
+        "trash": "trash",
+        "recycle_bin": "trash",
+        "locked": "locked",
+        "locked_content": "locked",
+        "trash_locked": "trash_locked",
+        "admins": "admins",
+        "admins_bot4": "admins",
+        "banned": "banned",
+        "banned_list": "banned",
+        "state": "state",
+        "bot4_state": "state",
+    }
+    return aliases.get(key)
+
+
+def _infer_restore_section_from_filename(file_name):
+    """Infer section when payload is list-only and filename carries section meaning."""
+    stem = os.path.basename(file_name or "uploaded.json").lower()
+    for ext in (".json.gz", ".json"):
+        if stem.endswith(ext):
+            stem = stem[:-len(ext)]
+            break
+    stem = re.sub(r"_\d{4}-\d{2}-\d{2}.*$", "", stem)
+    return _resolve_restore_section_name(stem)
+
+
+def _normalize_restore_payload(payload, source_name):
+    """
+    Normalize restore JSON to canonical sections.
+    Returns: (section_docs: dict, skipped_sections: list, error_text: str|None)
+    """
+    section_docs = {}
+    skipped_sections = []
+
+    if isinstance(payload, dict):
+        for raw_key, value in payload.items():
+            if not isinstance(value, list):
+                continue
+            section = _resolve_restore_section_name(raw_key)
+            if not section:
+                skipped_sections.append(str(raw_key))
+                continue
+            section_docs.setdefault(section, []).extend(value)
+        return section_docs, skipped_sections, None
+
+    if isinstance(payload, list):
+        section = _infer_restore_section_from_filename(source_name)
+        if not section:
+            return {}, [], "Cannot infer section from filename for list payload."
+        section_docs[section] = payload
+        return section_docs, [], None
+
+    return {}, [], "Invalid JSON structure. Expected object or array payload."
+
+
+def _apply_bot4_restore(section_docs):
+    """Apply normalized restore docs with strict upsert keys to prevent duplicates."""
+    targets = {
+        "pdfs": (col_pdfs, "code", "pdf_library"),
+        "trash": (col_trash, "code", "recycle_bin"),
+        "locked": (col_locked, "code", "locked_content"),
+        "trash_locked": (col_trash_locked, "code", "trash_locked"),
+        "admins": (col_admins, "user_id", "admins_bot4"),
+        "banned": (col_banned, "user_id", "banned_list"),
+        "state": (col_bot4_state, "_id", "bot4_state"),
+    }
+
+    results = {}
+    total_upserted = 0
+    total_errors = 0
+
+    for section, docs in section_docs.items():
+        collection, unique_key, label = targets.get(section, (None, None, section))
+        if collection is None:
+            results[label] = {"upserted": 0, "errors": len(docs)}
+            total_errors += len(docs)
+            continue
+
+        upserted = 0
+        errors = 0
+
+        for raw_doc in docs:
+            if not isinstance(raw_doc, dict):
+                errors += 1
+                continue
+            try:
+                d = dict(raw_doc)
+
+                # Ignore imported _id for non-state collections.
+                if unique_key != "_id":
+                    d.pop("_id", None)
+
+                if unique_key == "code":
+                    code = _sanitize_code(d.get("code", ""))
+                    if not code:
+                        errors += 1
+                        continue
+                    d["code"] = code
+                    collection.update_one({"code": code}, {"$set": d}, upsert=True)
+
+                elif unique_key == "user_id":
+                    uid = _normalize_restore_user_id(d.get("user_id"))
+                    if uid is None:
+                        errors += 1
+                        continue
+                    d["user_id"] = uid
+                    collection.update_one({"user_id": uid}, {"$set": d}, upsert=True)
+
+                elif unique_key == "_id":
+                    doc_id = d.get("_id")
+                    if doc_id in (None, ""):
+                        errors += 1
+                        continue
+                    collection.replace_one({"_id": doc_id}, d, upsert=True)
+
+                else:
+                    errors += 1
+                    continue
+
+                upserted += 1
+            except Exception:
+                errors += 1
+
+        results[label] = {"upserted": upserted, "errors": errors}
+        total_upserted += upserted
+        total_errors += errors
+
+    return results, total_upserted, total_errors
+
+
+@dp.message(F.text == "📥 JSON Restore")
+async def start_backup_json_restore(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    await state.set_state(BotState.waiting_for_backup_restore_file)
+    await state.update_data(backup_restore_session={
+        "files": 0,
+        "upserted": 0,
+        "errors": 0,
+        "skipped_sections": [],
+    })
+
+    kb = ReplyKeyboardBuilder()
+    kb.row(KeyboardButton(text="✅ FINISH RESTORE"), KeyboardButton(text="❌ CANCEL"))
+    kb.row(KeyboardButton(text="🔙 Back to Menu"))
+
+    await message.answer(
+        "📥 <b>JSON RESTORE MODE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Send <b>.json</b> or <b>.zip</b> backup files to restore data.\n\n"
+        "✅ Supports multiple files in one session.\n"
+        "✅ Uses strict upsert keys (no duplicates).\n"
+        "✅ Accepted sections: <code>pdfs, trash, locked, trash_locked, admins, banned, state</code>.\n\n"
+        "When done, tap <b>✅ FINISH RESTORE</b>.",
+        parse_mode="HTML",
+        reply_markup=kb.as_markup(resize_keyboard=True),
+    )
+
+
+@dp.message(BotState.waiting_for_backup_restore_file)
+async def receive_backup_json_restore(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if text in ("❌ CANCEL", "🔙 Back to Menu"):
+        await state.clear()
+        await message.answer("✅ JSON restore cancelled.", parse_mode="HTML")
+        return await start(message, state)
+
+    if text == "✅ FINISH RESTORE":
+        data = await state.get_data()
+        sess = data.get("backup_restore_session", {})
+        files = int(sess.get("files", 0))
+        upserted = int(sess.get("upserted", 0))
+        errors = int(sess.get("errors", 0))
+        skipped = sess.get("skipped_sections", []) or []
+
+        lines = [
+            "✅ <b>RESTORE SESSION CLOSED</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"📁 Files processed: <code>{files}</code>",
+            f"📥 Total upserted: <code>{upserted}</code>",
+            f"⚠️ Total errors/skips: <code>{errors}</code>",
+        ]
+        if skipped:
+            lines.append("\n⚠️ Skipped sections:")
+            for name in skipped[:10]:
+                lines.append(f"• <code>{name}</code>")
+            if len(skipped) > 10:
+                lines.append(f"• ... and {len(skipped) - 10} more")
+
+        await state.clear()
+        await message.answer("\n".join(lines), parse_mode="HTML")
+        return await start(message, state)
+
+    if not message.document:
+        await message.answer(
+            "⚠️ Send a <b>.json</b> or <b>.zip</b> file, or use ✅ FINISH RESTORE / ❌ CANCEL.",
+            parse_mode="HTML"
+        )
+        return
+
+    doc = message.document
+    fname = (doc.file_name or "").lower()
+    if not (fname.endswith(".json") or fname.endswith(".zip")):
+        await message.answer("❌ Only <b>.json</b> or <b>.zip</b> files are allowed.", parse_mode="HTML")
+        return
+
+    status = await message.answer("⏳ <b>Downloading restore file...</b>", parse_mode="HTML")
+
+    try:
+        file_info = await bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file_info.file_path, buf)
+        raw_bytes = buf.getvalue()
+    except Exception as e:
+        await status.edit_text(f"❌ <b>File download failed:</b> <code>{e}</code>", parse_mode="HTML")
+        return
+
+    import zipfile
+
+    section_docs = {}
+    skipped_sections = []
+
+    try:
+        if fname.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as zf:
+                members = [n for n in zf.namelist() if n.lower().endswith(".json") and not n.endswith("/")]
+                if not members:
+                    raise ValueError("ZIP has no JSON files")
+                for member in members:
+                    with zf.open(member) as fp:
+                        part_payload = json.loads(fp.read().decode("utf-8-sig"))
+                    part_docs, part_skipped, part_err = _normalize_restore_payload(part_payload, member)
+                    if part_err:
+                        raise ValueError(f"{member}: {part_err}")
+                    for sec, docs in part_docs.items():
+                        section_docs.setdefault(sec, []).extend(docs)
+                    skipped_sections.extend(part_skipped)
+        else:
+            payload = json.loads(raw_bytes.decode("utf-8-sig"))
+            part_docs, part_skipped, part_err = _normalize_restore_payload(payload, doc.file_name or "uploaded.json")
+            if part_err:
+                raise ValueError(part_err)
+            for sec, docs in part_docs.items():
+                section_docs.setdefault(sec, []).extend(docs)
+            skipped_sections.extend(part_skipped)
+
+    except Exception as e:
+        await status.edit_text(f"❌ <b>Invalid restore payload:</b> <code>{e}</code>", parse_mode="HTML")
+        return
+
+    await status.edit_text("⏳ <b>Applying restore...</b>", parse_mode="HTML")
+    results, total_upserted, total_errors = _apply_bot4_restore(section_docs)
+
+    data = await state.get_data()
+    sess = data.get("backup_restore_session", {
+        "files": 0,
+        "upserted": 0,
+        "errors": 0,
+        "skipped_sections": [],
+    })
+    sess["files"] = int(sess.get("files", 0)) + 1
+    sess["upserted"] = int(sess.get("upserted", 0)) + total_upserted
+    sess["errors"] = int(sess.get("errors", 0)) + total_errors + len(skipped_sections)
+    sess["skipped_sections"] = list(dict.fromkeys((sess.get("skipped_sections", []) or []) + skipped_sections))
+    await state.update_data(backup_restore_session=sess)
+
+    lines = [
+        "✅ <b>RESTORE FILE PROCESSED</b>",
+        f"📄 Source: <code>{doc.file_name or 'uploaded'}</code>",
+    ]
+    for section_name, r in results.items():
+        icon = "✅" if r["errors"] == 0 else "⚠️"
+        lines.append(f"{icon} <code>{section_name}</code>: +{r['upserted']}" + (f", {r['errors']} errors" if r["errors"] else ""))
+
+    if skipped_sections:
+        lines.append("\n⚠️ Skipped unknown sections:")
+        for s in skipped_sections[:8]:
+            lines.append(f"• <code>{s}</code>")
+        if len(skipped_sections) > 8:
+            lines.append(f"• ... and {len(skipped_sections) - 8} more")
+
+    lines.append(f"\n📥 File upserted: <code>{total_upserted}</code>")
+    lines.append(f"⚠️ File errors/skips: <code>{total_errors + len(skipped_sections)}</code>")
+    lines.append("\n🔁 Send next file or tap <b>✅ FINISH RESTORE</b>.")
+
+    await status.edit_text("\n".join(lines), parse_mode="HTML")
+
+
 @dp.message(F.text == "📅 Backup History")
 async def backup_history_btn(message: types.Message):
     if not is_admin(message.from_user.id): return
@@ -1652,6 +2203,97 @@ async def backup_history_btn(message: types.Message):
         await message.answer(msg_text, parse_mode="HTML")
     except Exception as e:
         await wait_msg.edit_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
+
+
+@dp.message(F.text == "🧨 Reset Backup Data")
+async def backup_reset_warning(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="⚠️ YES, RESET BACKUPS"), KeyboardButton(text="❌ ABORT"))
+    builder.row(KeyboardButton(text="🔙 Back to Menu"))
+    await message.answer(
+        "🧨 <b>BACKUP DATA RESET — STEP 1/2</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "This will permanently delete only backup records:\n"
+        "• <code>bot4_backups</code>\n"
+        "• <code>bot4_monthly_backups</code>\n"
+        "• backup markers in <code>bot4_state</code>\n\n"
+        "✅ <b>Will NOT delete:</b>\n"
+        "• Google Drive files\n"
+        "• Active PDF library\n"
+        "• Recycle bin, admins, bans\n\n"
+        "Press <b>YES, RESET BACKUPS</b> to continue.",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(resize_keyboard=True),
+    )
+    await state.set_state(BotState.backup_reset_confirm1)
+
+
+@dp.message(BotState.backup_reset_confirm1)
+async def backup_reset_step1(message: types.Message, state: FSMContext):
+    if message.text in ("❌ ABORT", "🔙 Back to Menu"):
+        await message.answer("✅ Backup reset aborted.", parse_mode="HTML")
+        await state.clear()
+        return await start(message, state)
+
+    if message.text == "⚠️ YES, RESET BACKUPS":
+        builder = ReplyKeyboardBuilder()
+        builder.row(KeyboardButton(text="☢️ EXECUTE FINAL BACKUP RESET"), KeyboardButton(text="❌ ABORT"))
+        builder.row(KeyboardButton(text="🔙 Back to Menu"))
+        await message.answer(
+            "☢️ <b>BACKUP DATA RESET — STEP 2/2</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Final confirmation required.\n"
+            "This action is irreversible for backup history records only.",
+            parse_mode="HTML",
+            reply_markup=builder.as_markup(resize_keyboard=True),
+        )
+        await state.set_state(BotState.backup_reset_confirm2)
+        return
+
+    await message.answer("⚠️ Use the confirmation buttons.", parse_mode="HTML")
+
+
+@dp.message(BotState.backup_reset_confirm2)
+async def backup_reset_step2(message: types.Message, state: FSMContext):
+    if message.text in ("❌ ABORT", "🔙 Back to Menu"):
+        await message.answer("✅ Backup reset aborted.", parse_mode="HTML")
+        await state.clear()
+        return await start(message, state)
+
+    if message.text != "☢️ EXECUTE FINAL BACKUP RESET":
+        await message.answer("⚠️ Use the final confirmation button.", parse_mode="HTML")
+        return
+
+    status = await message.answer("🧨 <b>Resetting backup records...</b>", parse_mode="HTML")
+    try:
+        _db = db_client["MSANodeDB"]
+
+        manual_deleted = _db["bot4_backups"].delete_many({}).deleted_count
+        monthly_deleted = _db["bot4_monthly_backups"].delete_many({}).deleted_count
+
+        state_deleted = 0
+        if col_bot4_state is not None:
+            res1 = col_bot4_state.delete_one({"_id": "last_weekly_backup"})
+            res2 = col_bot4_state.delete_one({"_id": "last_report_sent"})
+            state_deleted = (res1.deleted_count if res1 else 0) + (res2.deleted_count if res2 else 0)
+
+        await status.edit_text(
+            "✅ <b>BACKUP RESET COMPLETE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💾 Manual/weekly records removed: <code>{manual_deleted}</code>\n"
+            f"📅 Monthly records removed: <code>{monthly_deleted}</code>\n"
+            f"⚙️ Backup markers removed: <code>{state_deleted}</code>\n\n"
+            "☁️ Google Drive files: <b>UNTOUCHED</b>\n"
+            "📚 PDF library: <b>UNTOUCHED</b>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await status.edit_text(f"❌ <b>Backup reset failed:</b> <code>{e}</code>", parse_mode="HTML")
+
+    await state.clear()
+    await start(message, state)
 
 async def weekly_backup():
     while True:
@@ -2709,12 +3351,14 @@ async def save_new_code(message: types.Message, state: FSMContext):
 async def link_btn(message: types.Message, state: FSMContext):
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="📄 GET PDF FILE"), KeyboardButton(text="🔗 GET DRIVE LINK"))
+    builder.row(KeyboardButton(text="➕ ADD"))
     builder.row(KeyboardButton(text="🏠 MAIN MENU"))
     
     await message.answer(
         "🎛 **SELECT RETRIEVAL FORMAT:**\n\n"
         "📄 **GET PDF FILE**: Downloads and sends the actual file.\n"
-        "🔗 **GET DRIVE LINK**: Sends the secure Google Drive URL.",
+        "🔗 **GET DRIVE LINK**: Sends the secure Google Drive URL.\n"
+        "➕ **ADD**: Add single or multiple PDF names + links (comma separated).",
         reply_markup=builder.as_markup(resize_keyboard=True)
     )
     await state.set_state(BotState.choosing_retrieval_mode)
@@ -2723,6 +3367,24 @@ async def link_btn(message: types.Message, state: FSMContext):
 async def handle_mode_selection(message: types.Message, state: FSMContext):
     if message.text == "🏠 MAIN MENU": return await start(message, state) # Reset
     if message.text == "⬅️ BACK": return await link_btn(message, state) # Back
+
+    if col_pdfs is None:
+        await message.answer("❌ Database unavailable right now. Please try again shortly.")
+        return await start(message, state)
+
+    if message.text == "➕ ADD":
+        await message.answer(
+            "📝 <b>ADD MODE</b>\n"
+            "Send PDF names (single or multiple), separated by commas.\n"
+            "Example: <code>S19, S20, S21</code>",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="⬅️ BACK")], [KeyboardButton(text="🏠 MAIN MENU")]],
+                resize_keyboard=True,
+            ),
+        )
+        await state.set_state(BotState.adding_pdf_names)
+        return
     
     mode = "link"
     if "PDF" in message.text: mode = "pdf"
@@ -2732,6 +3394,17 @@ async def handle_mode_selection(message: types.Message, state: FSMContext):
     # Step 2: Choose Method (Single vs Bulk)
     # Check for empty FIRST (as requested)
     count = col_pdfs.count_documents({})
+    if count == 0:
+        try:
+            sync_result = await asyncio.to_thread(_sync_drive_folder_to_db)
+            count = col_pdfs.count_documents({})
+            if count > 0:
+                await message.answer(
+                    f"✅ Synced from Drive: added {sync_result.get('added',0)}, updated {sync_result.get('updated',0)}."
+                )
+        except Exception as sync_err:
+            logging.warning(f"Drive sync on empty vault failed: {sync_err}")
+
     if count == 0:
         await message.answer("📭 **VAULT IS EMPTY**", parse_mode="Markdown")
         return await start(message, state)
@@ -2749,6 +3422,150 @@ async def handle_mode_selection(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
     await state.set_state(BotState.choosing_retrieval_method)
+
+
+@dp.message(BotState.adding_pdf_names)
+async def add_pdf_names(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "🏠 MAIN MENU":
+        return await start(message, state)
+    if text == "⬅️ BACK":
+        return await link_btn(message, state)
+
+    if col_pdfs is None:
+        await message.answer("❌ Database unavailable. Cannot add records right now.")
+        return
+
+    names = [_sanitize_code(x) for x in text.split(",")]
+    names = [n for n in names if n]
+
+    if not names:
+        await message.answer("⚠️ Please provide at least one valid PDF name.")
+        return
+
+    if len(set(names)) != len(names):
+        await message.answer("❌ Duplicate names in input. Each name must be unique.")
+        return
+
+    existing_names = [n for n in names if col_pdfs.find_one({"code": n})]
+    if existing_names:
+        await message.answer(
+            "❌ These names already exist: " + ", ".join(sorted(set(existing_names)))
+        )
+        return
+
+    await state.update_data(add_names=names)
+    await message.answer(
+        "🔗 Now send Drive links separated by commas in the same order.\n"
+        f"Expected links: <b>{len(names)}</b>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⬅️ BACK")], [KeyboardButton(text="🏠 MAIN MENU")]],
+            resize_keyboard=True,
+        ),
+    )
+    await state.set_state(BotState.adding_pdf_links)
+
+
+@dp.message(BotState.adding_pdf_links)
+async def add_pdf_links(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "🏠 MAIN MENU":
+        return await start(message, state)
+    if text == "⬅️ BACK":
+        await message.answer(
+            "📝 Re-send PDF names separated by commas.",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="⬅️ BACK")], [KeyboardButton(text="🏠 MAIN MENU")]],
+                resize_keyboard=True,
+            ),
+        )
+        await state.set_state(BotState.adding_pdf_names)
+        return
+
+    data = await state.get_data()
+    names = data.get("add_names", [])
+    links = [x.strip() for x in text.split(",") if x.strip()]
+
+    if not names:
+        await message.answer("⚠️ Add session expired. Start again from ➕ ADD.")
+        return await link_btn(message, state)
+
+    if len(links) != len(names):
+        await message.answer(f"❌ Count mismatch. Names: {len(names)} | Links: {len(links)}")
+        return
+
+    if len(set(links)) != len(links):
+        await message.answer("❌ Duplicate links detected. Every link must be unique.")
+        return
+
+    invalid_links = [lnk for lnk in links if not _is_valid_drive_link(lnk)]
+    if invalid_links:
+        await message.answer("❌ One or more links are invalid Google Drive links.")
+        return
+
+    if col_pdfs is None:
+        await message.answer("❌ Database unavailable. Please try again later.")
+        return
+
+    try:
+        service = await asyncio.to_thread(get_drive_service)
+    except Exception as e:
+        await message.answer(f"❌ Drive auth failed: {e}")
+        return
+
+    existing_ids = set()
+    for d in col_pdfs.find({}, {"drive_file_id": 1, "link": 1}):
+        fid = d.get("drive_file_id") or _extract_drive_id(d.get("link", ""))
+        if fid:
+            existing_ids.add(fid)
+
+    prepared = []
+    seen_new_ids = set()
+
+    for idx, link in enumerate(links):
+        fid = _extract_drive_id(link)
+        if not fid:
+            await message.answer(f"❌ Invalid link at position {idx+1}.")
+            return
+        if fid in existing_ids or fid in seen_new_ids:
+            await message.answer("❌ Same Drive file is already used. Duplicate files are blocked.")
+            return
+        seen_new_ids.add(fid)
+
+        try:
+            meta = await asyncio.to_thread(_fetch_drive_pdf_meta, service, link)
+        except Exception as e:
+            await message.answer(f"❌ Could not verify link {idx+1}: {e}")
+            return
+
+        if meta is None:
+            await message.answer("❌ One of the links is not a valid PDF file on Drive.")
+            return
+
+        prepared.append({
+            "code": names[idx],
+            "link": meta.get("webViewLink", link),
+            "drive_file_id": meta.get("id"),
+            "drive_name": meta.get("name", ""),
+            "drive_modified": meta.get("modifiedTime"),
+            "timestamp": now_local(),
+            "source": "manual_add",
+        })
+
+    inserted = 0
+    for item in prepared:
+        try:
+            col_pdfs.insert_one(item)
+            inserted += 1
+        except Exception as e:
+            await message.answer(f"⚠️ Failed to add {item['code']}: {e}")
+
+    await message.answer(
+        f"✅ <b>ADD COMPLETE</b>\nInserted: <code>{inserted}</code>/<code>{len(prepared)}</code>",
+        parse_mode="HTML",
+    )
+    await link_btn(message, state)
 
 @dp.message(BotState.choosing_retrieval_method)
 async def handle_retrieval_method_selection(message: types.Message, state: FSMContext, override_text: str = None, override_page: int = None):
@@ -3313,15 +4130,7 @@ async def process_deletion(message: types.Message, state: FSMContext):
         await state.set_state(BotState.confirm_delete)
 
     else:
-        # Range Deletion (Keep existing logic for now, or add confirmation? Let's add simple confirmation)
-        # Actually user specifically asked for "click button confirm". 
-        # Range relies on text input. Single relies on buttons.
-        # Let's just implement confirmation for EVERYTHING.
-        pass # To be continued in next edit if needed, but for now focusing on Code mode changes.
-        
-        # ... Wait, I can't leave 'pass'. I need to keep the Range logic functioning.
-        # Let's just update the Code block first.
-        
+        # Range Deletion - first confirmation (step 1/2)
         try:
             # Parse Range
             if "-" in text:
@@ -3370,141 +4179,164 @@ async def execute_deletion(message: types.Message, state: FSMContext):
     text = message.text.upper()
     data = await state.get_data()
     mode = data.get('delete_mode', 'code')
-    
-    # Handle BACK button - return to delete mode
+
     if text == "⬅️ BACK":
         await remove_btn(message, state)
         return
-    
+
+    if text == "🔙 BACK TO MENU":
+        await state.clear()
+        await start(message, state)
+        return
+
     if text == "❌ CANCEL":
         await message.answer("❌ <b>DELETION CANCELLED.</b>\nNo files were deleted.", parse_mode="HTML")
-        
-        # Helper to re-show menu based on mode
-        if mode == 'code':
-            # Re-fetch buttons
-            docs = _get_unique_docs()
-            builder = ReplyKeyboardBuilder()
-            existing_codes = []
-            for d in docs[:50]:
-                code = d.get('code')
-                if code and code not in existing_codes:
-                    abs_idx = docs.index(d) + 1
-                    builder.add(KeyboardButton(text=f"{abs_idx}. {code}"))
-                    existing_codes.append(code)
-            builder.adjust(2)
-            builder.row(KeyboardButton(text="🔙 Back to Menu"))
-            await message.answer("🆔 **Select Code to Delete:**", reply_markup=builder.as_markup(resize_keyboard=True))
-            await state.set_state(BotState.deleting_pdf)
-        else:
-            await message.answer("🔢 **Enter range to purge (e.g. 1-5):**", 
-                                 reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True))
-            await state.set_state(BotState.deleting_pdf)
+        await remove_btn(message, state)
         return
 
     if text == "✅ YES, DELETE":
         if mode == 'code':
-            code = data.get('target_code')
-            msg = await message.answer(f"⏳ **ARCHIVING: `{code}`...**")
-
-            if code.endswith('…'):
-                search_code = code[:-1]
-                query = {"code": {"$regex": f"^{search_code}"}}
-            elif code.endswith('...'):
-                search_code = code[:-3]
-                query = {"code": {"$regex": f"^{search_code}"}}
-            else:
-                query = {"code": code}
-            
-            docs = list(col_pdfs.find(query))
-            if docs:
-                db_res = True
-                drive_del_count = 0
-                links_to_delete = set()
-                
-                for doc in docs:
-                    link = doc.get("link", "")
-                    if link: links_to_delete.add(link)
-                    doc['deleted_at'] = datetime.now()
-                    col_trash.insert_one(doc)
-                    col_pdfs.delete_one({"_id": doc['_id']})
-                
-                for i in range(0, len(links_to_delete), 15):
-                    chunk = list(links_to_delete)[i:i+15]
-                    results = await asyncio.gather(*(asyncio.to_thread(_drive_delete_file, l) for l in chunk), return_exceptions=True)
-                    drive_del_count += sum(1 for r in results if r is True)
-                
-                DAILY_STATS_BOT4["pdfs_deleted"] += len(docs)
-                asyncio.create_task(_persist_stats())
-                
-                if links_to_delete:
-                    drive_note = f"  ☁️ Drive: {drive_del_count}/{len(links_to_delete)}"
-                else:
-                    drive_note = ""
-            else:
-                db_res = False
-                drive_note = ""
-                docs = []
-
-            status = f"🍃 DB: ✅ {len(docs)} Deleted" if db_res else "🍃 DB: ❌ Not Found"
-            await msg.edit_text(f"✅ <b>DELETED: <code>{code}</code></b>\n{status}{drive_note}", parse_mode="HTML")
+            target = data.get('target_code', 'UNKNOWN')
+            summary = f"Code: <code>{target}</code>"
         else:
-            # Range Deletion
-            indices = data.get('target_range_indices')
-            start_idx, end_idx = indices
-            
-            msg = await message.answer("⏳ <b>Deleting files...</b>", parse_mode="HTML")
-            
-            all_docs = _get_unique_docs()
-            selected_docs = all_docs[start_idx-1 : end_idx]
-            
-            moved_count = 0
+            indices = data.get('target_range_indices', [0, 0])
+            total = data.get('target_range_len', 0)
+            summary = f"Range: <code>{indices[0]}-{indices[1]}</code> | Files: <code>{total}</code>"
+
+        builder2 = ReplyKeyboardBuilder()
+        builder2.row(KeyboardButton(text="☢️ FINAL DELETE"), KeyboardButton(text="❌ CANCEL"))
+        builder2.row(KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="🔙 Back to Menu"))
+        await message.answer(
+            "☢️ <b>FINAL CONFIRMATION — STEP 2/2</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"{summary}\n\n"
+            "This will delete from <b>Database + Google Drive</b>.\n"
+            "Press <b>FINAL DELETE</b> to execute.",
+            parse_mode="HTML",
+            reply_markup=builder2.as_markup(resize_keyboard=True),
+        )
+        await state.set_state(BotState.waiting_delete_final)
+        return
+
+    await message.answer("⚠️ Please select YES or CANCEL.")
+
+
+@dp.message(BotState.waiting_delete_final)
+async def execute_deletion_final(message: types.Message, state: FSMContext):
+    text = message.text.upper()
+    data = await state.get_data()
+    mode = data.get('delete_mode', 'code')
+
+    if text in ("❌ CANCEL", "⬅️ BACK"):
+        await message.answer("❌ <b>DELETION CANCELLED.</b>\nNo files were deleted.", parse_mode="HTML")
+        await remove_btn(message, state)
+        return
+
+    if text == "🔙 BACK TO MENU":
+        await state.clear()
+        await start(message, state)
+        return
+
+    if text != "☢️ FINAL DELETE":
+        await message.answer("⚠️ Use FINAL DELETE or CANCEL.")
+        return
+
+    if mode == 'code':
+        code = data.get('target_code')
+        msg = await message.answer(f"⏳ **ARCHIVING: `{code}`...**")
+
+        if code.endswith('…'):
+            search_code = code[:-1]
+            query = {"code": {"$regex": f"^{search_code}"}}
+        elif code.endswith('...'):
+            search_code = code[:-3]
+            query = {"code": {"$regex": f"^{search_code}"}}
+        else:
+            query = {"code": code}
+
+        docs = list(col_pdfs.find(query))
+        if docs:
+            db_res = True
             drive_del_count = 0
             links_to_delete = set()
-            
-            for unique_doc in selected_docs:
-                unique_code = unique_doc.get("code")
-                duplicates = list(col_pdfs.find({"code": unique_code}))
-                for doc in duplicates:
-                    link = doc.get("link", "")
-                    if link: links_to_delete.add(link)
-                    
-                    doc['deleted_at'] = datetime.now()
-                    col_trash.insert_one(doc)
-                    col_pdfs.delete_one({"_id": doc['_id']})
-                    moved_count += 1
+
+            for doc in docs:
+                link = doc.get("link", "")
+                if link:
+                    links_to_delete.add(link)
+                doc['deleted_at'] = datetime.now()
+                col_trash.insert_one(doc)
+                col_pdfs.delete_one({"_id": doc['_id']})
 
             for i in range(0, len(links_to_delete), 15):
                 chunk = list(links_to_delete)[i:i+15]
                 results = await asyncio.gather(*(asyncio.to_thread(_drive_delete_file, l) for l in chunk), return_exceptions=True)
                 drive_del_count += sum(1 for r in results if r is True)
 
-            drive_note = f"  ☁️ Drive: {drive_del_count}/{len(links_to_delete)}" if links_to_delete else ""
-            DAILY_STATS_BOT4["pdfs_deleted"] += moved_count
+            DAILY_STATS_BOT4["pdfs_deleted"] += len(docs)
             asyncio.create_task(_persist_stats())
-            await msg.edit_text(f"✅ <b>BULK DELETE COMPLETE</b>\nRemoved <code>{moved_count}</code> matching records from vault.{drive_note}", parse_mode="HTML")
-            
-        # Re-Show Menu
-        if mode == 'code':
-            await asyncio.sleep(1)
-            # Re-fetch buttons
-            docs = _get_unique_docs()
-            builder = ReplyKeyboardBuilder()
-            existing_codes = []
-            for d in docs[:50]:
-                code = d.get('code')
-                if code and code not in existing_codes:
-                    builder.add(KeyboardButton(text=code))
-                    existing_codes.append(code)
-            builder.adjust(2)
-            builder.row(KeyboardButton(text="🔙 Back to Menu"))
-            await message.answer("🆔 Select next Code or '🔙 Back to Menu'.", reply_markup=builder.as_markup(resize_keyboard=True))
+            drive_note = f"  ☁️ Drive: {drive_del_count}/{len(links_to_delete)}" if links_to_delete else ""
         else:
-            await message.answer("🔢 Enter next range or '🔙 Back to Menu'.",
-                                 reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True))
-        
-        await state.set_state(BotState.deleting_pdf)
+            db_res = False
+            drive_note = ""
+            docs = []
+
+        status = f"🍃 DB: ✅ {len(docs)} Deleted" if db_res else "🍃 DB: ❌ Not Found"
+        await msg.edit_text(f"✅ <b>DELETED: <code>{code}</code></b>\n{status}{drive_note}", parse_mode="HTML")
     else:
-        await message.answer("⚠️ Please select YES or CANCEL.")
+        indices = data.get('target_range_indices')
+        start_idx, end_idx = indices
+
+        msg = await message.answer("⏳ <b>Deleting files...</b>", parse_mode="HTML")
+
+        all_docs = _get_unique_docs()
+        selected_docs = all_docs[start_idx-1 : end_idx]
+
+        moved_count = 0
+        drive_del_count = 0
+        links_to_delete = set()
+
+        for unique_doc in selected_docs:
+            unique_code = unique_doc.get("code")
+            duplicates = list(col_pdfs.find({"code": unique_code}))
+            for doc in duplicates:
+                link = doc.get("link", "")
+                if link:
+                    links_to_delete.add(link)
+
+                doc['deleted_at'] = datetime.now()
+                col_trash.insert_one(doc)
+                col_pdfs.delete_one({"_id": doc['_id']})
+                moved_count += 1
+
+        for i in range(0, len(links_to_delete), 15):
+            chunk = list(links_to_delete)[i:i+15]
+            results = await asyncio.gather(*(asyncio.to_thread(_drive_delete_file, l) for l in chunk), return_exceptions=True)
+            drive_del_count += sum(1 for r in results if r is True)
+
+        drive_note = f"  ☁️ Drive: {drive_del_count}/{len(links_to_delete)}" if links_to_delete else ""
+        DAILY_STATS_BOT4["pdfs_deleted"] += moved_count
+        asyncio.create_task(_persist_stats())
+        await msg.edit_text(f"✅ <b>BULK DELETE COMPLETE</b>\nRemoved <code>{moved_count}</code> matching records from vault.{drive_note}", parse_mode="HTML")
+
+    if mode == 'code':
+        await asyncio.sleep(1)
+        docs = _get_unique_docs()
+        builder = ReplyKeyboardBuilder()
+        existing_codes = []
+        for d in docs[:50]:
+            code = d.get('code')
+            if code and code not in existing_codes:
+                builder.add(KeyboardButton(text=code))
+                existing_codes.append(code)
+        builder.adjust(2)
+        builder.row(KeyboardButton(text="🔙 Back to Menu"))
+        await message.answer("🆔 Select next Code or '🔙 Back to Menu'.", reply_markup=builder.as_markup(resize_keyboard=True))
+    else:
+        await message.answer("🔢 Enter next range or '🔙 Back to Menu'.",
+                             reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Back to Menu")]], resize_keyboard=True))
+
+    await state.set_state(BotState.deleting_pdf)
 
 
 
@@ -3566,9 +4398,12 @@ async def nuke_warning(message: types.Message, state: FSMContext):
     await message.answer(
         "☢️ <b>DANGER — NUKE ALL DATA</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "This will <b>permanently destroy ALL</b>:\n"
-        "• All MongoDB PDF records\n"
-        "• All local PDF files\n\n"
+        "This will <b>permanently destroy operational vault data</b>:\n"
+        "• MongoDB vault collections (pdf/trash/locked)\n"
+        "• Local PDF cache files\n\n"
+        "✅ <b>Strictly NOT touched:</b>\n"
+        "• Google Drive files\n"
+        "• Backup collections/history\n\n"
         "⚠️ <b>IRREVERSIBLE. Step 1 of 2:</b>\n"
         "Press <b>YES, I UNDERSTAND</b> to continue:",
         reply_markup=builder.as_markup(resize_keyboard=True),
@@ -3603,28 +4438,11 @@ async def nuke_execution(message: types.Message, state: FSMContext):
         return await start(message, state)
     if message.text == "☢️ EXECUTE FINAL NUKE":
         status_msg = await message.answer("☢️ <b>INITIATING NUCLEAR PROTOCOL...</b>", parse_mode="HTML")
-        
-        # 1. Google Drive Wipe
-        await status_msg.edit_text("🔥 <b>STEP 1/3: Wiping Google Drive Vault...</b>", parse_mode="HTML")
-        drive_count = 0
-        all_colls = [col_pdfs, col_trash, col_locked, col_trash_locked]
-        all_links = []
-        for coll in all_colls:
-            if coll is not None:
-                for doc in coll.find({}, {"link": 1}):
-                    if "link" in doc and doc["link"]:
-                        all_links.append(doc["link"])
-        
-        all_links = list(set(all_links)) # unique only
-        
-        for i in range(0, len(all_links), 15):
-            chunk = all_links[i:i+15]
-            results = await asyncio.gather(*(asyncio.to_thread(_drive_delete_file, l) for l in chunk), return_exceptions=True)
-            drive_count += sum(1 for r in results if r is True)
 
-        # 2. MongoDB Wipe
-        await status_msg.edit_text("🔥 <b>STEP 2/3: Purging Database...</b>", parse_mode="HTML")
+        # 1. MongoDB vault wipe (backups untouched by design)
+        await status_msg.edit_text("🔥 <b>STEP 1/2: Purging Vault Database...</b>", parse_mode="HTML")
         db_count = 0
+        all_colls = [col_pdfs, col_trash, col_locked, col_trash_locked]
         for coll in all_colls:
             if coll is not None:
                 try:
@@ -3632,8 +4450,8 @@ async def nuke_execution(message: types.Message, state: FSMContext):
                     db_count += x.deleted_count
                 except: pass
 
-        # 3. Local Wipe
-        await status_msg.edit_text("🔥 <b>STEP 3/3: Sterilizing Local Environment...</b>", parse_mode="HTML")
+        # 2. Local cache wipe
+        await status_msg.edit_text("🔥 <b>STEP 2/2: Sterilizing Local PDF Cache...</b>", parse_mode="HTML")
         local_count = 0
         for file in os.listdir():
             if file.endswith(".pdf"):
@@ -3645,9 +4463,10 @@ async def nuke_execution(message: types.Message, state: FSMContext):
         report = (
             "☢️ <b>NUCLEAR WIPEOUT COMPLETE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"☁️ <b>Drive:</b> <code>{drive_count}</code> files destroyed.\n"
             f"🛢 <b>Database:</b> <code>{db_count}</code> records destroyed.\n"
             f"💻 <b>Local:</b> <code>{local_count}</code> files purged.\n\n"
+            "☁️ <b>Drive:</b> <code>UNTOUCHED</code>\n"
+            "📦 <b>Backups:</b> <code>UNTOUCHED</code>\n\n"
             "☠️ <b>NUKE COMPLETE.</b>\n"
             "The system has been purged, Master."
         )
@@ -5609,6 +6428,16 @@ async def main():
     # ── 3. One-time startup tasks ────────────────────────────────────────────
     await _migrate_permissions()
     await _load_persisted_stats()
+
+    # If DB library is empty but Drive already has PDFs, auto-import them.
+    try:
+        if col_pdfs is not None and col_pdfs.count_documents({}) == 0:
+            sync_result = await asyncio.to_thread(_sync_drive_folder_to_db)
+            print(
+                f"🔄 Drive sync on boot: +{sync_result.get('added',0)} / ~{sync_result.get('updated',0)} / skip {sync_result.get('skipped',0)}"
+            )
+    except Exception as _sync_err:
+        logging.warning(f"Startup Drive sync failed: {_sync_err}")
 
     print("💎 MSANODE BOT 4 ONLINE")
 
