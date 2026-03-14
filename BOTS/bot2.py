@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from aiohttp import web as aiohttp_web
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -18,6 +18,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
 from aiogram.exceptions import TelegramNetworkError, TelegramServerError, TelegramRetryAfter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.types import TelegramObject
+from typing import Callable, Dict, Any, Awaitable
 
 # Fix Windows console encoding for emojis
 if sys.platform == 'win32':
@@ -307,6 +309,25 @@ bot = Bot(token=BOT_TOKEN)  # Bot 2 - Admin interface
 bot_8 = Bot(token=BOT_8_TOKEN)  # Bot 1 - Message delivery
 dp = Dispatcher(storage=MemoryStorage())
 
+
+class Bot2BanBlockMiddleware(BaseMiddleware):
+    """Silently drop all incoming messages from users banned in Bot 2 scope."""
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user and user.id != MASTER_ADMIN_ID:
+            if col_banned_users.find_one({"user_id": user.id, "scope": "bot2"}):
+                return
+        return await handler(event, data)
+
+
+# Global gate: once auto-banned in bot2 scope, all messages are ignored silently
+dp.message.middleware(Bot2BanBlockMiddleware())
+
 print(f"⚙️ Bot instances initialized")
 print(f"📱 Bot 2: Admin interface ready")
 print(f"📤 Bot 1: Message delivery ready")
@@ -436,11 +457,14 @@ class AdminStates(StatesGroup):
     selecting_permissions = State()
     toggling_permissions = State()
     waiting_for_role_admin_id = State()
+    waiting_for_role_type = State()
     selecting_role = State()
     waiting_for_lock_user_id = State()
     waiting_for_lock_action = State()
     waiting_for_unlock_user_id = State()
     waiting_for_ban_user_id = State()
+    waiting_for_ban_config_id = State()
+    waiting_for_ban_config_confirm = State()
     waiting_for_admin_search = State()
     # Owner transfer flow
     owner_transfer_first_confirm = State()   # Step 1: "type CONFIRM"
@@ -723,25 +747,34 @@ async def is_admin(user_id: int) -> bool:
     
     return True  # Admin exists and is unlocked
 
-async def notify_owner_unauthorized_access(user_id: int, user_name: str, username: str, attempt_count: int, was_banned: bool = False):
-    """Notify owner about unauthorized access attempts"""
-    timestamp = now_local().strftime('%b %d, %Y %I:%M %p')  # 12-hour format
-    
+async def notify_owner_unauthorized_access(
+    user_id: int,
+    user_name: str,
+    username: str,
+    attempt_count: int,
+    was_banned: bool = False,
+    attempt_type: str = "NON-ADMIN",
+):
+    """Notify owner about unauthorized /start attempts with strict 12-hour timestamp."""
+    timestamp = now_local().strftime('%B %d, %Y — %I:%M:%S %p')
+    uname = f"@{username}" if username else "N/A"
+
     msg = (
-        f"🚨 **UNAUTHORIZED ACCESS ATTEMPT**\n\n"
+        f"🚨 **UNAUTHORIZED /START ATTEMPT**\n\n"
         f"👤 User ID: `{user_id}`\n"
         f"📝 Name: {user_name or 'Unknown'}\n"
-        f"🔗 Username: @{username or 'None'}\n"
-        f"🕐 Time: {timestamp}\n"
-        f"🔢 Attempt #{attempt_count}"
+        f"🔗 Username: {uname}\n"
+        f"📌 Type: **{attempt_type}**\n"
+        f"🕐 Time (12h): {timestamp}\n"
+        f"🔢 Attempts (5m window): **{attempt_count}**"
     )
-    
+
     if was_banned:
-        msg += f"\n\n🚫 **AUTO-BANNED** (Spam detected - 3+ attempts in 5 min)"
-    
+        msg += "\n\n🚫 **AUTO-BANNED (BOT 2)**\nReason: 3+ unauthorized /start attempts within 5 minutes."
+
     try:
         await bot.send_message(MASTER_ADMIN_ID, msg, parse_mode="Markdown")
-        log_action("🚨 UNAUTHORIZED ACCESS", user_id, f"Notified owner - Attempt #{attempt_count}")
+        log_action("🚨 UNAUTHORIZED ACCESS", user_id, f"Owner notified ({attempt_type}) - Attempt #{attempt_count}")
     except Exception as e:
         print(f"❌ Failed to notify owner: {e}")
 
@@ -783,8 +816,13 @@ async def get_main_menu(user_id: int = None):
     # Get user permissions
     admin = col_admins.find_one({"user_id": user_id})
     if not admin:
-        # Not an admin - show minimal menu
-        keyboard = [[KeyboardButton(text="👥 ADMINS"), KeyboardButton(text="📖 GUIDE")]]
+        # Not an admin - show stripped minimal menu
+        keyboard = [[KeyboardButton(text="📖 GUIDE")]]
+        return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+    # Locked admins are treated as inactive/non-admin until unlocked
+    if admin.get('locked', False):
+        keyboard = [[KeyboardButton(text="📖 GUIDE")]]
         return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
     
     perms = admin.get('permissions', [])
@@ -820,6 +858,28 @@ async def get_main_menu(user_id: int = None):
         keyboard.append([KeyboardButton(text=btn) for btn in row])
     
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+async def _push_instant_user_menu_refresh(user_id: int, context: str = "updated"):
+    """Push the current effective menu to a user immediately after role/permission/lock changes."""
+    try:
+        admin_doc = col_admins.find_one({"user_id": user_id})
+        if not admin_doc or admin_doc.get("locked", False):
+            await bot.send_message(
+                user_id,
+                "🔒 Access is currently inactive. Your menu remains restricted until unlock.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return
+
+        refreshed_menu = await get_main_menu(user_id)
+        await bot.send_message(
+            user_id,
+            f"📋 Your Bot 2 menu was {context} instantly.",
+            reply_markup=refreshed_menu
+        )
+    except Exception as e:
+        log_action("⚠️ INSTANT MENU REFRESH FAILED", user_id, str(e))
 
 
 def get_backup_menu():
@@ -996,6 +1056,132 @@ def get_admin_menu():
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
+
+_ADMIN_OV_PREV = "⬅️ PREV OVERVIEW"
+_ADMIN_OV_NEXT = "NEXT OVERVIEW ➡️"
+_ADMIN_OV_MAX_CHARS = 2800
+
+
+def _get_admin_overview_keyboard(page: int, total_pages: int) -> ReplyKeyboardMarkup:
+    """Admin menu + optional overview pagination controls."""
+    rows = []
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(KeyboardButton(text=_ADMIN_OV_PREV))
+        if page < total_pages - 1:
+            nav.append(KeyboardButton(text=_ADMIN_OV_NEXT))
+        if nav:
+            rows.append(nav)
+
+    rows.extend([
+        [KeyboardButton(text="➕ NEW ADMIN"), KeyboardButton(text="➖ REMOVE ADMIN")],
+        [KeyboardButton(text="🔐 PERMISSIONS"), KeyboardButton(text="👔 MANAGE ROLES")],
+        [KeyboardButton(text="🔒 LOCK/UNLOCK USER"), KeyboardButton(text="🚫 BAN CONFIG")],
+        [KeyboardButton(text="📋 LIST ADMINS"), KeyboardButton(text="⬅️ MAIN MENU")]
+    ])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def _build_admin_overview_pages(admins: list[dict]) -> list[str]:
+    """Build character-safe admin overview pages with status/role/permissions."""
+    role_icons = {
+        "Owner": "👑", "Manager": "🔴", "Admin": "🟡", "Moderator": "🟢", "Support": "🔵"
+    }
+
+    entries = []
+    for idx, a in enumerate(admins, start=1):
+        uid = a.get("user_id")
+        name = a.get("name", str(uid))
+        role = a.get("role", "Admin")
+        role_icon = role_icons.get(role, "👤")
+        locked = bool(a.get("locked", False))
+        status_line = "🔒 LOCKED (Inactive)" if locked else "🔓 UNLOCKED (Active)"
+
+        perms = a.get("permissions", []) or []
+        if "all" in perms:
+            perms_text = "ALL"
+        else:
+            labels = [_PERM_LABELS.get(p, p) for p in perms]
+            perms_text = ", ".join(labels) if labels else "None"
+
+        if name == str(uid):
+            title = f"{idx}. {status_line} — {role_icon} {role}"
+            user_line = f"   👤 ID: {uid}"
+        else:
+            title = f"{idx}. {status_line} — {role_icon} {role}"
+            user_line = f"   👤 {name} ({uid})"
+
+        entries.append(
+            f"{title}\n"
+            f"{user_line}\n"
+            f"   🔐 Permissions: {perms_text}\n"
+        )
+
+    pages = []
+    current = ""
+    for entry in entries:
+        if current and (len(current) + len(entry) + 1) > _ADMIN_OV_MAX_CHARS:
+            pages.append(current.rstrip())
+            current = entry
+        else:
+            current += ("\n" + entry) if current else entry
+
+    if current:
+        pages.append(current.rstrip())
+    return pages or ["_No sub-admins found._"]
+
+
+async def _send_admin_overview_page(message: types.Message, state: FSMContext, page: int = 0):
+    """Render one page of admin overview with clean details and pagination."""
+    admins = list(col_admins.find({}).sort("added_at", -1))
+    admin_count = len(admins)
+
+    pages = _build_admin_overview_pages(admins) if admins else ["_No sub-admins found._"]
+    total_pages = len(pages)
+    page = max(0, min(page, total_pages - 1))
+
+    await state.update_data(admin_overview_pages=pages, admin_overview_page=page)
+
+    body = pages[page]
+    header = (
+        f"👥 ADMIN MANAGEMENT\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👑 Owner: MSA ({MASTER_ADMIN_ID})\n"
+        f"📊 Sub-admins: {admin_count}\n"
+        f"📄 Page: {page + 1}/{total_pages}\n\n"
+    )
+
+    await message.answer(
+        header + body + "\n\nSelect an option:",
+        reply_markup=_get_admin_overview_keyboard(page, total_pages)
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ROLE PERMISSION TEMPLATES — Auto-applied when using AUTO ROLES mode
+# ──────────────────────────────────────────────────────────────────────────────
+_ROLE_PERMISSION_TEMPLATES = {
+    "Owner":     ["broadcast", "find", "traffic", "diagnosis", "shoot", "support", "backup", "terminal", "admins", "bot8"],
+    "Manager":   ["broadcast", "find", "traffic", "diagnosis", "shoot", "support", "backup", "terminal", "admins", "bot8"],
+    "Admin":     ["broadcast", "find", "traffic", "support", "backup"],
+    "Moderator": ["support", "find", "traffic"],
+    "Support":   ["support"],
+}
+_ROLE_DESCRIPTIONS = {
+    "Owner":     ("👑", "All 10 permissions — full control"),
+    "Manager":   ("🔴", "All 10 permissions — full management"),
+    "Admin":     ("🟡", "Broadcast · Find · Traffic · Support · Backup"),
+    "Moderator": ("🟢", "Support · Find · Traffic"),
+    "Support":   ("🔵", "Support only"),
+}
+_PERM_LABELS = {
+    'broadcast': '📢 Broadcast', 'find': '🔍 Find',
+    'traffic': '📊 Traffic',    'diagnosis': '🩺 Diagnosis',
+    'shoot': '📸 Shoot',        'support': '💬 Support',
+    'backup': '💾 Backup',      'terminal': '🖥️ Terminal',
+    'admins': '👥 Admins',      'bot8': '🤖 Bot 1',
+}
+
 def _admin_btn(admin: dict) -> str:
     """Build admin selection button label: '👤 @username (user_id)' or '👤 Name (user_id)'"""
     uid  = admin['user_id']
@@ -1006,9 +1192,11 @@ def _admin_btn(admin: dict) -> str:
     return f"👤 {name} ({uid})"
 
 def _parse_admin_uid(text: str) -> int:
-    """Parse user_id from '👤 Name (user_id)' or legacy 'UID - Role' button text."""
+    """Parse user_id from '👤 Name (user_id)' or '🔒 Name (user_id) — Role' button text."""
     if '(' in text and ')' in text:
-        return int(text.split('(')[-1].rstrip(')'))
+        start = text.index('(') + 1
+        end   = text.index(')', start)
+        return int(text[start:end].strip())
     if '[' in text and ']' in text:
         return int(text.split('[')[-1].rstrip(']'))
     if ' - ' in text:
@@ -1081,9 +1269,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_name = message.from_user.full_name
     username = message.from_user.username
     
-    # 1. Check if user is banned - Silent ignore
-    if col_banned_users.find_one({"user_id": user_id}):
-        log_action("🚫 BANNED ACCESS BLOCKED", user_id, f"Banned user tried /start")
+    # 1. Check if user is Bot 2-banned - complete silent ignore
+    if col_banned_users.find_one({"user_id": user_id, "scope": "bot2"}):
+        log_action("🚫 BANNED ACCESS BLOCKED", user_id, "Bot2-banned user tried /start")
         return  # Complete silence
 
     # ── Password gate: master admin must authenticate once per session ──────
@@ -1113,56 +1301,53 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         return
     
-    # 3. Non-admin access attempt
-    log_action("❌ NON-ADMIN ATTEMPT", user_id, f"{user_name} tried to access")
-    
-    # Record attempt
-    attempt_doc = {
+    # 3. Unauthorized /start attempt (non-admin OR locked admin)
+    admin_doc = col_admins.find_one({"user_id": user_id})
+    is_locked_admin = bool(admin_doc and admin_doc.get("locked", False))
+    attempt_type = "LOCKED ADMIN" if is_locked_admin else "NON-ADMIN"
+
+    log_action("❌ UNAUTHORIZED START", user_id, f"{attempt_type} tried /start")
+
+    # Record this attempt (used for anti-spam auto-ban)
+    col_access_attempts.insert_one({
         "user_id": user_id,
         "user_name": user_name,
         "username": username,
-        "attempted_at": now_local()
-    }
-    col_access_attempts.insert_one(attempt_doc)
-    
-    # Check for spam (3+ attempts in 5 minutes)
+        "attempt_type": attempt_type,
+        "attempted_at": now_local(),
+    })
+
+    # Spam policy: 3+ unauthorized /start attempts in 5 minutes => auto-ban
     five_min_ago = now_local() - timedelta(minutes=5)
     recent_attempts = col_access_attempts.count_documents({
         "user_id": user_id,
         "attempted_at": {"$gte": five_min_ago}
     })
-    
-    # Auto-ban if spam detected
+
     if recent_attempts >= 3:
-        # Ban user
         ban_doc = {
             "user_id": user_id,
             "banned_by": "SYSTEM",
             "banned_at": now_local(),
-            "reason": "Automated: Spam detection (3+ unauthorized access attempts)",
+            "reason": "Automated: 3+ unauthorized /start attempts in 5 minutes",
             "status": "banned",
-            "scope": "bot2"  # Only blocks Bot 2 admin access, NOT Bot 1
+            "scope": "bot2",
         }
-        try:
-            col_banned_users.insert_one(ban_doc)
-            log_action("🚫 AUTO-BAN", user_id, f"Spam detected - {recent_attempts} attempts")
-            
-            # Notify owner about ban
-            await notify_owner_unauthorized_access(
-                user_id, user_name, username, recent_attempts, was_banned=True
-            )
-        except:
-            # Duplicate ban, just notify
-            await notify_owner_unauthorized_access(
-                user_id, user_name, username, recent_attempts, was_banned=False
-            )
-    else:
-        # Not spam yet, just notify owner
-        await notify_owner_unauthorized_access(
-            user_id, user_name, username, recent_attempts, was_banned=False
+        col_banned_users.update_one(
+            {"user_id": user_id, "scope": "bot2"},
+            {"$setOnInsert": ban_doc},
+            upsert=True,
         )
-    
-    # Silent reject - NO response to user
+        log_action("🚫 AUTO-BAN", user_id, f"Auto-banned for spam unauthorized /start ({recent_attempts}/5m)")
+        await notify_owner_unauthorized_access(
+            user_id, user_name, username, recent_attempts, was_banned=True, attempt_type=attempt_type
+        )
+    else:
+        await notify_owner_unauthorized_access(
+            user_id, user_name, username, recent_attempts, was_banned=False, attempt_type=attempt_type
+        )
+
+    # Silent reject — no response to user
     return
 
 
@@ -1218,18 +1403,43 @@ async def admin_pw_second(message: types.Message, state: FSMContext):
         await state.clear()
         await cmd_start(message, state)
         return
-    try: await message.delete()
-    except: pass
-    if message.text == ADMIN_PASSWORD:
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    data = await state.get_data()
+    attempts = data.get("pw_attempts_2", 0)
+
+    if not ADMIN_PASSWORD:
         _admin_authenticated.add(user_id)
         await state.clear()
         await cmd_start(message, state)
-    else:
+        return
+
+    if message.text == ADMIN_PASSWORD and data.get("pw_first_ok"):
+        _admin_authenticated.add(user_id)
+        await state.clear()
+        await message.answer("✅ Authentication complete.", parse_mode="HTML")
+        await cmd_start(message, state)
+        return
+
+    attempts += 1
+    remaining = 3 - attempts
+    if remaining <= 0:
         await state.clear()
         await message.answer(
-            "❌ Passwords did not match. Authentication failed.\n\nUse /start to try again.",
+            "❌ Authentication failed. Use /start to try again.",
             reply_markup=ReplyKeyboardRemove(),
         )
+        return
+
+    await state.update_data(pw_attempts_2=attempts)
+    await message.answer(
+        f"❌ Incorrect confirmation password. <b>{remaining}</b> attempt(s) remaining.",
+        parse_mode="HTML",
+    )
 
 
 @dp.message(Command("report"))
@@ -1329,36 +1539,6 @@ async def bot8_settings_handler(message: types.Message, state: FSMContext):
     is_maintenance = settings.get("value", False) if settings else False
     status_icon    = "🔴 OFFLINE (Maintenance)" if is_maintenance else "🟢 ONLINE"
     updated_at     = settings.get("updated_at", None) if settings else None
-    updated_str    = updated_at.strftime("%b %d, %Y %I:%M %p") if updated_at else "Never"
-
-    total_tracking = col_user_tracking.count_documents({})
-    total_msa      = col_msa_ids.count_documents({"retired": {"$ne": True}})
-
-    await message.answer(
-        f"🤖 **BOT 1 SETTINGS**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📡 **Status:** {status_icon}\n"
-        f"🕒 **Last Changed:** {updated_str}\n"
-        f"👥 **Users who started bot:** {total_tracking}\n"
-        f"🆔 **Verified MSA Members:** {total_msa}\n\n"
-        f"**🔴 TURN BOT OFF** — Put bot in Maintenance Mode\n"
-        f"**🟢 TURN BOT ON** — Bring bot back online\n\n"
-        f"Choose your action below:",
-        reply_markup=get_bot8_settings_menu(),
-        parse_mode="Markdown"
-    )
-
-
-# ==========================================
-# 🤖 BOT 1 — TURN OFF / TURN ON  (with Auto / Template / Custom choice)
-# ==========================================
-
-@dp.message(F.text.in_({"🔴 TURN BOT OFF", "🟢 TURN BOT ON"}))
-async def b8_toggle_start_handler(message: types.Message, state: FSMContext):
-    """Ask admin how to broadcast: Auto, select template, or custom message."""
-    if not await has_permission(message.from_user.id, "bot8"):
-        return
-
     direction = "OFF" if "OFF" in message.text else "ON"
     await state.update_data(b8_direction=direction)
 
@@ -1630,15 +1810,29 @@ async def _b8_execute_toggle(message: types.Message, state: FSMContext, directio
     # turn_on=True  → maintenance ON  → hide keyboard (ReplyKeyboardRemove)
     # turn_on=False → maintenance OFF → restore keyboard (_BOT1_MAIN_MENU_KB)
     _broadcast_kb = ReplyKeyboardRemove() if turn_on else _BOT1_MAIN_MENU_KB
-    for doc in all_users:
+    for i, doc in enumerate(all_users, 1):
         uid = doc.get("user_id")
         if not uid: continue
-        try:
-            await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown", reply_markup=_broadcast_kb)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            fail += 1
+        for _attempt in range(3):
+            try:
+                await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown", reply_markup=_broadcast_kb)
+                sent += 1
+                await asyncio.sleep(0.04)  # ~25 msgs/sec — within Telegram rate limits
+                break
+            except TelegramRetryAfter as rafe:
+                await asyncio.sleep(rafe.retry_after + 1)
+                if _attempt == 2:
+                    fail += 1
+            except Exception:
+                fail += 1
+                break
+        if i % 50 == 0 or i == len(all_users):
+            try:
+                await progress.edit_text(
+                    f"📡 Broadcasting… {i}/{len(all_users)} — ✅ {sent} sent / ❌ {fail} failed"
+                )
+            except Exception:
+                pass
     try:
         await progress.delete()
     except Exception:
@@ -1677,15 +1871,34 @@ async def _b8_execute_toggle_from_callback(callback: types.CallbackQuery, state:
     all_users  = list(col_user_tracking.find({}, {"user_id": 1}))
     sent, fail = 0, 0
     _broadcast_kb = ReplyKeyboardRemove() if turn_on else _BOT1_MAIN_MENU_KB
-    for doc in all_users:
+    progress = await callback.message.answer(f"📡 Broadcasting to {len(all_users)} users…")
+    for i, doc in enumerate(all_users, 1):
         uid = doc.get("user_id")
         if not uid: continue
-        try:
-            await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown", reply_markup=_broadcast_kb)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            fail += 1
+        for _attempt in range(3):
+            try:
+                await bot_8.send_message(uid, broadcast_text, parse_mode="Markdown", reply_markup=_broadcast_kb)
+                sent += 1
+                await asyncio.sleep(0.04)  # ~25 msgs/sec — within Telegram rate limits
+                break
+            except TelegramRetryAfter as rafe:
+                await asyncio.sleep(rafe.retry_after + 1)
+                if _attempt == 2:
+                    fail += 1
+            except Exception:
+                fail += 1
+                break
+        if i % 50 == 0 or i == len(all_users):
+            try:
+                await progress.edit_text(
+                    f"📡 Broadcasting… {i}/{len(all_users)} — ✅ {sent} sent / ❌ {fail} failed"
+                )
+            except Exception:
+                pass
+    try:
+        await progress.delete()
+    except Exception:
+        pass
 
     await state.clear()
     await callback.message.answer(
@@ -5601,13 +5814,20 @@ async def process_ban_id(message: types.Message, state: FSMContext):
                 parse_mode="Markdown"
             )
             return
-        
+
+        # Check if user is an admin — warn but still allow ban (admin record auto-removed on confirm)
+        admin_doc = col_admins.find_one({"user_id": user_id})
+        is_admin_user = bool(admin_doc)
+        admin_role = admin_doc.get('role', 'Admin') if admin_doc else None
+
         # Store user data for confirmation
         await state.update_data(
             user_id=user_id,
             msa_id=msa_id,
             first_name=first_name,
-            username=username
+            username=username,
+            is_admin_user=is_admin_user,
+            admin_role=admin_role
         )
         await state.set_state(ShootStates.waiting_for_ban_confirm)
         
@@ -5618,13 +5838,19 @@ async def process_ban_id(message: types.Message, state: FSMContext):
             resize_keyboard=True
         )
         
+        admin_note = (
+            f"\n⚠️ **Note:** This user is a **{admin_role}** admin — "
+            f"their admin record will be removed automatically.\n"
+        ) if is_admin_user else ""
+
         await loading_msg.delete()
         await message.answer(
             f"🚫 **CONFIRM BAN**\n\n"
             f"👤 **Name:** {first_name}\n"
             f"🆔 **MSA ID:** `{msa_id}`\n"
             f"👁️ **User ID:** `{user_id}`\n"
-            f"📱 **Username:** @{username if username != 'N/A' else 'None'}\n\n"
+            f"📱 **Username:** @{username if username != 'N/A' else 'None'}\n"
+            f"{admin_note}\n"
             f"⚠️ **This will:**\n"
             f"  • Ban user from all Bot 1 functions\n"
             f"  • Hide all menus and buttons\n"
@@ -5652,8 +5878,14 @@ async def process_ban_confirm(message: types.Message, state: FSMContext):
         user_id = data.get("user_id")
         msa_id = data.get("msa_id")
         first_name = data.get("first_name")
+        is_admin_user = data.get("is_admin_user", False)
+        admin_role = data.get("admin_role", "Admin")
         
         try:
+            # If target is an admin, remove their admin record first
+            if is_admin_user:
+                col_admins.delete_one({"user_id": user_id})
+
             # Add to banned_users collection
             col_banned_users.insert_one({
                 "user_id": user_id,
@@ -5709,16 +5941,18 @@ async def process_ban_confirm(message: types.Message, state: FSMContext):
             except Exception:
                 pass  # User might have blocked bot
             
+            admin_removed_note = f"\n🔓 Admin record ({admin_role}) removed automatically." if is_admin_user else ""
             await state.clear()
             await message.answer(
                 f"✅ **USER BANNED**\n\n"
-                f"👤 {first_name} (`{msa_id}`) has been banned from Bot 1.\n\n"
+                f"👤 {first_name} (`{msa_id}`) has been banned from Bot 1.\n"
+                f"{admin_removed_note}\n"
                 f"🕐 Banned at: {now_local().strftime('%I:%M:%S %p')}\n\n"
                 f"User will see ban notification on next interaction.",
                 reply_markup=get_shoot_menu(),
                 parse_mode="Markdown"
             )
-            print(f"🚫 User {user_id} ({msa_id}) banned by admin {message.from_user.id}")
+            print(f"🚫 User {user_id} ({msa_id}) banned by admin {message.from_user.id}{'  [admin record removed]' if is_admin_user else ''}")
         
         except Exception as e:
             await message.answer(f"❌ **BAN FAILED:** {str(e)[:100]}", parse_mode="Markdown")
@@ -6172,12 +6406,14 @@ async def process_unban_id(message: types.Message, state: FSMContext):
         msa_id = ban_doc.get("msa_id", "N/A")
         first_name = ban_doc.get("first_name", "Unknown")
         banned_at = ban_doc.get("banned_at", now_local())
+        ban_type = ban_doc.get("ban_type", "permanent")
         
         # Store data for confirmation
         await state.update_data(
             user_id=user_id,
             msa_id=msa_id,
-            first_name=first_name
+            first_name=first_name,
+            ban_type=ban_type
         )
         await state.set_state(ShootStates.waiting_for_unban_confirm)
         
@@ -6188,14 +6424,20 @@ async def process_unban_id(message: types.Message, state: FSMContext):
             resize_keyboard=True
         )
         
+        _perm_warning = (
+            "\n⚠️ **PERMANENT BAN — DATA WIPE ON UNBAN:**\n"
+            "All user records (tracking, verification, MSA ID) will be erased.\n"
+            "User must /start again as a brand-new member.\n"
+        ) if ban_type == "permanent" else "\nThis will restore full bot access.\n"
+        
         await loading_msg.delete()
         await message.answer(
             f"✅ **CONFIRM UNBAN**\n\n"
             f"👤 **Name:** {first_name}\n"
             f"🆔 **MSA ID:** `{msa_id}`\n"
             f"👁️ **User ID:** `{user_id}`\n"
-            f"🚫 **Banned:** {banned_at.strftime('%b %d, %Y at %I:%M:%S %p')}\n\n"
-            f"This will restore full bot access.\n\n"
+            f"🚫 **Banned:** {banned_at.strftime('%b %d, %Y at %I:%M:%S %p')}\n"
+            f"📌 **Ban type:** {ban_type.capitalize()}{_perm_warning}\n"
             f"Type **✅ CONFIRM UNBAN** to proceed or **❌ CANCEL** to abort.",
             reply_markup=confirm_keyboard,
             parse_mode="Markdown"
@@ -6218,54 +6460,85 @@ async def process_unban_confirm(message: types.Message, state: FSMContext):
         user_id = data.get("user_id")
         msa_id = data.get("msa_id")
         first_name = data.get("first_name")
+        ban_type = data.get("ban_type", "permanent")
         
         try:
             # Remove from banned_users collection
             result = col_banned_users.delete_one({"user_id": user_id})
             
             if result.deleted_count > 0:
-                # Try to notify user via Bot 1 with menu restoration
+                records_cleared = 0
+
+                # For permanent bans: wipe ALL user records so they start completely fresh
+                if ban_type == "permanent":
+                    r1 = col_user_tracking.delete_one({"user_id": user_id})
+                    r2 = col_user_verification.delete_one({"user_id": user_id})
+                    r3 = col_msa_ids.delete_one({"user_id": user_id})
+                    # Also clear any suspended features left over
+                    col_suspended_features.delete_one({"user_id": user_id})
+                    records_cleared = r1.deleted_count + r2.deleted_count + r3.deleted_count
+                    print(f"🗑️ Permanent-ban data wipe for user {user_id}: tracking={r1.deleted_count}, verification={r2.deleted_count}, msa_ids={r3.deleted_count}")
+
+                # Notify user with appropriate message
                 try:
-                    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-                    
-                    unban_message = (
-                        "✅ **ACCOUNT UNBANNED**\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "Your account has been unbanned by an administrator.\n\n"
-                        "🎉 **Full Access Restored**\n"
-                        "All bot features are now available to you.\n\n"
-                        "⚠️ **Warning:**\n"
-                        "Please follow community guidelines to avoid future restrictions.\n\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "Your menu has been automatically restored below. 👇"
-                    )
-                    
-                    # Create full menu keyboard
-                    menu_keyboard = ReplyKeyboardMarkup(
-                        keyboard=[
-                            [KeyboardButton(text="📊 DASHBOARD")],
-                            [KeyboardButton(text="🔍 SEARCH CODE")],
-                            [KeyboardButton(text="📜 RULES")],
-                            [KeyboardButton(text="📚 GUIDE")],
-                            [KeyboardButton(text="📞 SUPPORT")]
-                        ],
-                        resize_keyboard=True
-                    )
-                    
-                    await bot_8.send_message(user_id, unban_message, reply_markup=menu_keyboard, parse_mode="Markdown")
-                except:
+                    if ban_type == "permanent":
+                        unban_message = (
+                            "✅ **ACCOUNT UNBANNED**\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            "Your permanent ban has been lifted by an administrator.\n\n"
+                            "🆕 **Fresh Start**\n"
+                            "Your previous data has been fully cleared.\n"
+                            "Use /start to register as a brand-new member.\n\n"
+                            "⚠️ **Warning:**\n"
+                            "Please follow community guidelines to avoid future restrictions.\n\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━━━"
+                        )
+                        await bot_8.send_message(
+                            user_id, unban_message,
+                            reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown"
+                        )
+                    else:
+                        unban_message = (
+                            "✅ **ACCOUNT UNBANNED**\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            "Your account has been unbanned by an administrator.\n\n"
+                            "🎉 **Full Access Restored**\n"
+                            "All bot features are now available to you.\n\n"
+                            "⚠️ **Warning:**\n"
+                            "Please follow community guidelines to avoid future restrictions.\n\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            "Your menu has been automatically restored below. 👇"
+                        )
+                        menu_keyboard = ReplyKeyboardMarkup(
+                            keyboard=[
+                                [KeyboardButton(text="📊 DASHBOARD")],
+                                [KeyboardButton(text="🔍 SEARCH CODE")],
+                                [KeyboardButton(text="📜 RULES")],
+                                [KeyboardButton(text="📚 GUIDE")],
+                                [KeyboardButton(text="📞 SUPPORT")]
+                            ],
+                            resize_keyboard=True
+                        )
+                        await bot_8.send_message(
+                            user_id, unban_message,
+                            reply_markup=menu_keyboard, parse_mode="Markdown"
+                        )
+                except Exception:
                     pass  # User might have blocked bot
                 
+                _cleared_note = f"\n🗑️ **Records cleared:** {records_cleared} (fresh start — user must /start again)" if ban_type == "permanent" else ""
                 await state.clear()
                 await message.answer(
                     f"✅ **USER UNBANNED**\n\n"
-                    f"👤 {first_name} (`{msa_id}`) has been unbanned.\n\n"
+                    f"👤 {first_name} (`{msa_id}`) has been unbanned.\n"
+                    f"📌 **Ban type was:** {'Permanent (all data wiped)' if ban_type == 'permanent' else 'Temporary'}"
+                    f"{_cleared_note}\n"
                     f"🕐 Unbanned at: {now_local().strftime('%I:%M:%S %p')}\n\n"
-                    f"User now has full bot access with warning notification sent.",
+                    f"{'User must /start again to register as a new member.' if ban_type == 'permanent' else 'User now has full bot access with warning notification sent.'}",
                     reply_markup=get_shoot_menu(),
                     parse_mode="Markdown"
                 )
-                print(f"✅ User {user_id} ({msa_id}) unbanned by admin {message.from_user.id}")
+                print(f"✅ User {user_id} ({msa_id}) unbanned by admin {message.from_user.id} (ban_type={ban_type}, records_cleared={records_cleared})")
             else:
                 await message.answer("❌ Failed to unban user. Please try again.", parse_mode="Markdown")
         
@@ -9784,35 +10057,36 @@ async def admins_handler(message: types.Message, state: FSMContext):
     await state.clear()
     log_action("👥 ADMINS MENU", message.from_user.id, "Opened admin management")
 
-    # Build admin list
-    admins = list(col_admins.find({}))
-    admin_count = len(admins)
+    await _send_admin_overview_page(message, state, 0)
 
-    if admins:
-        lines = []
-        for a in admins:
-            uid    = a['user_id']
-            name   = a.get('name', str(uid))
-            role   = a.get('role', 'Admin')
-            locked = '🔒' if a.get('locked') else '🔓'
-            # Show name only once; avoid "1028732 (1028732)" display bug
-            if name == str(uid):
-                lines.append(f"{locked} 👤 `{uid}` — {role}")
-            else:
-                lines.append(f"{locked} 👤 {name} (`{uid}`) — {role}")
-        admin_list_text = "\n".join(lines)
-    else:
-        admin_list_text = "_No admins found._"
 
-    await message.answer(
-        f"👥 **ADMIN MANAGEMENT**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Total Admins: {admin_count}\n\n"
-        f"{admin_list_text}\n\n"
-        "Select an option:",
-        reply_markup=get_admin_menu(),
-        parse_mode="Markdown"
-    )
+@dp.message(F.text == _ADMIN_OV_PREV)
+async def admins_overview_prev(message: types.Message, state: FSMContext):
+    """Previous page for admin overview."""
+    if not await has_permission(message.from_user.id, "admins"):
+        return
+    data = await state.get_data()
+    pages = data.get("admin_overview_pages") or []
+    if not pages:
+        await _send_admin_overview_page(message, state, 0)
+        return
+    page = max(0, int(data.get("admin_overview_page", 0)) - 1)
+    await _send_admin_overview_page(message, state, page)
+
+
+@dp.message(F.text == _ADMIN_OV_NEXT)
+async def admins_overview_next(message: types.Message, state: FSMContext):
+    """Next page for admin overview."""
+    if not await has_permission(message.from_user.id, "admins"):
+        return
+    data = await state.get_data()
+    pages = data.get("admin_overview_pages") or []
+    if not pages:
+        await _send_admin_overview_page(message, state, 0)
+        return
+    total_pages = len(pages)
+    page = min(total_pages - 1, int(data.get("admin_overview_page", 0)) + 1)
+    await _send_admin_overview_page(message, state, page)
 
 # ==========================================
 # ADMIN MANAGEMENT HANDLERS
@@ -9872,6 +10146,34 @@ async def process_new_admin_id(message: types.Message, state: FSMContext):
         )
         await state.clear()
         return
+
+    # ─── Ban check: banned users cannot be added as admins ───
+    ban_doc = col_banned_users.find_one({"user_id": user_id})
+    if ban_doc:
+        ban_type = ban_doc.get("ban_type", "permanent")
+        banned_by = ban_doc.get("banned_by", "Unknown")
+        banned_at_raw = ban_doc.get("banned_at")
+        scope = ban_doc.get("scope", "")
+        is_auto = banned_by == "SYSTEM"
+        banned_at_str = banned_at_raw.strftime('%b %d, %Y at %I:%M %p') if banned_at_raw else "Unknown"
+        scope_label = " (Bot 2 auto-ban only)" if scope == "bot2" else ""
+        await message.answer(
+            f"🚫 **CANNOT ADD AS ADMIN — USER IS BANNED**\n\n"
+            f"👤 User ID: `{user_id}`\n\n"
+            f"⚠️ **Ban Status:**\n"
+            f"  • Source: {'SYSTEM (Auto spam-detection)' if is_auto else f'Manually by Admin ({banned_by})'}{scope_label}\n"
+            f"  • Type: {ban_type.capitalize()}\n"
+            f"  • Banned At: {banned_at_str}\n\n"
+            f"❌ Banned users **cannot** be added as admins.\n\n"
+            f"💡 To add this user as admin:\n"
+            f"  1️⃣ Go to **🔫 SHOOT → ✅ UNBAN USER** and unban them\n"
+            f"  2️⃣ Then return here to add them as admin",
+            reply_markup=get_admin_menu(),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        return
+
     
     # Prefer @username, then full_name so the admin list shows readable labels
     try:
@@ -10375,38 +10677,42 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
         '🤖 BOT 1 SETTINGS': 'bot8'
     }
     
-    # Handle SAVE CHANGES
+    # Handle SAVE CHANGES — permissions can always be saved, even while locked.
+    # Locked admins won't have these active until unlocked.
     if message.text == "💾 SAVE CHANGES":
-        # Check if admin is locked
         admin_doc = col_admins.find_one({"user_id": user_id})
-        if admin_doc and admin_doc.get("locked", False):
-            await message.answer(
-                f"🚫 **ACTION BLOCKED**\n\n"
-                f"👤 Admin: {admin_name} (`{user_id}`)\n\n"
-                f"This admin is currently **LOCKED**.\n"
-                f"You cannot assign or save new permissions to a locked account.\n\n"
-                f"💡 Use **🔒 LOCK/UNLOCK USER** to unlock them first.",
-                reply_markup=get_admin_menu(),
-                parse_mode="Markdown"
-            )
-            await state.clear()
-            return
-
-        # Update database
+        is_locked = admin_doc.get("locked", False) if admin_doc else False
         try:
             col_admins.update_one(
                 {"user_id": user_id},
                 {"$set": {"permissions": current_perms, "updated_at": now_local()}}
             )
             log_action("🔐 PERMISSIONS UPDATED", message.from_user.id,
-                      f"Updated permissions for {user_id}")
-            
+                      f"Updated permissions for {user_id} (locked={is_locked})")
+            _perm_labels = {
+                'broadcast': '📢 Broadcast', 'find': '🔍 Find',
+                'traffic': '📊 Traffic', 'diagnosis': '🩺 Diagnosis',
+                'shoot': '📸 Shoot', 'support': '💬 Support',
+                'backup': '💾 Backup', 'terminal': '🖥️ Terminal',
+                'admins': '👥 Admins', 'bot8': '🤖 Bot 1 Settings'
+            }
+            perm_display = ", ".join(_perm_labels.get(p, p) for p in current_perms) if current_perms else "None"
+            _lock_note = (
+                "\n\n⚠️ **Admin is currently LOCKED.**\n"
+                "These permissions are saved and **will activate automatically once unlocked**."
+            ) if is_locked else ""
             await message.answer(
-                f"✅ PERMISSIONS SAVED\n\n"
+                f"✅ **PERMISSIONS SAVED**\n\n"
                 f"👤 Admin: {admin_name} (`{user_id}`)\n"
-                f"New permissions: {', '.join(current_perms) if current_perms else 'None'}",
-                reply_markup=get_admin_menu()
+                f"🔐 Permissions set: {perm_display}{_lock_note}",
+                reply_markup=get_admin_menu(),
+                parse_mode="Markdown"
             )
+
+            # Instant button/feature refresh for active admins
+            if not is_locked:
+                await _push_instant_user_menu_refresh(user_id, context="permissions updated")
+
             await state.clear()
         except Exception as e:
             await message.answer(
@@ -10415,37 +10721,30 @@ async def process_permission_toggle(message: types.Message, state: FSMContext):
             )
             await state.clear()
         return
-    
+
     # Handle GRANT ALL
     if message.text == "✅ GRANT ALL":
         current_perms = list(perm_map.values())
         await state.update_data(current_permissions=current_perms)
-    
+
     # Handle REVOKE ALL
     elif message.text == "❌ REVOKE ALL":
         current_perms = []
         await state.update_data(current_permissions=current_perms)
-    
+
     # Handle individual permission toggle
     else:
-        # Extract permission label from button text
         button_text = message.text.replace("✅ ", "").replace("❌ ", "")
-        
         if button_text in perm_map:
             perm_key = perm_map[button_text]
-            
-            # Toggle permission
             if perm_key in current_perms:
                 current_perms.remove(perm_key)
             else:
                 current_perms.append(perm_key)
-            
-            # Remove 'all' if it exists
             if 'all' in current_perms:
                 current_perms.remove('all')
-            
             await state.update_data(current_permissions=current_perms)
-    
+
     # Rebuild permission UI with updated state
     all_permissions = {
         'broadcast': '📢 BROADCAST',
@@ -10514,10 +10813,20 @@ async def manage_roles_handler(message: types.Message, state: FSMContext):
     end_idx = min(start_idx + ITEMS_PER_PAGE, len(admins))
     page_admins = admins[start_idx:end_idx]
     
-    # Create admin buttons
+    # Create admin buttons — show lock status + current role
     admin_buttons = []
     for admin in page_admins:
-        admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
+        uid  = admin['user_id']
+        name = admin.get('name', str(uid))
+        role = admin.get('role', 'Admin')
+        is_locked = admin.get('locked', False)
+        lock_icon = "🔒" if is_locked else "🔓"
+        role_icon = _ROLE_DESCRIPTIONS.get(role, ("", ""))[0]
+        if name != str(uid):
+            label = f"{lock_icon} {name} ({uid}) — {role_icon}{role}"
+        else:
+            label = f"{lock_icon} ({uid}) — {role_icon}{role}"
+        admin_buttons.append([KeyboardButton(text=label)])
     
     # Navigation buttons
     nav_buttons = []
@@ -10534,6 +10843,7 @@ async def manage_roles_handler(message: types.Message, state: FSMContext):
     
     await message.answer(
         f"👔 MANAGE ROLES\n\n"
+        f"🔒 = LOCKED (Inactive)  🔓 = UNLOCKED (Active)\n\n"
         f"Select admin to change role:\n"
         f"Showing {start_idx + 1}-{end_idx} of {len(admins)} admins"
         f"{f' (Page {page + 1}/{total_pages})' if total_pages > 1 else ''}",
@@ -10626,7 +10936,17 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
         
         admin_buttons = []
         for admin in page_admins:
-            admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
+            uid  = admin['user_id']
+            name = admin.get('name', str(uid))
+            role = admin.get('role', 'Admin')
+            is_locked = admin.get('locked', False)
+            lock_icon = "🔒" if is_locked else "🔓"
+            role_icon = _ROLE_DESCRIPTIONS.get(role, ("", ""))[0]
+            if name != str(uid):
+                lbl = f"{lock_icon} {name} ({uid}) — {role_icon}{role}"
+            else:
+                lbl = f"{lock_icon} ({uid}) — {role_icon}{role}"
+            admin_buttons.append([KeyboardButton(text=lbl)])
         
         nav_buttons = []
         if new_page > 0:
@@ -10639,6 +10959,7 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
         
         await message.answer(
             f"👔 MANAGE ROLES\n\n"
+            f"🔒 = LOCKED  🔓 = UNLOCKED\n\n"
             f"Select admin to change role:\n"
             f"Showing {start_idx + 1}-{end_idx} of {len(admins_list)} admins"
             f"{f' (Page {new_page + 1}/{total_pages})' if total_pages > 1 else ''}",
@@ -10659,7 +10980,57 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
         return
 
     await state.update_data(role_admin_id=user_id)
-    
+
+    # Build profile snapshot for the master admin to review
+    current_role = admin_doc.get('role', 'Admin')
+    current_perms = admin_doc.get('permissions', [])
+    is_locked = admin_doc.get('locked', False)
+    role_icon, role_desc = _ROLE_DESCRIPTIONS.get(current_role, ("", ""))
+    lock_badge = "🔒 LOCKED — changes save as PENDING" if is_locked else "🔓 UNLOCKED — changes activate immediately"
+    perms_display = ", ".join(_PERM_LABELS.get(p, p) for p in current_perms) if current_perms else "None"
+
+    type_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔵 AUTO ROLES")],
+            [KeyboardButton(text="⚙️ CUSTOM ROLE")],
+            [KeyboardButton(text="🔙 BACK")]
+        ],
+        resize_keyboard=True
+    )
+
+    await message.answer(
+        f"👔 **CHANGE ROLE**\n\n"
+        f"👤 Admin: {admin_doc.get('name', str(user_id))} (`{user_id}`)\n"
+        f"📋 Current Role: {role_icon} **{current_role}** — _{role_desc}_\n"
+        f"🔑 Permissions: {perms_display}\n"
+        f"Status: {lock_badge}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**🔵 AUTO ROLES** — Select a role template.\n"
+        f"Permissions are automatically assigned based on the role.\n\n"
+        f"**⚙️ CUSTOM ROLE** — Select a role label only.\n"
+        f"Permissions remain unchanged (edit manually via 🔐 PERMISSIONS).",
+        reply_markup=type_kb,
+        parse_mode="Markdown"
+    )
+    await state.set_state(AdminStates.waiting_for_role_type)
+
+
+
+@dp.message(AdminStates.waiting_for_role_type)
+async def process_role_type(message: types.Message, state: FSMContext):
+    """Handle AUTO ROLES vs CUSTOM ROLE choice, then show role buttons."""
+    if message.text in ["❌ CANCEL", "⬅️ BACK", "🔙 BACK", "/cancel"]:
+        await state.clear()
+        await message.answer("✅ Cancelled.", reply_markup=get_admin_menu())
+        return
+
+    if message.text not in ["🔵 AUTO ROLES", "⚙️ CUSTOM ROLE"]:
+        await message.answer("⚠️ Please select 🔵 AUTO ROLES or ⚙️ CUSTOM ROLE.")
+        return
+
+    is_auto = message.text == "🔵 AUTO ROLES"
+    await state.update_data(role_type="auto" if is_auto else "custom")
+
     role_kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👑 OWNER")],
@@ -10669,16 +11040,31 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
         ],
         resize_keyboard=True
     )
-    
-    await message.answer(
-        f"👔 CHANGE ROLE\n\n"
-        f"👤 Admin: {admin_doc.get('name', str(user_id))} (`{user_id}`)\n"
-        f"📋 Current Role: {admin_doc.get('role', 'Admin')}\n\n"
-        "Select new role:",
-        reply_markup=role_kb
-    )
-    await state.set_state(AdminStates.selecting_role)
 
+    if is_auto:
+        info = (
+            "👔 **AUTO ROLE ASSIGNMENT**\n\n"
+            "Select a role — permissions will be auto-applied:\n\n"
+            "👑 **OWNER** — All 10 permissions\n"
+            "🔴 **MANAGER** — All 10 permissions\n"
+            "🟡 **ADMIN** — Broadcast · Find · Traffic · Support · Backup\n"
+            "🟢 **MODERATOR** — Support · Find · Traffic\n"
+            "🔵 **SUPPORT** — Support only\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ Role + permissions applied automatically on selection."
+        )
+    else:
+        info = (
+            "⚙️ **CUSTOM ROLE ASSIGNMENT**\n\n"
+            "Select a role label — permissions will **NOT** change.\n"
+            "Manage permissions manually via 🔐 PERMISSIONS.\n\n"
+            "👑 **OWNER**  🔴 **MANAGER**\n"
+            "🟡 **ADMIN**  🟢 **MODERATOR**\n"
+            "🔵 **SUPPORT**"
+        )
+
+    await message.answer(info, reply_markup=role_kb, parse_mode="Markdown")
+    await state.set_state(AdminStates.selecting_role)
 
 
 @dp.message(AdminStates.selecting_role)
@@ -10726,11 +11112,12 @@ async def process_role_selection(message: types.Message, state: FSMContext):
             admin_buttons.append([KeyboardButton(text="🔙 BACK")])
 
             action_text = "BAN" if ban_action == "ban" else "UNBAN"
-            status_text = "unbanned" if ban_action == "ban" else "banned"
+            target_label = "admin" if ban_action == "ban" else "user"
+            status_text = "unbanned admins" if ban_action == "ban" else "banned users"
             await message.answer(
-                f"{'🚫' if ban_action == 'ban' else '✅'} {action_text} ADMIN\n\n"
-                f"Select admin to {action_text}:\n"
-                f"Showing {start_idx + 1}-{end_idx} of {len(admins_list)} {status_text} admins"
+                f"{'🚫' if ban_action == 'ban' else '✅'} {action_text} {target_label.upper()}\n\n"
+                f"Select {target_label} to {action_text}:\n"
+                f"Showing {start_idx + 1}-{end_idx} of {len(admins_list)} {status_text}"
                 f"{f' (Page {new_page + 1}/{total_pages})' if total_pages > 1 else ''}",
                 reply_markup=ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
             )
@@ -10743,12 +11130,12 @@ async def process_role_selection(message: types.Message, state: FSMContext):
             await message.answer("⚠️ Invalid selection.")
             return
 
-        admin_doc = col_admins.find_one({"user_id": user_id})
-        if not admin_doc:
-            await message.answer(f"⚠️ User {user_id} is not an admin.")
-            return
-
         if ban_action == "ban":
+            admin_doc = col_admins.find_one({"user_id": user_id})
+            if not admin_doc:
+                await message.answer(f"⚠️ User {user_id} is not an admin.")
+                return
+
             # ── BLOCK: must remove admin first ──
             is_still_admin = col_admins.find_one({"user_id": user_id}) is not None
             if is_still_admin and user_id != MASTER_ADMIN_ID:
@@ -10778,7 +11165,7 @@ async def process_role_selection(message: types.Message, state: FSMContext):
             }
             try:
                 col_banned_users.update_one(
-                    {"user_id": user_id},
+                    {"user_id": user_id, "scope": "bot2"},
                     {"$setOnInsert": ban_doc},
                     upsert=True
                 )
@@ -10797,16 +11184,25 @@ async def process_role_selection(message: types.Message, state: FSMContext):
 
         elif ban_action == "unban":
             try:
-                col_banned_users.delete_one({"user_id": user_id})
-                log_action("✅ USER UNBANNED", message.from_user.id, f"Unbanned user: {user_id}")
-                await message.answer(
-                    f"✅ **USER UNBANNED**\n\n"
-                    f"👤 User ID: `{user_id}`\n"
-                    f"📅 Unbanned: {now_local().strftime('%B %d, %Y — %I:%M %p')}\n\n"
-                    f"This user can now access Bot 1 again.",
-                    reply_markup=get_admin_menu(),
-                    parse_mode="Markdown"
-                )
+                result = col_banned_users.delete_many({"user_id": user_id, "scope": "bot2"})
+                if result.deleted_count == 0:
+                    await message.answer(
+                        f"⚠️ User `{user_id}` is not currently banned in Bot 2.",
+                        reply_markup=get_admin_menu(),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    extra = f"\n🧹 Removed duplicate ban records: {result.deleted_count - 1}" if result.deleted_count > 1 else ""
+                    log_action("✅ USER UNBANNED (BOT10)", message.from_user.id, f"Unbanned user from Bot 2: {user_id}")
+                    await message.answer(
+                        f"✅ **USER UNBANNED (BOT 2)**\n\n"
+                        f"👤 User ID: `{user_id}`\n"
+                        f"📅 Unbanned: {now_local().strftime('%B %d, %Y — %I:%M %p')}"
+                        f"{extra}\n\n"
+                        f"This user can now access Bot 2 admin panel again.",
+                        reply_markup=get_admin_menu(),
+                        parse_mode="Markdown"
+                    )
             except Exception as e:
                 await message.answer(f"❌ Error unbanning: {str(e)}", reply_markup=get_admin_menu())
         await state.clear()
@@ -10856,28 +11252,46 @@ async def process_role_selection(message: types.Message, state: FSMContext):
 
     # ── REGULAR ROLE UPDATE ──
     admin_doc = col_admins.find_one({"user_id": user_id})
-    is_locked = admin_doc.get('locked', False) if admin_doc else True
-    admin_name = admin_doc.get('name', str(user_id)) if admin_doc else str(user_id)
+    if not admin_doc:
+        await message.answer("⚠️ Admin not found. Session expired.", reply_markup=get_admin_menu())
+        await state.clear()
+        return
 
+    is_locked  = admin_doc.get('locked', False)
+    admin_name = admin_doc.get('name', str(user_id))
+    role_type  = data.get("role_type", "custom")  # "auto" or "custom"
+
+    # Build the DB update dict
+    update_dict = {"role": new_role, "updated_at": now_local()}
+    if role_type == "auto":
+        update_dict["permissions"] = _ROLE_PERMISSION_TEMPLATES.get(new_role, [])
+
+    col_admins.update_one({"user_id": user_id}, {"$set": update_dict})
+    log_action("👔 ROLE CHANGED", message.from_user.id, f"Changed {user_id} to {new_role} (mode={role_type})")
+
+    # ── If admin is LOCKED — save silently, show pending note ──
     if is_locked:
+        if role_type == "auto":
+            saved_perms = _ROLE_PERMISSION_TEMPLATES.get(new_role, [])
+            perm_str = ", ".join(_PERM_LABELS.get(p, p) for p in saved_perms) if saved_perms else "None"
+            perm_note = f"\n🔑 Permissions saved: {perm_str}"
+        else:
+            perm_note = "\n🔑 Permissions: unchanged (custom mode)"
+
         await message.answer(
-            f"🚫 **ACTION BLOCKED**\n\n"
-            f"👤 Admin: {admin_name} (`{user_id}`)\n\n"
-            f"This admin is currently **LOCKED**.\n"
-            f"You cannot assign a new role to a locked account.\n\n"
-            f"💡 Use **🔒 LOCK/UNLOCK USER** to unlock them first.",
+            f"📋 **ROLE SAVED (PENDING)**\n\n"
+            f"👤 Admin: {admin_name} (`{user_id}`)\n"
+            f"👔 New Role: **{new_role}** ({'AUTO' if role_type == 'auto' else 'CUSTOM'}){perm_note}\n\n"
+            f"⚠️ This admin is currently **LOCKED**.\n"
+            f"The role{'and permissions' if role_type == 'auto' else ''} will activate once unlocked.\n\n"
+            f"Use 🔒 LOCK/UNLOCK USER to activate.",
             reply_markup=get_admin_menu(),
             parse_mode="Markdown"
         )
         await state.clear()
         return
 
-    col_admins.update_one(
-        {"user_id": user_id},
-        {"$set": {"role": new_role, "updated_at": now_local()}}
-    )
-
-    log_action("👔 ROLE CHANGED", message.from_user.id, f"Changed {user_id} to {new_role}")
+    # ── Admin is UNLOCKED — apply immediately + notify ──
 
     # ── NOTIFY UNLOCKED ADMIN OF NEW ROLE ──
     _ROLE_NOTIFY = {
@@ -10944,10 +11358,21 @@ async def process_role_selection(message: types.Message, state: FSMContext):
         except Exception as e:
             log_action("⚠️ ROLE NOTIFY FAILED", user_id, str(e))
 
+    # Push updated keyboard instantly so features/buttons match new effective permissions
+    await _push_instant_user_menu_refresh(user_id, context="role/permissions updated")
+
+    mode_badge = "AUTO (permissions applied)" if role_type == "auto" else "CUSTOM (permissions unchanged)"
+    if role_type == "auto":
+        saved_perms = _ROLE_PERMISSION_TEMPLATES.get(new_role, [])
+        mode_detail = f"\n🔑 Permissions set: {', '.join(_PERM_LABELS.get(p, p) for p in saved_perms) or 'None'}"
+    else:
+        mode_detail = ""
+
     await message.answer(
         f"✅ **ROLE UPDATED**\n\n"
-        f"👤 User: `{user_id}`\n"
-        f"👔 New Role: **{new_role}**\n\n"
+        f"👤 Admin: {admin_name} (`{user_id}`)\n"
+        f"👔 New Role: **{new_role}**\n"
+        f"⚙️ Mode: {mode_badge}{mode_detail}\n\n"
         f"📨 Notification sent to admin.",
         reply_markup=get_admin_menu(),
         parse_mode="Markdown"
@@ -11246,9 +11671,25 @@ async def execute_lock_action(message: types.Message, state: FSMContext):
     
     log_action(f"{icon} ADMIN STATUS CHANGED", message.from_user.id, 
               f"Set {user_id} to {status_text}")
-              
-    # Notify user if UNLOCKED — send role notification + restore menu
-    if not new_lock:
+
+    # ── LOCKED: immediately strip menu from the target user ──
+    if new_lock:
+        try:
+            await bot.send_message(
+                user_id,
+                "🔒 **YOUR ACCOUNT HAS BEEN LOCKED**\n\n"
+                "Your access to Bot 2 has been suspended by the master admin.\n"
+                "Your menu has been removed. Contact the owner to be unlocked.\n\n"
+                "_— MSA NODE Systems_",
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode="Markdown"
+            )
+            log_action("📨 LOCK NOTIFICATION", user_id, "Sent lock notification + removed menu")
+        except Exception as e:
+            log_action("⚠️ LOCK NOTIFY FAILED", user_id, str(e))
+
+    # ── UNLOCKED: restore role notification + menu ──
+    elif not new_lock:
         admin_role = admin_doc.get('role', 'Admin')
         _ROLE_NOTIFY_LOCK = {
             "Owner": (
@@ -11355,9 +11796,9 @@ async def ban_config_handler(message: types.Message, state: FSMContext):
     await message.answer(
         "🚫 BAN/UNBAN CONFIGURATION\n\n"
         "Choose an action:\n"
-        "• 🚫 BAN ADMIN - Restrict admin access\n"
-        "• ✅ UNBAN ADMIN - Restore admin access\n"
-        "• 📋 BANNED LIST - View all banned admins",
+        "• 🚫 BAN ADMIN - Ban any user by User ID (Bot 2 scope)\n"
+        "• ✅ UNBAN ADMIN - Remove Bot 2 ban by selecting user\n"
+        "• 📋 BANNED LIST - View all Bot 2 banned users",
         reply_markup=choice_kb
     )
     await state.set_state(AdminStates.waiting_for_ban_user_id)
@@ -11373,93 +11814,132 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
             reply_markup=get_admin_menu()
         )
         return
+
+    def _get_unique_bot2_banned_user_ids() -> list[int]:
+        """Return bot2-scoped banned user IDs (deduplicated, newest first)."""
+        seen = set()
+        ordered = []
+        for d in col_banned_users.find({"scope": "bot2"}).sort("banned_at", -1):
+            uid = d.get("user_id")
+            if not isinstance(uid, int):
+                continue
+            if uid == MASTER_ADMIN_ID:
+                continue
+            if uid in seen:
+                continue
+            seen.add(uid)
+            ordered.append(uid)
+        return ordered
+
+    # BANNED LIST pagination
+    if message.text in ["⬅️ PREV PAGE", "NEXT PAGE ➡️"]:
+        data = await state.get_data()
+        banned_user_ids = data.get("bot2_banned_user_ids", [])
+        if not banned_user_ids:
+            await message.answer("⚠️ No Bot 2 banned users found.", reply_markup=get_admin_menu())
+            await state.clear()
+            return
+
+        current_page = data.get("banned_list_page", 0)
+        page = max(0, current_page - 1) if message.text == "⬅️ PREV PAGE" else current_page + 1
+
+        per_page = 10
+        total_pages = max(1, (len(banned_user_ids) + per_page - 1) // per_page)
+        page = min(page, total_pages - 1)
+        await state.update_data(banned_list_page=page)
+
+        start_idx = page * per_page
+        end_idx = min(start_idx + per_page, len(banned_user_ids))
+        page_user_ids = banned_user_ids[start_idx:end_idx]
+
+        msg = "📋 BANNED USERS LIST (BOT 2)\n\n"
+        msg += f"Total Banned: {len(banned_user_ids)}\n"
+        msg += f"Showing {start_idx + 1}-{end_idx} (Page {page + 1}/{total_pages})\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        for uid in page_user_ids:
+            ban_doc = col_banned_users.find_one(
+                {"user_id": uid, "scope": "bot2"},
+                sort=[("banned_at", -1)]
+            ) or {}
+            admin_doc = col_admins.find_one({"user_id": uid}) or {}
+            name = admin_doc.get("name", str(uid))
+            role = admin_doc.get("role", "User")
+            banned_at = ban_doc.get("banned_at")
+            banned_by = ban_doc.get("banned_by", "Unknown")
+
+            if name != str(uid):
+                msg += f"👤 {name} (`{uid}`)\n"
+            else:
+                msg += f"👤 ID: `{uid}`\n"
+            msg += f"👔 Role: {role}\n"
+            msg += f"📅 Banned: {format_datetime(banned_at)}\n"
+            msg += f"👨💼 By: {banned_by}\n"
+            msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        nav_buttons = []
+        if total_pages > 1:
+            if page > 0:
+                nav_buttons.append(KeyboardButton(text="⬅️ PREV PAGE"))
+            if page < total_pages - 1:
+                nav_buttons.append(KeyboardButton(text="NEXT PAGE ➡️"))
+
+        list_kb_buttons = []
+        if nav_buttons:
+            list_kb_buttons.append(nav_buttons)
+        list_kb_buttons.append([KeyboardButton(text="🔙 BACK")])
+
+        list_kb = ReplyKeyboardMarkup(keyboard=list_kb_buttons, resize_keyboard=True)
+        await message.answer(msg, reply_markup=list_kb, parse_mode="Markdown")
+        await state.set_state(AdminStates.waiting_for_ban_user_id)
+        return
     
     # Store choice in state
     if message.text == "🚫 BAN ADMIN":
-        await state.update_data(ban_action="ban")
-        
-        # Get UNBANNED admins only
-        all_admins = list(col_admins.find({}))
-        unbanned_admins = []
-        for admin in all_admins:
-            if admin['user_id'] == MASTER_ADMIN_ID:
-                continue  # Skip master admin
-            if not col_banned_users.find_one({"user_id": admin['user_id']}):
-                unbanned_admins.append(admin)
-        
-        if not unbanned_admins:
-            await message.answer(
-                "⚠️ No unbanned admins to ban!",
-                reply_markup=get_admin_menu()
-            )
-            await state.clear()
-            return
-        
-        # Show unbanned admins
-        page = 0
-        await state.update_data(ban_page=page, admins_list=unbanned_admins)
-        
-        per_page = 10
-        total_pages = (len(unbanned_admins) + per_page - 1) // per_page
-        start_idx = page * per_page
-        end_idx = min(start_idx + per_page, len(unbanned_admins))
-        page_admins = unbanned_admins[start_idx:end_idx]
-        
-        # Create buttons
-        admin_buttons = []
-        for admin in page_admins:
-            admin_buttons.append([KeyboardButton(text=_admin_btn(admin))])
-
-        # Navigation
-        nav_buttons = []
-        if total_pages > 1:
-            if page > 0:
-                nav_buttons.append(KeyboardButton(text="⬅️ PREV"))
-            if page < total_pages - 1:
-                nav_buttons.append(KeyboardButton(text="NEXT ➡️"))
-
-        if nav_buttons:
-            admin_buttons.append(nav_buttons)
-        admin_buttons.append([KeyboardButton(text="🔙 BACK")])
-
-        select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
-
-        await message.answer(
-            f"🚫 BAN ADMIN\n\n"
-            f"Select admin to BAN:\n"
-            f"Showing {start_idx + 1}-{end_idx} of {len(unbanned_admins)} unbanned admins"
-            f"{f' (Page {page + 1}/{total_pages})' if total_pages > 1 else ''}",
-            reply_markup=select_kb
+        back_kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ CANCEL")]],
+            resize_keyboard=True
         )
-        await state.set_state(AdminStates.selecting_role)  # Reuse state
+        await message.answer(
+            "🚫 **BAN USER**\n\n"
+            "Enter the **User ID** of the person you want to ban from Bot 2:\n\n"
+            "💡 This bans any user by ID.\n"
+            "  • If the user is an active admin, you must remove them from admin first.\n"
+            "  • If they are not an admin, ban will proceed after confirmation.",
+            reply_markup=back_kb,
+            parse_mode="Markdown"
+        )
+        await state.set_state(AdminStates.waiting_for_ban_config_id)
         
     elif message.text == "✅ UNBAN ADMIN":
         await state.update_data(ban_action="unban")
-        
-        # Get BANNED admins only
-        all_admins = list(col_admins.find({}))
-        banned_admins = []
-        for admin in all_admins:
-            if col_banned_users.find_one({"user_id": admin['user_id']}):
-                banned_admins.append(admin)
-        
-        if not banned_admins:
+
+        # Get unique bot2-scoped banned users (not only admins)
+        banned_user_ids = _get_unique_bot2_banned_user_ids()
+        if not banned_user_ids:
             await message.answer(
-                "⚠️ No banned admins to unban!",
+                "⚠️ No Bot 2 banned users to unban!",
                 reply_markup=get_admin_menu()
             )
             await state.clear()
             return
-        
-        # Show banned admins
+
+        # Build selection list (name from admin record when available)
+        unban_items = []
+        for uid in banned_user_ids:
+            admin_doc = col_admins.find_one({"user_id": uid})
+            name = admin_doc.get("name", str(uid)) if admin_doc else str(uid)
+            unban_items.append({"user_id": uid, "name": name})
+
+        # Show first page
         page = 0
-        await state.update_data(ban_page=page, admins_list=banned_admins)
+        await state.update_data(ban_page=page, admins_list=unban_items)
         
         per_page = 10
-        total_pages = (len(banned_admins) + per_page - 1) // per_page
+        total_pages = max(1, (len(unban_items) + per_page - 1) // per_page)
         start_idx = page * per_page
-        end_idx = min(start_idx + per_page, len(banned_admins))
-        page_admins = banned_admins[start_idx:end_idx]
+        end_idx = min(start_idx + per_page, len(unban_items))
+        page_admins = unban_items[start_idx:end_idx]
         
         # Create buttons
         admin_buttons = []
@@ -11481,28 +11961,21 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
         select_kb = ReplyKeyboardMarkup(keyboard=admin_buttons, resize_keyboard=True)
 
         await message.answer(
-            f"✅ UNBAN ADMIN\n\n"
-            f"Select admin to UNBAN:\n"
-            f"Showing {start_idx + 1}-{end_idx} of {len(banned_admins)} banned admins"
+            f"✅ UNBAN USER\n\n"
+            f"Select user to UNBAN from Bot 2:\n"
+            f"Showing {start_idx + 1}-{end_idx} of {len(unban_items)} banned users"
             f"{f' (Page {page + 1}/{total_pages})' if total_pages > 1 else ''}",
             reply_markup=select_kb
         )
         await state.set_state(AdminStates.selecting_role)  # Reuse state
     
     elif message.text == "📋 BANNED LIST":
-        # Show list of all banned admins with pagination
-        all_admins = list(col_admins.find({}))
-        banned_admins = []
-        
-        for admin in all_admins:
-            if col_banned_users.find_one({"user_id": admin['user_id']}):
-                ban_doc = col_banned_users.find_one({"user_id": admin['user_id']})
-                admin['ban_info'] = ban_doc
-                banned_admins.append(admin)
-        
-        if not banned_admins:
+        # Show list of bot2-scoped banned users (deduplicated)
+        banned_user_ids = _get_unique_bot2_banned_user_ids()
+
+        if not banned_user_ids:
             await message.answer(
-                "✅ No banned admins found!",
+                "✅ No Bot 2 banned users found!",
                 reply_markup=get_admin_menu()
             )
             await state.clear()
@@ -11510,28 +11983,35 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
         
         # Pagination: 10 per page
         page = 0
-        await state.update_data(banned_list_page=page)
+        await state.update_data(banned_list_page=page, bot2_banned_user_ids=banned_user_ids)
         
         per_page = 10
-        total_pages = (len(banned_admins) + per_page - 1) // per_page
+        total_pages = max(1, (len(banned_user_ids) + per_page - 1) // per_page)
         start_idx = page * per_page
-        end_idx = min(start_idx + per_page, len(banned_admins))
-        page_admins = banned_admins[start_idx:end_idx]
+        end_idx = min(start_idx + per_page, len(banned_user_ids))
+        page_user_ids = banned_user_ids[start_idx:end_idx]
         
         # Build message
-        msg = f"📋 BANNED ADMINS LIST\n\n"
-        msg += f"Total Banned: {len(banned_admins)}\n"
-        msg += f"Showing {start_idx + 1}-{end_idx}\n"
+        msg = f"📋 BANNED USERS LIST (BOT 2)\n\n"
+        msg += f"Total Banned: {len(banned_user_ids)}\n"
+        msg += f"Showing {start_idx + 1}-{end_idx} (Page {page + 1}/{total_pages})\n"
         msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
-        for admin in page_admins:
-            user_id = admin['user_id']
-            role = admin.get('role', 'Admin')
-            ban_info = admin.get('ban_info', {})
-            banned_at = ban_info.get('banned_at')
-            banned_by = ban_info.get('banned_by', 'Unknown')
-            
-            msg += f"👤 ID: {user_id}\n"
+        for user_id in page_user_ids:
+            ban_doc = col_banned_users.find_one(
+                {"user_id": user_id, "scope": "bot2"},
+                sort=[("banned_at", -1)]
+            ) or {}
+            admin_doc = col_admins.find_one({"user_id": user_id}) or {}
+            name = admin_doc.get("name", str(user_id))
+            role = admin_doc.get("role", "User")
+            banned_at = ban_doc.get("banned_at")
+            banned_by = ban_doc.get("banned_by", "Unknown")
+
+            if name != str(user_id):
+                msg += f"👤 {name} (`{user_id}`)\n"
+            else:
+                msg += f"👤 ID: `{user_id}`\n"
             msg += f"👔 Role: {role}\n"
             msg += f"📅 Banned: {format_datetime(banned_at)}\n"
             msg += f"👨💼 By: {banned_by}\n"
@@ -11552,11 +12032,144 @@ async def process_ban_choice(message: types.Message, state: FSMContext):
         
         list_kb = ReplyKeyboardMarkup(keyboard=list_kb_buttons, resize_keyboard=True)
         
-        await message.answer(msg, reply_markup=list_kb)
+        await message.answer(msg, reply_markup=list_kb, parse_mode="Markdown")
         await state.set_state(AdminStates.waiting_for_ban_user_id)  # Keep in ban flow for pagination
     
     else:
         await message.answer("⚠️ Please select from the buttons.")
+
+
+@dp.message(AdminStates.waiting_for_ban_config_id)
+async def process_ban_config_id(message: types.Message, state: FSMContext):
+    """Accept a user ID for ban-config ban, validate, and ask for confirmation."""
+    if message.text in ["❌ CANCEL", "⬅️ BACK", "🔙 BACK", "/cancel"]:
+        await state.clear()
+        await message.answer("✅ Cancelled.", reply_markup=get_admin_menu())
+        return
+
+    text = (message.text or "").strip()
+    try:
+        user_id = int(text)
+    except ValueError:
+        await message.answer(
+            "⚠️ Invalid input. Please enter a numeric **User ID** only.\n\nExample: `987654321`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Master admin cannot be banned
+    if user_id == MASTER_ADMIN_ID:
+        await message.answer(
+            "⛔ The master admin (MSA) cannot be banned.",
+            reply_markup=get_admin_menu()
+        )
+        await state.clear()
+        return
+
+    # Already banned in Bot 2 scope?
+    existing_ban = col_banned_users.find_one({"user_id": user_id, "scope": "bot2"})
+    if existing_ban:
+        banned_at = existing_ban.get("banned_at")
+        banned_at_str = banned_at.strftime("%b %d, %Y at %I:%M %p") if banned_at else "Unknown"
+        await message.answer(
+            f"⚠️ **ALREADY BANNED**\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"📅 Banned since: {banned_at_str}\n\n"
+            f"This user is already banned.",
+            reply_markup=get_admin_menu(),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        return
+
+    # Is this user an active admin?
+    admin_doc = col_admins.find_one({"user_id": user_id})
+    if admin_doc:
+        admin_role = admin_doc.get("role", "Admin")
+        admin_locked = admin_doc.get("locked", False)
+        await message.answer(
+            f"⚠️ **CANNOT BAN — USER IS AN ACTIVE ADMIN**\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"👔 Role: **{admin_role}**\n"
+            f"{'🔒' if admin_locked else '🔓'} Status: **{'Locked' if admin_locked else 'Unlocked'}**\n\n"
+            f"❌ You must remove this user from admin first.\n\n"
+            f"💡 Steps:\n"
+            f"  1️⃣ Go to **👥 ADMINS → ➖ REMOVE ADMIN**\n"
+            f"  2️⃣ Remove user `{user_id}`\n"
+            f"  3️⃣ Then return here to ban them",
+            reply_markup=get_admin_menu(),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        return
+
+    # Not an admin, not banned — ask for confirmation
+    await state.update_data(ban_config_user_id=user_id)
+    await state.set_state(AdminStates.waiting_for_ban_config_confirm)
+
+    confirm_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ CONFIRM BAN"), KeyboardButton(text="❌ CANCEL")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer(
+        f"🚫 **CONFIRM BAN**\n\n"
+        f"👤 User ID: `{user_id}`\n\n"
+        f"⚠️ This will ban the user from Bot 2 admin panel access.\n\n"
+        f"Type **✅ CONFIRM BAN** to proceed or **❌ CANCEL** to abort.",
+        reply_markup=confirm_kb,
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(AdminStates.waiting_for_ban_config_confirm)
+async def process_ban_config_confirm(message: types.Message, state: FSMContext):
+    """Perform the ban after confirmation."""
+    if message.text in ["❌ CANCEL", "⬅️ BACK", "🔙 BACK", "/cancel"]:
+        await state.clear()
+        await message.answer("✅ Ban cancelled.", reply_markup=get_admin_menu())
+        return
+
+    if message.text != "✅ CONFIRM BAN":
+        await message.answer("⚠️ Please click **✅ CONFIRM BAN** or **❌ CANCEL**.", parse_mode="Markdown")
+        return
+
+    data = await state.get_data()
+    user_id = data.get("ban_config_user_id")
+
+    # Double-check not already banned in Bot 2 scope (race guard)
+    if col_banned_users.find_one({"user_id": user_id, "scope": "bot2"}):
+        await message.answer("⚠️ This user is already banned in Bot 2.", reply_markup=get_admin_menu())
+        await state.clear()
+        return
+
+    try:
+        col_banned_users.update_one(
+            {"user_id": user_id, "scope": "bot2"},
+            {"$set": {
+                "user_id": user_id,
+                "banned_by": message.from_user.id,
+                "banned_at": now_local(),
+                "reason": "Banned via Ban Config by admin",
+                "status": "banned",
+                "scope": "bot2"
+            }},
+            upsert=True
+        )
+        log_action("🚫 USER BANNED (BAN CONFIG)", message.from_user.id, f"Banned user from Bot 2: {user_id}")
+        await message.answer(
+            f"✅ **USER BANNED**\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"📅 Banned: {now_local().strftime('%b %d, %Y at %I:%M %p')}\n\n"
+            f"This user can no longer access Bot 2 admin panel.\n"
+            f"Their Bot 1 access is **NOT affected**.",
+            reply_markup=get_admin_menu(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Error banning: {str(e)}", reply_markup=get_admin_menu())
+    await state.clear()
 
 
 @dp.message(F.text == "📋 LIST ADMINS")
@@ -13387,29 +14000,28 @@ async def state_auto_save_loop():
 # ==========================================
 
 async def cleanup_resolved_tickets_loop():
-    """Automatically deletes tickets that have been resolved for over 7 days to keep DB lean"""
-    print("🧹 [CLEANUP] Scheduled Ticket Auto-Cleanup started")
+    """Legacy loop kept for compatibility.
+    Ticket records are permanent by policy, so this loop only reports old resolved tickets.
+    """
+    print("🧹 [CLEANUP] Legacy ticket cleaner running in observe-only mode (no deletions)")
     while True:
         try:
-            # Run cleanup check every 24 hours
-            seven_days_ago = now_local() - datetime.timedelta(days=7)
-            
-            result = col_support_tickets.delete_many({
+            seven_days_ago = now_local() - timedelta(days=7)
+            old_resolved = col_support_tickets.count_documents({
                 "status": "resolved",
                 "resolved_at": {"$lt": seven_days_ago}
             })
-            
-            if result.deleted_count > 0:
-                print(f"🧹 [CLEANUP] Automatically deleted {result.deleted_count} old resolved tickets.")
-                
-            # Sleep exactly 24 hours
+
+            if old_resolved > 0:
+                print(f"ℹ️ [CLEANUP] {old_resolved} resolved tickets are older than 7 days (kept permanently).")
+
             await asyncio.sleep(86400)
-            
+
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"⚠️ [CLEANUP ERROR] Failed to clean tickets: {e}")
-            await asyncio.sleep(3600)  # Retry in 1 hour if failed
+            print(f"⚠️ [CLEANUP ERROR] Legacy ticket observer failed: {e}")
+            await asyncio.sleep(3600)
 
 # ==========================================
 # DAILY REPORT SYSTEM (8:40 AM & 8:40 PM)
