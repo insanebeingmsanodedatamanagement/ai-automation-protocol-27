@@ -11,6 +11,7 @@ import time
 import traceback
 import sys
 from datetime import datetime, timedelta
+from pymongo.errors import DuplicateKeyError
 
 # Fix Windows console encoding for emojis (prevents UnicodeEncodeError with cp1252)
 if sys.platform == 'win32':
@@ -28,6 +29,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
 
 
 # ==========================================
@@ -118,13 +120,25 @@ COMMAND_COOLDOWN = 2.0  # seconds between commands (prevents Telegram FloodWait)
 # 🧊 PROGRESSIVE AUTO-FREEZE SYSTEM
 # ==========================================
 # Freeze durations per offense level (seconds)
-_FREEZE_LEVELS  = [30, 90, 300, 900]   # 30s → 1m30s → 5m → 15m
+_FREEZE_LEVELS  = [60, 60, 60, 60]   # Fixed 60s anti-flood cooldown on trigger
 _FREEZE_WINDOW  = 4.0   # sliding window (seconds) — lenient for slow internet
 _FREEZE_TRIGGER = 5     # rapid taps within window needed to trip first freeze
 _FREEZE_DECAY   = 600   # seconds of clean behavior before offense count resets
 
 # Per-user state: {user_id: {offense, frozen_until, taps, window_start}}
 _freeze_tracker: dict[int, dict] = {}
+_freeze_notice_tracker: dict[int, float] = {}  # throttle freeze notice spam per user
+
+# Support security hardening: progressive warnings + temporary lock for repeated abuse
+_SUPPORT_SECURITY_WINDOW_SECS = 24 * 3600
+_SUPPORT_SECURITY_MAX_WARNINGS = 3
+_SUPPORT_SECURITY_LOCK_SECS = 6 * 3600
+_support_security_tracker: dict[int, dict] = {}
+
+# Cooldown live-refresh hardening (prevents Telegram flood during heavy traffic)
+_COOLDOWN_REFRESH_INTERVAL_SECS = 5
+_COOLDOWN_REFRESH_MAX_SECS = 30
+_ticket_cooldown_live_tasks: dict[int, asyncio.Task] = {}
 
 # ==========================================
 # 🛠 SYSTEM SETUP
@@ -260,7 +274,7 @@ try:
         col_bot8_backups.create_index([("backup_date", -1)])
         col_bot8_backups.create_index([("backup_type", 1)])
         col_broadcasts.create_index([("index", -1)])
-        col_broadcasts.create_index("broadcast_id")
+        col_broadcasts.create_index("broadcast_id", unique=True)
         # ── Unique dedup index: prevents duplicate click-tracking rows even under concurrent load
         db["bot3_user_activity"].create_index(
             [("user_id", 1), ("item_id", 1), ("click_type", 1)],
@@ -292,6 +306,18 @@ try:
         logger.info("✅ Unique partial index: one open ticket per user enforced")
     except Exception as uniq_err:
         logger.warning(f"⚠️ Partial unique index warning (may already exist): {uniq_err}")
+
+    # ── Backup dedup index: one backup summary per bot/window key ───────────
+    try:
+        col_bot8_backups.create_index(
+            [("bot", 1), ("window_key", 1)],
+            unique=True,
+            sparse=True,
+            name="unique_bot_window_key"
+        )
+        logger.info("✅ Backup dedup index active: unique (bot, window_key)")
+    except Exception as bidx_err:
+        logger.warning(f"⚠️ Backup dedup index warning: {bidx_err}")
 
 except Exception as e:
     logger.error(f"❌ MongoDB connection failed: {e}")
@@ -764,6 +790,112 @@ def is_spam_or_gibberish(text: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 TICKET_COOLDOWN_HOURS = 24# User must wait 24 hours between ticket submissions
 
+def _format_hms(total_seconds: int) -> str:
+    """Format seconds as Hh Mm Ss for premium cooldown/readability messages."""
+    total_seconds = max(0, int(total_seconds))
+    h = total_seconds // 3600
+    m = (total_seconds % 3600) // 60
+    s = total_seconds % 60
+    return f"{h}h {m}m {s}s"
+
+def _build_remaining_bar(remaining_seconds: int, total_seconds: int, width: int = 20) -> tuple[str, float]:
+    """Build a decreasing progress bar based on remaining time."""
+    if total_seconds <= 0:
+        return ("▱" * width, 0.0)
+    ratio = max(0.0, min(1.0, remaining_seconds / total_seconds))
+    filled = int(round(ratio * width))
+    filled = max(0, min(width, filled))
+    return ("▰" * filled + "▱" * (width - filled), ratio * 100)
+
+def _get_support_lock_remaining(user_id: int) -> int:
+    """Return active support lock remaining seconds, else 0."""
+    state = _support_security_tracker.get(user_id)
+    if not state:
+        return 0
+    lock_until = int(state.get("lock_until", 0))
+    now_ts = int(time.time())
+    return max(0, lock_until - now_ts)
+
+def _register_support_violation(user_id: int) -> tuple[int, int, bool]:
+    """Register a support abuse violation.
+    Returns: (warning_count, lock_remaining_seconds, lock_triggered_now)
+    """
+    now_ts = int(time.time())
+    state = _support_security_tracker.get(user_id, {
+        "window_start": now_ts,
+        "warnings": 0,
+        "lock_until": 0,
+    })
+
+    # Reset rolling window
+    if now_ts - int(state.get("window_start", now_ts)) > _SUPPORT_SECURITY_WINDOW_SECS:
+        state["window_start"] = now_ts
+        state["warnings"] = 0
+
+    # If already locked, keep lock state stable
+    active_lock = max(0, int(state.get("lock_until", 0)) - now_ts)
+    if active_lock > 0:
+        _support_security_tracker[user_id] = state
+        return (int(state.get("warnings", 0)), active_lock, False)
+
+    # Increment warning count
+    warnings = int(state.get("warnings", 0)) + 1
+    state["warnings"] = warnings
+    lock_triggered = False
+
+    if warnings >= _SUPPORT_SECURITY_MAX_WARNINGS:
+        state["lock_until"] = now_ts + _SUPPORT_SECURITY_LOCK_SECS
+        state["warnings"] = 0
+        lock_triggered = True
+
+    _support_security_tracker[user_id] = state
+    lock_remaining = max(0, int(state.get("lock_until", 0)) - now_ts)
+    return (warnings, lock_remaining, lock_triggered)
+
+def _build_support_security_notice(user_name: str, reason: str, warning_count: int, lock_remaining: int = 0) -> str:
+    """Premium security warning/lock notice for support abuse detection."""
+    if lock_remaining > 0:
+        bar, pct = _build_remaining_bar(lock_remaining, _SUPPORT_SECURITY_LOCK_SECS)
+        return (
+            f"🛡️ **SUPPORT SECURITY LOCK ENABLED**\n\n"
+            f"**{user_name}**, repeated unsafe/spam submissions were detected.\n\n"
+            f"**Latest reason:** {reason}\n"
+            f"⏳ **Lock remaining:** {_format_hms(lock_remaining)}\n"
+            f"📉 **Lock cooldown bar:** `{bar}` ({pct:.1f}% remaining)\n\n"
+            f"Please return with a clean, professional issue report after the lock expires."
+        )
+
+    return (
+        f"⚠️ **SECURITY WARNING ({warning_count}/{_SUPPORT_SECURITY_MAX_WARNINGS})**\n\n"
+        f"**{user_name}**, your submission violated support safety policy.\n"
+        f"**Reason:** {reason}\n\n"
+        f"Please send only relevant, professional support details.\n"
+        f"Repeated violations can temporarily lock ticket submissions."
+    )
+
+def _detect_nsfw_caption_terms(text: str) -> list[str]:
+    """Return matched NSFW terms from text/caption (for media protection)."""
+    if not text:
+        return []
+    normalized = _normalize(text)
+    nsfw_terms = {
+        "nude", "nudes", "nudity", "naked", "porn", "porno", "pornography", "xxx",
+        "sex", "sexual", "explicit", "blowjob", "handjob", "hentai", "onlyfans",
+        "boobs", "breasts", "nipples", "dick", "cock", "pussy", "cum", "sexting",
+    }
+    found = []
+    for term in nsfw_terms:
+        if _normalize(term) in normalized:
+            found.append(term)
+    # Deduplicate in insertion order
+    dedup = []
+    seen = set()
+    for term in found:
+        if term not in seen:
+            seen.add(term)
+            dedup.append(term)
+    return dedup
+
 def check_ticket_rate_limit(user_id: int, user_name: str = "You") -> tuple[bool, str]:
     """
     Returns (allowed: bool, error_msg: str).
@@ -783,19 +915,71 @@ def check_ticket_rate_limit(user_id: int, user_name: str = "You") -> tuple[bool,
         last_at = last_ticket.get("created_at")
         if last_at and last_at > cutoff:
             remaining = timedelta(hours=TICKET_COOLDOWN_HOURS) - (now - last_at)
-            hours_left = int(remaining.total_seconds() // 3600)
-            mins_left  = int((remaining.total_seconds() % 3600) // 60)
-            unlock_at  = (last_at + timedelta(hours=TICKET_COOLDOWN_HOURS)).strftime("%I:%M %p")
+            remaining_secs = max(0, int(remaining.total_seconds()))
+            unlock_dt = last_at + timedelta(hours=TICKET_COOLDOWN_HOURS)
+            unlock_at = unlock_dt.strftime("%I:%M:%S %p")
+            cooldown_total_secs = TICKET_COOLDOWN_HOURS * 3600
+            bar, pct = _build_remaining_bar(remaining_secs, cooldown_total_secs)
             return (False,
                 f"⏳ **COOLDOWN ACTIVE**\n\n"
                 f"**{user_name}**, you already submitted a support ticket recently.\n\n"
-                f"⏰ **Time remaining:** {hours_left}h {mins_left}m\n"
+                f"⏰ **Live time remaining:** {_format_hms(remaining_secs)}\n"
                 f"🔓 **Unlocks at:** {unlock_at}\n\n"
+                f"📉 **Live cooldown bar:** `{bar}` ({pct:.2f}% remaining)\n"
+                f"🕒 _Server-time based and recalculated on every submission attempt._\n\n"
                 f"_One ticket per {TICKET_COOLDOWN_HOURS} hours keeps our support queue manageable.\n"
                 f"You will be able to submit a new ticket once this period ends._"
             )
 
     return (True, "")
+
+async def _cooldown_refresh_runner(msg: types.Message, user_id: int, user_name: str, seconds: int):
+    """Background runner for cooldown live refresh with low API call rate."""
+    refresh_every = max(2, _COOLDOWN_REFRESH_INTERVAL_SECS)
+    loops = max(1, seconds // refresh_every)
+
+    for _ in range(loops):
+        await asyncio.sleep(refresh_every)
+        allowed, refreshed = check_ticket_rate_limit(user_id, user_name)
+        if allowed:
+            try:
+                await msg.edit_text(
+                    "✅ **COOLDOWN COMPLETE**\n\n"
+                    "Your support cooldown has ended.\n"
+                    "You can now submit a new ticket.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                pass
+            return
+        try:
+            await msg.edit_text(refreshed, parse_mode=ParseMode.MARKDOWN)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(max(1, int(e.retry_after)))
+        except Exception:
+            # Message may be unchanged/deleted; stop this runner quietly.
+            return
+
+
+async def _live_refresh_ticket_cooldown(msg: types.Message, user_id: int, user_name: str, seconds: int = 20):
+    """Schedule one low-frequency live cooldown refresh task per user."""
+    existing = _ticket_cooldown_live_tasks.get(user_id)
+    if existing and not existing.done():
+        return
+
+    seconds = max(_COOLDOWN_REFRESH_INTERVAL_SECS, min(seconds, _COOLDOWN_REFRESH_MAX_SECS))
+    task = asyncio.create_task(
+        _cooldown_refresh_runner(msg, user_id, user_name, seconds),
+        name=f"cooldown_live_{user_id}"
+    )
+    _ticket_cooldown_live_tasks[user_id] = task
+
+    def _cleanup(_):
+        cur = _ticket_cooldown_live_tasks.get(user_id)
+        if cur is task:
+            _ticket_cooldown_live_tasks.pop(user_id, None)
+
+    task.add_done_callback(_cleanup)
 
 def record_ticket_submission(user_id: int):
     """No-op — submission is recorded directly in the tickets collection (DB-backed)."""
@@ -1000,13 +1184,16 @@ def rate_limit(cooldown: float = COMMAND_COOLDOWN):
             user_id = message.from_user.id
             now = time.time()
             last_time = user_last_command.get(user_id, 0)
+
+            # If user is already frozen, block with throttled reminder.
+            if await _guard_flood_from_wrapper(message, "rate_limit", record_tap=False):
+                return
             
             # Check if user is within cooldown period
             time_since_last = now - last_time
             if time_since_last < cooldown:
-                remaining = cooldown - time_since_last
-                logger.warning(f"RATE LIMIT: User {user_id} too fast ({remaining:.1f}s remaining)")
-                # Silently ignore - prevents spam from triggering more messages
+                # Rejected rapid tap: feed anti-flood tracker (non-punitive, no ban)
+                await _guard_flood_from_wrapper(message, "rate_limit", record_tap=True)
                 return
             
             # Update last command time
@@ -1024,12 +1211,15 @@ def anti_spam(command_name: str):
         @functools.wraps(handler)
         async def wrapper(message: types.Message, *args, **kwargs):
             user_id = message.from_user.id
+
+            # If user is already frozen, block with throttled reminder.
+            if await _guard_flood_from_wrapper(message, "anti_spam", record_tap=False):
+                return
             
             # Check if user is already processing
             if is_user_processing(user_id):
-                current_command = user_processing.get(user_id, "unknown")
-                logger.warning(f"SPAM BLOCKED: User {user_id} tried '{command_name}' while processing '{current_command}'")
-                # Silently ignore - don't send warning message to avoid spam
+                # Rejected parallel tap: feed anti-flood tracker (non-punitive, no ban)
+                await _guard_flood_from_wrapper(message, "anti_spam", record_tap=True)
                 return
             
             # Mark as processing
@@ -1092,6 +1282,71 @@ def _record_spam_tap(user_id: int) -> tuple[bool, int]:
     return False, 0
 
 
+async def _guard_flood_from_wrapper(message: types.Message, source: str, record_tap: bool = False) -> bool:
+    """Decorator-level flood guard.
+    Returns True when the request should be blocked.
+    When record_tap=True, this rejected action is counted toward anti-flood freeze.
+    """
+    user_id = message.from_user.id
+    now = time.time()
+
+    # Already frozen: show throttled reminder
+    state = _freeze_tracker.get(user_id, {})
+    frozen_until = state.get("frozen_until", 0)
+    if now < frozen_until:
+        remaining = int(max(0, frozen_until - now))
+        last_notice = _freeze_notice_tracker.get(user_id, 0)
+        if now - last_notice >= 3:
+            _freeze_notice_tracker[user_id] = now
+            mins, secs = divmod(remaining, 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            unfreeze_dt = datetime.now(TZ) + timedelta(seconds=remaining)
+            unfreeze_str = unfreeze_dt.strftime("%I:%M:%S %p")
+            try:
+                await message.answer(
+                    f"🛡️ <b>FLOOD PROTECTION ACTIVE</b>\n\n"
+                    f"Too many rapid taps were detected.\n"
+                    f"⏳ <b>Cooldown:</b> {time_str} (until {unfreeze_str})\n\n"
+                    f"<i>Please do not spam buttons.\n"
+                    f"If your internet is lagging, wait a few seconds and try once.</i>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        return True
+
+    # Non-rejected path: no tap should be counted.
+    if not record_tap:
+        return False
+
+    # Rejected action path: record one tap and trigger fixed 60s freeze on rapid abuse
+    triggered, freeze_secs = _record_spam_tap(user_id)
+    if not triggered:
+        return True
+
+    state = _freeze_tracker.get(user_id, {})
+    offense = state.get("offense", 1)
+    logger.warning(f"🧊 FLOOD LOCK: User {user_id} frozen for {freeze_secs}s via {source} (offense #{offense})")
+    _freeze_notice_tracker[user_id] = now
+
+    mins, secs = divmod(freeze_secs, 60)
+    time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+    unfreeze_dt = datetime.now(TZ) + timedelta(seconds=freeze_secs)
+    unfreeze_str = unfreeze_dt.strftime("%I:%M:%S %p")
+    try:
+        await message.answer(
+            f"🧊 <b>ANTI-FLOOD TIMER STARTED</b>\n\n"
+            f"We detected rapid button spam and paused input for safety or pleaase check your internet connection is strong to avoid these kind of issues.\n"
+            f"⏳ <b>Cooldown:</b> {time_str} (until {unfreeze_str})\n\n"
+            f"<i>No ban was applied.\n"
+            f"Please send one action at a time to avoid Telegram policy/flood issues.</i>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    return True
+
+
 async def _check_freeze(message: types.Message) -> bool:
     """
     Call at the top of every user handler.
@@ -1144,7 +1399,7 @@ async def _check_freeze(message: types.Message) -> bool:
                 f"🧊 <b>Auto-Freeze Activated!</b>\n\n"
                 f"Too many rapid button presses detected.\n\n"
                 f"⏳ <b>Frozen for:</b> {time_str}  (until {unfreeze_str})\n"
-                f"⚠️ <b>Offense level:</b> {level_label} — each repeat increases freeze time.\n\n"
+                f"⚠️ <b>Offense level:</b> {level_label} — repeated spam will restart the timer.\n\n"
                 f"<i>All features are paused during freeze.\n"
                 f"Slow internet? No worry — 5+ taps in 4s needed to trigger. "
                 f"After 10 min of normal use the count resets completely.</i>",
@@ -1162,7 +1417,7 @@ async def _check_freeze(message: types.Message) -> bool:
                     f"User: {user_mention} (ID: <code>{user_id}</code>)\n"
                     f"Frozen for: {time_str}\n"
                     f"Total offenses: {offense}\n\n"
-                    f"<i>Not banned — progressive freeze only.</i>",
+                    f"<i>Not banned — temporary 60s anti-flood lock only.</i>",
                     parse_mode="HTML"
                 )
             except Exception:
@@ -3770,8 +4025,31 @@ async def process_search_code(message: types.Message, state: FSMContext):
             parse_mode=ParseMode.MARKDOWN
         )
         return
-    
-    code = message.text.strip()
+
+    incoming_text = (message.text or "").strip()
+    if not incoming_text:
+        await message.answer(
+            "⚠️ **INVALID INPUT**\n\nSend a valid MSA CODE or tap **❌ CANCEL**.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Allow clean escape from code-entry state when user taps menu/navigation buttons.
+    if incoming_text == "📺 WATCH TUTORIAL":
+        await state.clear()
+        await _handle_main_tutorial_request(message, state)
+        return
+
+    if incoming_text in {"❌ CANCEL", "CANCEL", "🏠 MAIN MENU", "🔙 BACK TO MENU"}:
+        await state.clear()
+        await message.answer(
+            "❌ **SEARCH CANCELLED**\n\n`Operation aborted. Returning to main menu...`",
+            reply_markup=get_user_menu(message.from_user.id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    code = incoming_text
     
     # 🎬 CYBER LOADING ANIMATION (Common for all)
     msg = await message.answer("📡 Establishing Secure Uplink...")
@@ -3998,15 +4276,15 @@ async def process_search_code(message: types.Message, state: FSMContext):
     )
     # State remains active - user can enter another code or cancel
 
-@dp.message(F.text == "📺 WATCH TUTORIAL")
-@rate_limit(3.0)
-@anti_spam("tutorial")
-async def main_tutorial_handler(message: types.Message, state: FSMContext):
-    """Handle 📺 TUTORIAL button from main menu."""
-    if await _check_freeze(message): return
-    if await check_maintenance_mode(message): return
-    user_id = message.from_user.id
 
+async def _handle_main_tutorial_request(message: types.Message, state: FSMContext):
+    """Shared tutorial flow used by both menu and state-escape routing."""
+    if await _check_freeze(message):
+        return
+    if await check_maintenance_mode(message):
+        return
+
+    user_id = message.from_user.id
     ban_doc = await check_if_banned(user_id)
     if ban_doc:
         await message.answer(
@@ -4041,7 +4319,6 @@ async def main_tutorial_handler(message: types.Message, state: FSMContext):
 
     await state.clear()
 
-    # 🎬 TUTORIAL FETCH ANIMATION
     msg = await message.answer("📡 Loading agent tutorial...")
     await asyncio.sleep(ANIM_FAST)
     steps = ["▱▱▱▱▱", "▰▱▱▱▱", "▰▰▱▱▱", "▰▰▰▱▱", "▰▰▰▰▱", "▰▰▰▰▰"]
@@ -4077,7 +4354,7 @@ async def main_tutorial_handler(message: types.Message, state: FSMContext):
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️  Watch MSA AGENT Tutorial", url=link)]
+        [InlineKeyboardButton(text="▶️ WATCH MSA NODE AGENT TUTORIAL", url=link)]
     ])
     await message.answer(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -4099,6 +4376,13 @@ async def main_tutorial_handler(message: types.Message, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN
     )
     logger.info(f"User {user_id} accessed TUTORIAL from main menu")
+
+@dp.message(F.text == "📺 WATCH TUTORIAL")
+@rate_limit(3.0)
+@anti_spam("tutorial")
+async def main_tutorial_handler(message: types.Message, state: FSMContext):
+    """Handle 📺 TUTORIAL button from main menu."""
+    await _handle_main_tutorial_request(message, state)
 
 # ──────────────────────────────────────────────────────────────
 # 📜 RULES SYSTEM — paginated member rules (3 pages)
@@ -5361,8 +5645,15 @@ async def raise_ticket_handler(message: types.Message, state: FSMContext):
         )
         logger.info(f"User {user_id} tried to submit ticket while one is open")
         return
-    
+
+    # Cooldown gate — one ticket every 24h, with live auto-refresh preview
     first_name = message.from_user.first_name or "Member"
+    rate_ok, rate_msg = check_ticket_rate_limit(user_id, first_name)
+    if not rate_ok:
+        cooldown_msg = await message.answer(rate_msg, parse_mode=ParseMode.MARKDOWN)
+        await _live_refresh_ticket_cooldown(cooldown_msg, user_id, first_name, seconds=20)
+        return
+
     
     # 🎬 TICKET PREPARATION ANIMATION
     msg = await message.answer("🎫 Preparing ticket form...")
@@ -5424,6 +5715,36 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     # Get user info for personalization
     user_id = message.from_user.id
     user_name = message.from_user.first_name or "Member"
+
+    # Concurrency guard: if a ticket is already open, block immediately
+    open_ticket = col_support_tickets.find_one({"user_id": user_id, "status": "open"})
+    if open_ticket:
+        created_at = open_ticket.get("created_at", now_local())
+        created_text = created_at.strftime("%B %d, %Y at %I:%M %p") if hasattr(created_at, "strftime") else str(created_at)
+        await state.clear()
+        await message.answer(
+            f"🔒 **ACTIVE TICKET ALREADY OPEN**\n\n"
+            f"{user_name}, you already have an active support ticket.\n"
+            f"📅 Submitted: {created_text}\n\n"
+            f"Please wait for admin response before opening another ticket.",
+            reply_markup=get_support_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Security lock gate (triggered by repeated abusive submissions)
+    lock_remaining = _get_support_lock_remaining(user_id)
+    if lock_remaining > 0:
+        await message.answer(
+            _build_support_security_notice(
+                user_name,
+                "Temporary lock due to repeated unsafe/spam submissions",
+                warning_count=0,
+                lock_remaining=lock_remaining,
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
     
     # Determine content type and extract text
     has_photo  = message.photo is not None
@@ -5455,6 +5776,7 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
 
     # ── Reject unsupported media types ───────────────────────────────────────
     if has_unsupported:
+        warn_count, lock_remaining, _ = _register_support_violation(user_id)
         await message.answer(
             f"⚠️  **UNSUPPORTED FILE TYPE**\n\n"
             f"**{user_name}**, only the following are accepted in a ticket:\n\n"
@@ -5465,10 +5787,20 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
             f"_Please resend using a supported format, or tap_ **❌ CANCEL** _to exit._",
             parse_mode=ParseMode.MARKDOWN
         )
+        await message.answer(
+            _build_support_security_notice(
+                user_name,
+                "Unsupported media submitted (documents/voice/GIF/stickers/audio)",
+                warning_count=warn_count,
+                lock_remaining=lock_remaining,
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     # ── Reject album / media group — only exactly 1 photo or 1 video per ticket ─
     if message.media_group_id:
+        warn_count, lock_remaining, _ = _register_support_violation(user_id)
         await message.answer(
             f"⚠️  **ALBUM NOT ALLOWED**\n\n"
             f"**{user_name}**, you sent multiple files (an album).\n\n"
@@ -5479,17 +5811,59 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
             f"_Please resend with a single image or video. Tap_ **❌ CANCEL** _to exit._",
             parse_mode=ParseMode.MARKDOWN
         )
+        await message.answer(
+            _build_support_security_notice(
+                user_name,
+                "Multiple media files/album submitted (only one attachment allowed)",
+                warning_count=warn_count,
+                lock_remaining=lock_remaining,
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     # ── Reject combined photo + video (one media per ticket only) ────────────
     if has_photo and has_video:
+        warn_count, lock_remaining, _ = _register_support_violation(user_id)
         await message.answer(
             f"⚠️  **ONE MEDIA FILE ONLY**\n\n"
             f"**{user_name}**, please send either a **photo** or a **video** — not both at once.\n\n"
             f"_Resend with a single attachment. Tap_ **❌ CANCEL** _to exit._",
             parse_mode=ParseMode.MARKDOWN
         )
+        await message.answer(
+            _build_support_security_notice(
+                user_name,
+                "Multiple media types submitted in one ticket",
+                warning_count=warn_count,
+                lock_remaining=lock_remaining,
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
+
+    # ── NSFW / explicit indicator check for media captions ───────────────────
+    if (has_photo or has_video) and issue_text:
+        nsfw_hits = _detect_nsfw_caption_terms(issue_text)
+        if nsfw_hits:
+            warn_count, lock_remaining, _ = _register_support_violation(user_id)
+            await message.answer(
+                f"🚫 **SENSITIVE MEDIA BLOCKED**\n\n"
+                f"**{user_name}**, your media caption appears to contain adult/explicit terms.\n"
+                f"This support channel does not allow nude/sexual content.\n\n"
+                f"Please resend with a professional issue description only.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await message.answer(
+                _build_support_security_notice(
+                    user_name,
+                    "Potential NSFW/adult media context detected",
+                    warning_count=warn_count,
+                    lock_remaining=lock_remaining,
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
 
     # ── Video-specific restrictions ───────────────────────────────────────────
     if has_video:
@@ -5552,12 +5926,25 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     is_valid, error_msg = validate_ticket_content(issue_text, user_name)
     if not is_valid:
         await message.answer(error_msg, parse_mode=ParseMode.MARKDOWN)
+        if "INAPPROPRIATE CONTENT DETECTED" in error_msg or "MESSAGE REJECTED" in error_msg:
+            warn_count, lock_remaining, _ = _register_support_violation(user_id)
+            reason = "Offensive, vulnerable, or spam-like text detected"
+            await message.answer(
+                _build_support_security_notice(
+                    user_name,
+                    reason,
+                    warning_count=warn_count,
+                    lock_remaining=lock_remaining,
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
 
     # Rate limit check — prevent ticket flooding
     rate_ok, rate_msg = check_ticket_rate_limit(user_id, user_name)
     if not rate_ok:
-        await message.answer(rate_msg, parse_mode=ParseMode.MARKDOWN)
+        cooldown_msg = await message.answer(rate_msg, parse_mode=ParseMode.MARKDOWN)
+        await _live_refresh_ticket_cooldown(cooldown_msg, user_id, user_name, seconds=20)
         return
 
     # Duplicate content check — reject same issue_text within 7 days
@@ -5732,8 +6119,21 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
         "channel_message_id": channel_message_id,  # Store for editing later
         "support_count": support_count  # Track ticket number for this user
     }
-    col_support_tickets.insert_one(ticket_record)
-    logger.info(f"Ticket record created for user {user_id} in database (Support #{support_count})")
+    try:
+        col_support_tickets.insert_one(ticket_record)
+        logger.info(f"Ticket record created for user {user_id} in database (Support #{support_count})")
+    except DuplicateKeyError:
+        # Race-safe handling when another concurrent request already opened one ticket
+        logger.warning(f"Duplicate open ticket blocked for user {user_id} (race condition handled)")
+        await state.clear()
+        await message.answer(
+            "⚠️ **REQUEST ALREADY IN QUEUE**\n\n"
+            "A support ticket is already open for your account.\n"
+            "Please wait for admin response before submitting again.",
+            reply_markup=get_support_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
 
     # Record submission for rate limiting
     record_ticket_submission(user_id)
@@ -7159,7 +7559,13 @@ async def auto_backup_bot8():
                 "processing_time": processing_time,
             }
 
-            col_bot8_backups.insert_one(backup_summary)
+            upsert_res = col_bot8_backups.update_one(
+                {"bot": "bot8", "window_key": window_key},
+                {"$setOnInsert": backup_summary},
+                upsert=True,
+            )
+            if upsert_res.upserted_id is None:
+                logger.info(f"⚠️ Bot1 backup dedup hit — summary already exists for window {window_key}")
 
             # ── Save full restorable snapshot (single always-replaced doc) ──────────
             # Full data in col_bot8_restore_data; backup history in col_bot8_backups (counts only)
