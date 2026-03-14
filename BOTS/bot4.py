@@ -201,6 +201,7 @@ _register_unicode_font()
 # ⚡ CONFIGURATION (LOAD FROM DB)
 # ==========================================
 MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "MSANodeDB")
 
 # ==========================================
 # 🌐 RENDER / WEBHOOK CONFIG
@@ -260,7 +261,10 @@ def update_env_file(key, value):
 def load_secrets_from_env():
     """Load BOT_TOKEN and OWNER_ID directly from bot4.env (no MongoDB)."""
     token = os.getenv("BOT_4_TOKEN") or os.getenv("BOT_TOKEN")
-    owner = int(os.getenv("OWNER_ID", "0"))
+    owner_raw = (os.getenv("OWNER_ID", "0") or "0").strip()
+    owner = int(owner_raw) if owner_raw.isdigit() else 0
+    if owner == 0:
+        print("⚠️ OWNER_ID is missing or not numeric. Set OWNER_ID in Render env vars.")
     if token:
         print("✅ Secrets loaded from bot4.env")
     else:
@@ -335,7 +339,7 @@ def connect_db():
             retryWrites=True,
             retryReads=True
         )
-        db = db_client["MSANodeDB"]
+        db = db_client[MONGO_DB_NAME]
         col_pdfs = db["pdf_library"]
         col_trash = db["recycle_bin"]
         col_locked = db["locked_content"] # NEW: Locked Content
@@ -1664,7 +1668,7 @@ async def storage_info(message: types.Message):
         except: active_admins = locked_admins = 0
         # Latest backup
         try:
-            _db = db_client["MSANodeDB"]
+            _db = db_client[MONGO_DB_NAME]
             last_bup  = _db["bot4_monthly_backups"].find_one({}, sort=[("date", -1)])
             bup_month = last_bup["month"] if last_bup else "None"
             bup_count = _db["bot4_monthly_backups"].count_documents({})
@@ -1798,7 +1802,7 @@ async def handle_backup_json(message: types.Message):
 
         # Save dedup-safe metadata record
         try:
-            db = db_client["MSANodeDB"]
+            db = db_client[MONGO_DB_NAME]
             db["bot4_backups"].update_one(
                 {"date": date_label, "type": "json_dump"},
                 {"$set": {
@@ -2157,7 +2161,7 @@ async def backup_history_btn(message: types.Message):
     if not is_admin(message.from_user.id): return
     wait_msg = await message.answer("⏳ <b>Fetching Backup Records...</b>", parse_mode="HTML")
     try:
-        _db = db_client["MSANodeDB"]
+        _db = db_client[MONGO_DB_NAME]
         monthly = list(_db["bot4_monthly_backups"].find({}, {"_id": 0}).sort("date", -1).limit(12))
         manual  = list(_db["bot4_backups"].find({}, {"_id": 0}).sort("created_at", -1).limit(10))
         lines = [
@@ -2268,7 +2272,7 @@ async def backup_reset_step2(message: types.Message, state: FSMContext):
 
     status = await message.answer("🧨 <b>Resetting backup records...</b>", parse_mode="HTML")
     try:
-        _db = db_client["MSANodeDB"]
+        _db = db_client[MONGO_DB_NAME]
 
         manual_deleted = _db["bot4_backups"].delete_many({}).deleted_count
         monthly_deleted = _db["bot4_monthly_backups"].delete_many({}).deleted_count
@@ -2313,7 +2317,7 @@ async def weekly_backup():
                 admin_count = col_admins.count_documents({}) if col_admins is not None else 0
 
                 try:
-                    db = db_client["MSANodeDB"]
+                    db = db_client[MONGO_DB_NAME]
                     db["bot4_backups"].update_one(
                         {"date": date_label, "type": "weekly"},
                         {"$set": {
@@ -4625,7 +4629,7 @@ async def perform_bot4_diagnosis(message: types.Message):
         _adm_locked = col_admins.count_documents({"locked": True})  if col_admins else 0
     except: _adm_active = _adm_locked = 0
     try:
-        _dbb = db_client["MSANodeDB"]
+        _dbb = db_client[MONGO_DB_NAME]
         _lb  = _dbb["bot4_monthly_backups"].find_one({}, sort=[("date", -1)])
         _lb_str = _lb["month"] if _lb else "Never"
     except: _lb_str = "?"
@@ -5246,7 +5250,7 @@ async def owner_pw_confirm(message: types.Message, state: FSMContext):
     # Load effective password (DB overrides env)
     effective_pw = OWNER_TRANSFER_PW
     try:
-        db = db_client["MSANodeDB"]
+        db = db_client[MONGO_DB_NAME]
         sec = db["bot_secrets"].find_one({"bot": "bot4"})
         if sec and sec.get("OWNER_TRANSFER_PW"):
             effective_pw = sec["OWNER_TRANSFER_PW"]
@@ -5261,7 +5265,7 @@ async def owner_pw_confirm(message: types.Message, state: FSMContext):
     old_owner = OWNER_ID
     OWNER_ID = target_id
     try:
-        db = db_client["MSANodeDB"]
+        db = db_client[MONGO_DB_NAME]
         db["bot_secrets"].update_one(
             {"bot": "bot4"}, {"$set": {"OWNER_ID": str(target_id)}}, upsert=False
         )
@@ -6102,7 +6106,7 @@ async def monthly_backup():
         fire_now = now_local()
         month_key = fire_now.strftime("%Y-%m")
         try:
-            db = db_client["MSANodeDB"]
+            db = db_client[MONGO_DB_NAME]
             existing = db["bot4_monthly_backups"].find_one({"month_key": month_key})
             if existing:
                 print(f"📅 Monthly Backup for {month_key} already exists — skipping.")
@@ -6155,7 +6159,7 @@ async def monthly_backup():
 
             # Store summary record in MongoDB (dedup guard)
             try:
-                db = db_client["MSANodeDB"]
+                db = db_client[MONGO_DB_NAME]
                 db["bot4_monthly_backups"].update_one(
                     {"month_key": month_key},
                     {"$set": {
