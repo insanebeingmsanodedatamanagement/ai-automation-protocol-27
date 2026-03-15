@@ -47,6 +47,14 @@ del _noisy
 # This ensures broadcasts appear to come from Bot 1
 # ==============================================
 
+# ── Unified weekly backup system ──
+try:
+    from backup_schedulers import weekly_backup_scheduler, monthly_export_scheduler
+except ImportError:
+    print("⚠️ backup_schedulers module not found — weekly backups disabled")
+    weekly_backup_scheduler = None
+    monthly_export_scheduler = None
+
 # Helper function for retry logic with exponential backoff
 async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_name="operation"):
     """Retry an async operation with exponential backoff for network errors"""
@@ -71,6 +79,7 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     
     # If we get here, all retries failed
     raise last_exception
+
 
 BOT_TOKEN = os.getenv("BOT_10_TOKEN")
 BOT_8_TOKEN = os.getenv("BOT_8_TOKEN")  # Bot 1 for delivery
@@ -14342,12 +14351,6 @@ async def main():
         cleanup_task = asyncio.create_task(schedule_daily_cleanup())
         print("🧹 Daily cleanup scheduler started (runs at 3:00 AM)")
 
-        monthly_backup_task = asyncio.create_task(schedule_monthly_backup())
-        print("💾 12h auto-backup scheduler started (Bot 2 → bot10_backups | every 12h AM & PM)")
-
-        monthly_json_task = asyncio.create_task(monthly_json_delivery_bot2())
-        print("📦 Monthly JSON backup started (1st of every month, 09:30 AM → all collections via Telegram)")
-
         daily_report_task = asyncio.create_task(schedule_daily_reports())
         print("📊 Daily report scheduler started (8:40 AM & 8:40 PM)")
 
@@ -14356,6 +14359,37 @@ async def main():
 
         state_save_task = asyncio.create_task(state_auto_save_loop())
         print("💾 State auto-save started (every 5 minutes)")
+
+        # ── NEW: Unified weekly backup (stores in DB, no delivery) ──
+        if weekly_backup_scheduler:
+            asyncio.create_task(
+                weekly_backup_scheduler(
+                    bot_instance=bot,
+                    bot_name="bot2",
+                    owner_id=OWNER_ID,
+                    mongo_uri=MONGO_URI,
+                    db_name=MONGO_DB_NAME
+                ),
+                name="weekly_backup_bot2"
+            )
+            print("💾 Weekly backup scheduler started (every Sunday 11:59 PM → stores in MongoDB)")
+
+        # ── NEW: Month-end auto-export (sends ZIP to owner) ──
+        if monthly_export_scheduler:
+            asyncio.create_task(
+                monthly_export_scheduler(
+                    bot_instance=bot,
+                    bot_name="bot2",
+                    owner_id=OWNER_ID,
+                    mongo_uri=MONGO_URI,
+                    db_name=MONGO_DB_NAME
+                ),
+                name="monthly_export_bot2"
+            )
+            print("📦 Month-end auto-export started (last day of month 11:59 PM → ZIP to owner)")
+
+        # ⚠️ DEPRECATED: Old 12h backups (schedule_monthly_backup, monthly_json_delivery_bot2) are disabled
+        # They are replaced by the unified weekly+monthly-end system above
 
         # ── 5. Notify owner of successful startup ──
         try:
