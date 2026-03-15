@@ -45,6 +45,7 @@ else:
 
 ACTIVE_ENV_FILE = next((p for p in ENV_FILE_CANDIDATES if os.path.exists(p)), "BOT9.env")
 
+
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -66,6 +67,14 @@ health_server_runner = None
 _WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 _WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 _WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
+
+# ── Unified weekly backup system ──
+try:
+    from backup_schedulers import weekly_backup_scheduler, monthly_export_scheduler
+except ImportError:
+    print("⚠️ backup_schedulers module not found — weekly backups disabled")
+    weekly_backup_scheduler = None
+    monthly_export_scheduler = None
 
 # Database Configuration
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "MSANodeDB")  # Single database — all bots use MSANodeDB
@@ -9657,9 +9666,6 @@ async def main():
     # Start background tasks
     print("\n🔧 Starting background services...")
     
-    asyncio.create_task(auto_backup_task())
-    print("  ✅ Auto-backup task (Monthly at 2 AM + catch-up)")
-    
     asyncio.create_task(health_monitoring_task())
     print(f"  ✅ Health monitoring ({HEALTH_CHECK_INTERVAL}s interval)")
     
@@ -9669,8 +9675,36 @@ async def main():
     asyncio.create_task(state_persistence_task())
     print(f"  ✅ State persistence ({STATE_BACKUP_INTERVAL_MINUTES} min interval)")
     
+    # ── NEW: Unified weekly backup (stores in DB, no delivery) ──
+    if weekly_backup_scheduler:
+        asyncio.create_task(
+            weekly_backup_scheduler(
+                bot_instance=bot,
+                bot_name="bot3",
+                owner_id=OWNER_ID,
+                mongo_uri=MONGO_URI,
+                db_name=MONGO_DB_NAME
+            ),
+            name="weekly_backup_bot3"
+        )
+        print("  ✅ Weekly backup (every Sunday 11:59 PM → stores in MongoDB)")
+    
+    # ── NEW: Month-end auto-export (sends ZIP to owner) ──
+    if monthly_export_scheduler:
+        asyncio.create_task(
+            monthly_export_scheduler(
+                bot_instance=bot,
+                bot_name="bot3",
+                owner_id=OWNER_ID,
+                mongo_uri=MONGO_URI,
+                db_name=MONGO_DB_NAME
+            ),
+            name="monthly_export_bot3"
+        )
+        print("  ✅ Month-end auto-export (last day 11:59 PM → ZIP to owner)")
+    
+    # ⚠️ DEPRECATED: Old monthly backup (auto_backup_task) is disabled and replaced
     # Startup backup check disabled — auto-backup runs on schedule (1st of month at 2 AM)
-    print("\n💾 Backup check skipped on startup (scheduled only)")
     
     # ── Auto-heal IG CC codes on every startup (fill gaps from past deletions) ──
     print("\n🔄 Reindexing IG CC codes...")
