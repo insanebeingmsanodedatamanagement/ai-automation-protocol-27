@@ -45,7 +45,6 @@ else:
 
 ACTIVE_ENV_FILE = next((p for p in ENV_FILE_CANDIDATES if os.path.exists(p)), "BOT9.env")
 
-
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -68,7 +67,7 @@ _WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 _WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 _WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
 
-# ── Unified weekly backup system ──
+# -- Unified weekly backup system --
 try:
     from backup_schedulers import weekly_backup_scheduler, monthly_export_scheduler
 except ImportError:
@@ -228,8 +227,10 @@ class HealthMonitor:
             else:
                 self.consecutive_mem_high = 0
             
-            # Check CPU usage — only alert after N consecutive high readings (sustained spike)
-            cpu_percent = psutil.cpu_percent(interval=1)
+            # Check CPU usage — use non-blocking call (interval=0 uses last known value)
+            # CRITICAL: Do NOT use interval=1 as it blocks the event loop for 1 second
+            # This was causing 100% CPU when handlers ran during the block
+            cpu_percent = psutil.cpu_percent(interval=0)
             if cpu_percent > ALERT_HIGH_CPU_PERCENT:
                 self.consecutive_cpu_high += 1
                 if self.consecutive_cpu_high >= self.CPU_SUSTAINED_THRESHOLD:
@@ -240,7 +241,7 @@ class HealthMonitor:
             else:
                 self.consecutive_cpu_high = 0
             
-            # Check database connection
+            # Check database connection (async, non-blocking)
             try:
                 client.admin.command('ping')
                 self.health_checks_failed = 0
@@ -263,28 +264,50 @@ class HealthMonitor:
             await self.send_error_notification("Health Check Failed", str(e), traceback.format_exc())
     
     async def auto_heal_database(self):
-        """Attempt to auto-heal database connection"""
+        """Attempt to auto-heal database connection (CRITICAL: Only on confirmed failures)"""
         try:
             logger.info("🔧 Attempting database auto-heal...")
             global client, db, col_pdfs, col_ig_content, col_logs, col_admins, col_banned_users, col_user_activity, col_settings, col_backups
             
+            # SAFETY: Verify old collections still work before healing
+            try:
+                test_count = col_pdfs.count_documents({})
+                logger.warning(f"⚠️ Auto-heal triggered but col_pdfs is still responsive ({test_count} docs). Skipping heal.")
+                return
+            except:
+                logger.error("✅ Confirmed: Database connection is truly broken. Proceeding with auto-heal.")
+            
             # Close existing connection
             try:
                 client.close()
-            except:
-                pass
+                logger.info("✅ Old connection closed")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not close old connection: {e}")
             
             # Reconnect
-            client = pymongo.MongoClient(
+            new_client = pymongo.MongoClient(
                 MONGO_URI,
                 serverSelectionTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
                 connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
                 maxPoolSize=MONGO_MAX_POOL_SIZE,
                 minPoolSize=MONGO_MIN_POOL_SIZE
             )
-            db = client[MONGO_DB_NAME]
+            new_db = new_client[MONGO_DB_NAME]
             
-            # Reinitialize collections
+            # Verify credentials and database name BEFORE reinitializing
+            try:
+                new_client.admin.command('ping')
+                logger.info(f"✅ New connection verified")
+                if new_db.name != MONGO_DB_NAME:
+                    logger.error(f"❌ CRITICAL: New connection points to wrong database '{new_db.name}' (expected {MONGO_DB_NAME}). Abort heal.")
+                    return
+            except Exception as e:
+                logger.error(f"❌ New connection failed: {e}. Reverting.")
+                return
+            
+            # ONLY NOW: Reinitialize collections
+            client = new_client
+            db = new_db
             col_logs = db["bot3_logs"]
             col_pdfs = db["bot3_pdfs"]
             col_ig_content = db["bot3_ig_content"]
@@ -294,17 +317,23 @@ class HealthMonitor:
             col_user_activity = db["bot3_user_activity"]
             col_backups = db["bot3_backups"]
             
-            # Test connection
-            client.admin.command('ping')
+            # Verify collections are responsive
+            try:
+                pdf_count = col_pdfs.count_documents({})
+                logger.info(f"✅ Collections reinitialized. PDFs: {pdf_count}")
+            except Exception as e:
+                logger.error(f"❌ New collections not responding: {e}")
+                return
             
             self.health_checks_failed = 0
             self.is_healthy = True
-            logger.info("✅ Database connection restored!")
+            logger.info("✅ Database connection auto-healed successfully!")
             
             await self.send_alert("SUCCESS", "Database connection auto-healed successfully!")
             
         except Exception as e:
             logger.error(f"Auto-heal failed: {e}")
+            self.is_healthy = False
             await self.send_alert(
                 "CRITICAL",
                 f"Auto-heal FAILED! Manual intervention required!\nError: {str(e)}"
@@ -856,7 +885,7 @@ try:
     print(f"   Database: {MONGO_DB_NAME}")
     print(f"   Connection Pool: {MONGO_MIN_POOL_SIZE}-{MONGO_MAX_POOL_SIZE}")
 
-    # ── STARTUP DB NAME GUARD ─────────────────────────────────────────────────
+    # -- STARTUP DB NAME GUARD --
     # Identical guard used in bot1.py and bot2.py.
     # If the environment points to the wrong database (e.g. MSANODEDATA instead
     # of MSANodeDB), the bot exits immediately with a clear error so the problem
@@ -870,9 +899,9 @@ try:
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         sys.exit(1)
     print("   ✅ Database name verified: MSANodeDB")
-    # ── END DB GUARD ─────────────────────────────────────────────────────────
+    # -- END DB GUARD --
 
-    # ── STARTUP DB FINGERPRINT GUARD ────────────────────────────────────────
+    # -- STARTUP DB FINGERPRINT GUARD --
     # Prevents silent connection drift to another cluster/URI, which looks like
     # "data loss" after restart even when data still exists elsewhere.
     try:
@@ -921,7 +950,7 @@ try:
             print("   ✅ DB fingerprint verified")
     except Exception as _fp_err:
         print(f"⚠️ DB fingerprint guard warning: {_fp_err}")
-    # ── END DB FINGERPRINT GUARD ────────────────────────────────────────────
+    # -- END DB FINGERPRINT GUARD --
 
     # Create indexes for better performance (idempotent - skips if exists)
     def create_index_safe(collection, keys, **kwargs):
@@ -1891,7 +1920,7 @@ def get_backup_menu():
     keyboard = [
         [KeyboardButton(text="💾 FULL BACKUP")],
         [KeyboardButton(text="📋 VIEW AS JSON"), KeyboardButton(text="📊 BACKUP STATS")],
-        [KeyboardButton(text="📤 JSON RESTORE"), KeyboardButton(text="� BACKUP HISTORY")],
+        [KeyboardButton(text="📤 JSON RESTORE"), KeyboardButton(text="📜 BACKUP HISTORY")],
         [KeyboardButton(text="🗑️ RESET BACKUPS")],
         [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
     ]
@@ -3968,12 +3997,24 @@ async def ig_link_pagination(message: types.Message):
 
 @dp.message(F.text == "📑 ALL PDF")
 async def all_pdf_links_handler(message: types.Message, page=0):
+    # Check authorization - must send response before returning
     if not await check_authorization(message, "All PDF Links", "can_list"):
-        return
+        return  # check_authorization sends error message itself
+    
     limit = 8
     skip = page * limit
 
-    total = col_pdfs.count_documents({})
+    # Verify database connection before querying
+    try:
+        total = col_pdfs.count_documents({})
+    except Exception as db_err:
+        logger.error(f"Database query failed in all_pdf_links_handler: {db_err}")
+        await message.answer(
+            f"⚠️ Database error: {str(db_err)[:100]}\n\nPlease try again.",
+            reply_markup=get_links_menu()
+        )
+        return
+        
     if total == 0:
         await message.answer("⚠️ No PDFs found.", reply_markup=get_links_menu())
         return
