@@ -3263,7 +3263,7 @@ _Select a service from the menu ⬇️_
 
 @dp.chat_member()
 async def handle_vault_join(event: ChatMemberUpdated):
-    """Detect when user joins vault and auto-send welcome message"""
+    """Detect when user joins vault and auto-send welcome message with source-specific rewards"""
     # Check if this is the vault channel
     if event.chat.id != CHANNEL_ID:
         return
@@ -3312,10 +3312,11 @@ async def handle_vault_join(event: ChatMemberUpdated):
         except Exception as e:
             logger.error(f"Error checking maintenance mode in vault join handler: {e}")
         
-        # Get user data to check for message IDs
+        # Get user data to check for message IDs and source
         user_data = get_user_verification_status(user_id)
         verification_msg_id = user_data.get('verification_msg_id')
         rejoin_msg_id = user_data.get('rejoin_msg_id')
+        pending_payload = user_data.get('pending_payload')  # ← KEY: Get any pending payload they clicked
         
         # Update verification status and mark as EVER verified (for old user detection)
         update_verification_status(user_id, vault_joined=True, verified=True, ever_verified=True, rejoin_msg_id=None)
@@ -3329,39 +3330,54 @@ async def handle_vault_join(event: ChatMemberUpdated):
         username = event.from_user.username or "unknown"
         msa_id = allocate_msa_id(user_id, username, user_name)
 
-        # Track as UNKNOWN source if user has no tracked source yet
-        # (only sets source once — won't overwrite IG/YT/IGCC/YTCODE)
-        track_user_source(user_id, "UNKNOWN", username, user_name, msa_id)
+        # 🔑 KEY FIX: Check if user already has a source tracked (from previous /start click)
+        existing_tracking = db["bot10_user_tracking"].find_one({"user_id": user_id}, {"source": 1})
+        user_source = existing_tracking.get("source") if existing_tracking and "source" in existing_tracking else None
+        
+        # Track source: only use UNKNOWN if user has NO prior source
+        # If user clicked IG/YT/IGCC/YTCODE link before, that source persists
+        if not user_source:
+            track_user_source(user_id, "UNKNOWN", username, user_name, msa_id)
+        else:
+            # User has existing source — just update their msa_id in tracking if not already set
+            db["bot10_user_tracking"].update_one(
+                {"user_id": user_id},
+                {"$set": {"msa_id": msa_id, "last_start": now_local()}}
+            )
 
-        # Delete the verification message if it exists
+        # 🗑️ DELETE ALL BLOCKING MESSAGES (IN PROPER ORDER)
+        messages_to_delete = []
+        
+        # 1. Verification message (when they first started)
         if verification_msg_id:
-            try:
-                await bot.delete_message(user_id, verification_msg_id)
-                logger.info(f"Deleted verification message {verification_msg_id} for user {user_id}")
-                # Clear after use — no point keeping a dead message ID in the DB
-                col_user_verification.update_one({"user_id": user_id}, {"$unset": {"verification_msg_id": ""}})
-            except Exception as e:
-                logger.error(f"Failed to delete verification message: {e}")
+            messages_to_delete.append(("verification", verification_msg_id))
         
-        # Delete the rejoin message if it exists (user rejoined after leaving)
+        # 2. Rejoin message (if they left and came back)
         if rejoin_msg_id:
-            try:
-                await bot.delete_message(user_id, rejoin_msg_id)
-                logger.info(f"Deleted rejoin message {rejoin_msg_id} for user {user_id}")
-                # rejoin_msg_id is already set to None above in update_verification_status ✅
-            except Exception as e:
-                logger.error(f"Failed to delete verification message: {e}")
+            messages_to_delete.append(("rejoin", rejoin_msg_id))
         
-        # Delete any deep-link vault block messages stored when user was blocked from content
+        # 3. Pending vault-block messages (from when they clicked link but weren't in vault)
         pending_delete_ids = user_data.get('pending_delete_msg_ids', [])
         for _mid in pending_delete_ids:
+            messages_to_delete.append(("pending", _mid))
+        
+        # Execute all deletions (don't fail on single error)
+        for msg_type, msg_id in messages_to_delete:
             try:
-                await bot.delete_message(user_id, _mid)
-                logger.info(f"Deleted pending vault message {_mid} for user {user_id}")
-            except Exception:
-                pass
-        if pending_delete_ids:
-            col_user_verification.update_one({"user_id": user_id}, {"$unset": {"pending_delete_msg_ids": ""}})
+                await bot.delete_message(user_id, msg_id)
+                logger.info(f"✅ Deleted {msg_type} message {msg_id} for user {user_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to delete {msg_type} message {msg_id}: {e}")
+        
+        # Clear all message IDs from database (no point keeping dead references)
+        col_user_verification.update_one(
+            {"user_id": user_id},
+            {"$unset": {
+                "verification_msg_id": "",
+                "rejoin_msg_id": "",
+                "pending_delete_msg_ids": ""
+            }}
+        )
         
         # Send welcome message to user's DM
         try:
