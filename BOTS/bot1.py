@@ -20,6 +20,14 @@ if sys.platform == 'win32':
 from zoneinfo import ZoneInfo
 from aiohttp import web as aiohttp_web
 from aiogram import Bot, Dispatcher, types, F
+
+# ── Unified weekly backup system ──
+try:
+    from backup_schedulers import weekly_backup_scheduler, monthly_export_scheduler
+except ImportError:
+    print("⚠️ backup_schedulers module not found — weekly backups disabled")
+    weekly_backup_scheduler = None
+    monthly_export_scheduler = None
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
 from aiogram.fsm.context import FSMContext
@@ -8135,11 +8143,39 @@ async def main():
             asyncio.create_task(auto_expire_tickets(),     name="ticket_archiver"),
             asyncio.create_task(daily_report_scheduler(),  name="daily_reports"),
             asyncio.create_task(periodic_state_saver(),    name="state_saver"),
-            asyncio.create_task(auto_backup_bot8(),           name="auto_backup"),
             asyncio.create_task(inactive_member_monitor(),    name="inactive_member_monitor"),
             asyncio.create_task(broadcast_live_sync(),        name="broadcast_live_sync"),
-            asyncio.create_task(monthly_json_delivery_bot1(), name="monthly_json_delivery"),
         ]
+        
+        # ── NEW: Unified weekly backup (stores in DB, no delivery) ──
+        if weekly_backup_scheduler:
+            tasks.append(asyncio.create_task(
+                weekly_backup_scheduler(
+                    bot_instance=bot,
+                    bot_name="bot1",
+                    owner_id=OWNER_ID,
+                    mongo_uri=MONGO_URI,
+                    db_name=MONGO_DB_NAME
+                ),
+                name="weekly_backup_bot1"
+            ))
+        
+        # ── NEW: Month-end auto-export (sends ZIP to owner) ──
+        if monthly_export_scheduler:
+            tasks.append(asyncio.create_task(
+                monthly_export_scheduler(
+                    bot_instance=bot,
+                    bot_name="bot1",
+                    owner_id=OWNER_ID,
+                    mongo_uri=MONGO_URI,
+                    db_name=MONGO_DB_NAME
+                ),
+                name="monthly_export_bot1"
+            ))
+        
+        # ⚠️ DEPRECATED: Old 12h backups (auto_backup_bot8, monthly_json_delivery_bot1) are disabled
+        # They are replaced by the unified weekly+monthly-end system above
+        
         logger.info(f"✅ {len(tasks)} background tasks started: {[t.get_name() for t in tasks]}")
 
         # ── Startup notification to owner ────────────────────────
