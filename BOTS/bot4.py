@@ -58,8 +58,6 @@ if sys.platform == 'win32':
 sys.stdout = StreamLogger(sys.stdout)
 sys.stderr = StreamLogger(sys.stderr)
 
-
-
 # ── Render secret-file restore ────────────────────────────────────────────────
 # On Render the disk is ephemeral (wiped on every redeploy).
 # Store credentials.json and token.pickle as base64 env vars so the bot can
@@ -303,6 +301,14 @@ col_trash_locked = None
 col_admins = None
 col_bot4_state = None
 db_client = None
+
+# ── Unified weekly backup system ──
+try:
+    from backup_schedulers import weekly_backup_scheduler, monthly_export_scheduler
+except ImportError:
+    print("⚠️ backup_schedulers module not found — weekly backups disabled")
+    weekly_backup_scheduler = None
+    monthly_export_scheduler = None
 
 # prepare_secrets() - DEPRECATED (Moved to DB loading)
 
@@ -6422,12 +6428,39 @@ async def main():
 
     # ── 2. Background tasks ──────────────────────────────────────────────────
     asyncio.create_task(auto_janitor())
-    asyncio.create_task(weekly_backup())
-    asyncio.create_task(monthly_backup())
     asyncio.create_task(system_guardian())
     asyncio.create_task(reset_daily_stats())
     asyncio.create_task(strict_daily_report())
     asyncio.create_task(auto_health_monitor())
+    
+    # ── NEW: Unified weekly backup (stores in DB, no delivery) ──
+    if weekly_backup_scheduler:
+        asyncio.create_task(
+            weekly_backup_scheduler(
+                bot_instance=bot,
+                bot_name="bot4",
+                owner_id=OWNER_ID,
+                mongo_uri=MONGO_URI,
+                db_name=MONGO_DB_NAME
+            ),
+            name="weekly_backup_bot4"
+        )
+    
+    # ── NEW: Month-end auto-export (sends ZIP to owner) ──
+    if monthly_export_scheduler:
+        asyncio.create_task(
+            monthly_export_scheduler(
+                bot_instance=bot,
+                bot_name="bot4",
+                owner_id=OWNER_ID,
+                mongo_uri=MONGO_URI,
+                db_name=MONGO_DB_NAME
+            ),
+            name="monthly_export_bot4"
+        )
+    
+    # ⚠️ DEPRECATED: Old weekly_backup() and monthly_backup() tasks are disabled
+    # They are replaced by the unified weekly+monthly-end system above
 
     # ── 3. One-time startup tasks ────────────────────────────────────────────
     await _migrate_permissions()
